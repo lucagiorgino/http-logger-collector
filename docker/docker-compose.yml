@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: amazing-http-logger-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: amazing_http_logger
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: amazing-http-logger-app
+    depends_on:
+      - mongo
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB_NAME: amazing_http_logger
+      JWT_SECRET: change-me-in-production
+      APP_ENV: development
+      APP_PORT: 8000
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
