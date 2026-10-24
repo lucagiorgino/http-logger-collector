@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
@@ -38,7 +39,34 @@ class TrafficLogRequest(BaseModel):
         return value
 
 
-class TrafficLogResponse(BaseModel):
-    accepted: bool
-    record_id: str
-    status: str
+class TrafficLogBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    logs: list[TrafficLogRequest] = Field(min_length=1, max_length=500)
+
+
+class BatchReceipt(BaseModel):
+    batch_id: str
+    accepted_count: int
+    status: Literal["stored", "queued"]
+
+
+class StoredTrafficLog(BaseModel):
+    id: str
+    batch_id: str
+    user_id: str
+    device_id: str
+    timestamp: datetime
+    received_at: datetime
+    method: str
+    url: str
+    status_code: int
+    headers: dict[str, str]
+    source_ip: str | None
+    body_length: int
+    body_sha256: str | None
+
+
+class TrafficLogPage(BaseModel):
+    items: list[StoredTrafficLog]
+    next_cursor: str | None

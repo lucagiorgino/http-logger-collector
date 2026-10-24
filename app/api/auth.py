@@ -1,6 +1,11 @@
 from fastapi import APIRouter
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+from app.core.auth import AuthenticatedClaims
+from app.services.traffic_service import authenticated_subject
 
-# Authentication is handled by Auth0. Legacy local /auth/authorize and /auth/token
-# endpoints were intentionally removed to avoid bypassing the configured IdP.
+router = APIRouter(prefix="/api/v1", tags=["auth"])
+
+
+@router.get("/me")
+async def get_current_user(claims: AuthenticatedClaims) -> dict[str, str]:
+    return {"user_id": authenticated_subject(claims)}

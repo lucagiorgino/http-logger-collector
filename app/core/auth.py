@@ -1,33 +1,38 @@
-import os
 import re
+from typing import Annotated
 
-from dotenv import load_dotenv
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi_plugin.fast_api_client import Auth0FastAPI
 
-load_dotenv()
+from app.core.config import settings
 
 auth0 = Auth0FastAPI(
-    domain=os.environ.get("AUTH0_DOMAIN"),
-    audience=os.environ.get("AUTH0_AUDIENCE", ""),
+    domain=settings.auth0_domain,
+    audience=settings.auth0_audience,
 )
 
 JWT_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+bearer_scheme = HTTPBearer(auto_error=False, scheme_name="Auth0Bearer")
 
 
-async def require_bearer_token(request: Request) -> dict:
-    authorization = request.headers.get("Authorization", "")
-    if not authorization or not authorization.lower().startswith("Bearer "):
+async def require_bearer_token(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+) -> dict:
+    if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token = authorization.split(" ", 1)[1].strip()
+    token = credentials.credentials.strip()
     if not JWT_RE.fullmatch(token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     try:
@@ -40,4 +45,8 @@ async def require_bearer_token(request: Request) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+
+
+AuthenticatedClaims = Annotated[dict, Depends(require_bearer_token)]

@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 
 from app.db.mongo import MongoRepository
+from app.services.ingestion import IngestionPublisher, MongoIngestionPublisher
 
 
 def get_mongo_repository(request: Request) -> MongoRepository:
@@ -10,3 +11,10 @@ def get_mongo_repository(request: Request) -> MongoRepository:
 
 
 MongoRepositoryDep = Annotated[MongoRepository, Depends(get_mongo_repository)]
+
+
+def get_ingestion_publisher(repository: MongoRepositoryDep) -> IngestionPublisher:
+    return MongoIngestionPublisher(repository)
+
+
+IngestionPublisherDep = Annotated[IngestionPublisher, Depends(get_ingestion_publisher)]

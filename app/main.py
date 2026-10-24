@@ -1,20 +1,24 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated
 
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-from app.api.agents import router as agents_router
-from app.core.auth import auth0
-from app.db.mongo import MongoRepository
+from app.api.auth import router as auth_router
+from app.api.batches import router as batches_router
+from app.api.traffic_logs import router as traffic_logs_router
+from app.db.mongo import MongoRepository, PersistenceError
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     repository = MongoRepository()
     app.state.mongo_repository = repository
-    await repository.ensure_indexes()
     try:
+        await repository.ensure_indexes()
         yield
     finally:
         repository.close()
@@ -22,33 +26,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Amazing HTTP Logger", lifespan=lifespan)
 
-app.include_router(agents_router)
+app.include_router(auth_router)
+app.include_router(batches_router)
+app.include_router(traffic_logs_router)
 
-AuthenticatedClaims = Annotated[dict, Depends(auth0.require_auth())]
-ScopedClaims = Annotated[dict, Depends(auth0.require_auth(scopes="read:messages"))]
+
+@app.exception_handler(PersistenceError)
+async def storage_unavailable(request: Request, exc: PersistenceError) -> JSONResponse:
+    logger.error("Storage is unavailable")
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Storage is temporarily unavailable"},
+    )
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
-
-
-@app.get("/api/public", tags=["public"])
-async def public() -> dict[str, str]:
-    return {"message": "Hello from a public endpoint! You don't need to be authenticated to see this."}
-
-
-@app.get("/api/private", tags=["private"])
-async def private(claims: AuthenticatedClaims) -> dict[str, str | None]:
-    return {
-        "message": "Hello from a private endpoint! You need to be authenticated to see this.",
-        "user_id": claims.get("sub"),
-    }
-
-
-@app.get("/api/private-scoped", tags=["private-scoped"])
-async def private_scoped(claims: ScopedClaims) -> dict[str, str | None]:
-    return {
-        "message": "Hello from a private endpoint! You need to be authenticated and have a scope of read:messages to see this.",
-        "user_id": claims.get("sub"),
-    }
