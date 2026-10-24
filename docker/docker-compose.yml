@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   mongo:
     image: mongo:7
@@ -17,10 +15,11 @@ services:
     container_name: amazing-http-logger-app
     depends_on:
       - mongo
+    env_file:
+      - ../.env
     environment:
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB_NAME: amazing_http_logger
-      JWT_SECRET: change-me-in-production
       APP_ENV: development
       APP_PORT: 8000
     ports:
