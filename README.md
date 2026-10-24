@@ -18,6 +18,7 @@ The application is responsible for:
 - FastAPI
 - Pydantic
 - MongoDB with native async PyMongo
+- Auth0FastAPI SDK for access-token verification and cached discovery/JWKS
 - HTTPX2 for HTTP clients and API tests
 - OpenBao Transit and KV v2 for key management
 - pytest
@@ -142,6 +143,12 @@ All `/api/v1` endpoints require an Auth0 access token in `Authorization: Bearer 
 Clients authenticate with Auth0 directly (Authorization Code with PKCE for user-device
 agents); this API does not issue tokens or proxy the IdP's authorization/token endpoints.
 `GET /api/v1/me` verifies the resulting identity. Interactive OpenAPI docs are at `/docs`.
+Tokens must use RS256 and include `exp`, `iat`, `iss`, `aud`, and a nonempty `sub`.
+Verification uses `Auth0FastAPI.require_auth()` and the configured tenant's HTTPS
+discovery/JWKS. Proof-bound tokens are not supported by this Bearer-only API.
+SDK validation failures return sanitized `401` responses; unexpected SDK failures
+return `503`. The SDK currently imports deprecated `authlib.jose` internally; this
+upstream warning remains visible. Application JWE encryption uses `joserfc`.
 
 | Method | Resource | Behavior |
 | --- | --- | --- |

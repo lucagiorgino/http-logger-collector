@@ -4,7 +4,9 @@
 - Project structure initialized.
 - Core FastAPI app skeleton created.
 - API, service, publisher, and persistence layers are implemented.
-- Auth0 FastAPI integration has been wired with environment-based configuration.
+- Auth0 token verification delegates to the official `Auth0FastAPI.require_auth()`
+  dependency, using configured tenant/audience and SDK discovery/JWKS caching.
+  Bearer challenges and sanitized errors are preserved; unexpected SDK failures return 503.
 - Persistence uses native async PyMongo with awaited client shutdown. Runtime/test
   HTTP clients use HTTPX2; Motor is not required. The requested Auth0 SDK currently
   depends on deprecated `authlib.jose`; this upstream import warning remains visible.
@@ -71,7 +73,9 @@
 - time-series initialization, startup races, invalid collection options, and routing
 - optional real replica-set integration test: time-series indexes and inserts,
   primary/secondary command routing, replica visibility, pagination, and no primary fallback
-- Auth0 authentication rejection and identity route checks (real tenant validation pending)
+- Signed JWT checks exercise the real Auth0 SDK against mocked discovery/JWKS,
+  including signature/algorithm and claim rejection, cached keys, bearer challenges,
+  and sanitized unexpected SDK failures (real tenant validation pending)
 - Deprecation and pending-deprecation warnings fail tests, except the exact upstream
   Auth0/Authlib JOSE import warning, which is reported in the warning summary
 - Helm lint/render validation for external and bundled MongoDB profiles, plus a

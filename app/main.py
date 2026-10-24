@@ -10,6 +10,7 @@ from app.api.auth import router as auth_router
 from app.api.batches import router as batches_router
 from app.api.devices import router as devices_router
 from app.api.traffic_logs import router as traffic_logs_router
+from app.core.auth import AuthenticationUnavailable
 from app.core.config import settings
 from app.core.encryption import get_encryption_keys
 from app.core.openbao import KMSUnavailable
@@ -69,3 +70,14 @@ async def storage_unavailable(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.exception_handler(AuthenticationUnavailable)
+async def authentication_unavailable(
+    request: Request, exc: AuthenticationUnavailable
+) -> JSONResponse:
+    logger.error("The authentication service is unavailable")
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "The authentication service is temporarily unavailable"},
+    )
