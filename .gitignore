@@ -10,6 +10,7 @@ venv/
 .env
 .env.*
 !.env.example
+!.env.stack-test.example
 *.key
 *.pem
 .secrets/

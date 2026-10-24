@@ -38,6 +38,7 @@ The application is responsible for:
 │   ├── main.py
 │   └── deps.py
 ├── tests/
+├── integration_tests/
 ├── docker/
 ├── helm/
 ├── .env.example
@@ -240,7 +241,7 @@ See [the plan](docs/PLAN.md) for the producer/worker contract.
 
 ```bash
 pytest
-ruff check app tests
+ruff check app tests integration_tests
 ```
 
 Set `MONGO_TEST_URI` to the local single-node replica-set URI for its integration
@@ -251,6 +252,16 @@ databases and verify time-series storage and the selected read policy.
 For OpenBao integration and KMS-to-API-to-MongoDB ingestion, see the runbook's
 opt-in test command. KMS tests use isolated test keys/records and never rotate
 the application's configured key set.
+
+`make test-stack` runs a separate **HTTP-only whole-stack test** against a running
+backend, real OAuth authorization server, OpenBao, and MongoDB. It uses two
+dedicated client-ID/secret pairs on separate device threads: one sends JWE-encrypted
+logs and the other sends gzip JSON. Copy `.env.stack-test.example` to the ignored
+`.env.stack-test`, configure the clients, and follow the
+[whole-stack test setup](docs/RUNBOOK.md#whole-stack-oauth-integration-test).
+Device IDs are stable/configurable and their policies must be configured beforehand.
+The test only reads policies and reports agent status; neither client needs
+`manage:devices`.
 
 ## Kubernetes deployment
 

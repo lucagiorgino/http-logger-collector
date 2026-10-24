@@ -56,6 +56,9 @@ make helm-test
 ## Tests
 - Unit tests cover validation, auth decisions, and service logic.
 - Integration tests validate MongoDB-backed flows.
+- `make test-stack` runs the HTTP-only two-device OAuth test in `integration_tests/`;
+  it requires a running stack and two dedicated client credential pairs in the
+  ignored `.env.stack-test`. See the runbook before running it against real services.
 - Security tests ensure unauthorized access is rejected and sensitive data is not logged.
 
 ## Conventions

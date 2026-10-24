@@ -103,3 +103,11 @@
 - Isolated Kubernetes OpenBao validation covers two API replicas, real projected-JWT
   authentication and Transit unwrap, install/upgrade bootstrap, root/key retention,
   privileged-credential log checks, and the Helm smoke test
+- An opt-in HTTP-only whole-stack test exchanges two dedicated OAuth client
+  credentials on device threads, uploads encrypted/plain batches, and verifies
+  persisted analysis, redaction, policy enforcement and cross-owner isolation.
+  It uses stable configured device IDs, reads pre-existing policies and reports
+  agent status without changing policy or requesting management permission.
+  Harness unit tests cover concurrent identities, advertised JWE suites, safe
+  configuration and explicit OAuth/storage/visibility failures. A live Auth0 run
+  requires externally provisioned test clients and is not part of offline validation.

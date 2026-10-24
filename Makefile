@@ -3,6 +3,7 @@ VENV ?= .venv
 PIP := $(VENV)/bin/pip
 PYTHON_VENV := $(VENV)/bin/python
 ENV_FILE ?= .env
+STACK_TEST_ENV_FILE ?= .env.stack-test
 OPENBAO_UID ?= $(shell id -u)
 OPENBAO_GID ?= $(shell id -g)
 export OPENBAO_UID OPENBAO_GID
@@ -29,8 +30,11 @@ install:
 
 test: .test
 
+test-stack:
+	STACK_TEST_ENV_FILE="$(STACK_TEST_ENV_FILE)" STACK_TEST_ENABLED=true $(PYTHON_VENV) -m pytest -q integration_tests/test_stack.py
+
 lint:
-	$(PYTHON_VENV) -m ruff check app tests
+	$(PYTHON_VENV) -m ruff check app tests integration_tests
 
 run:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app
@@ -78,4 +82,4 @@ helm-down:
 helm-port-forward:
 	kubectl $(KUBECTL_CONTEXT) --namespace "$(KUBE_NAMESPACE)" port-forward "service/$(KUBE_SERVICE)" "$(KUBE_LOCAL_PORT):http"
 
-.PHONY: install test lint run mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image helm-lint helm-template helm-up helm-test helm-down helm-port-forward
+.PHONY: install test test-stack lint run mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image helm-lint helm-template helm-up helm-test helm-down helm-port-forward

@@ -236,7 +236,7 @@ code; application encryption uses `joserfc`.
 
 ```bash
 pytest -q
-ruff check app tests
+ruff check app tests integration_tests
 ```
 
 To exercise local time-series storage and primary analysis, point `MONGO_TEST_URI` at
@@ -277,6 +277,98 @@ For the optional Kubernetes database, run the integration test inside the API po
 kubectl --context=minikube -n logger exec deployment/logger-amazing-http-logger -c api -- \
   python -c 'import os, subprocess, sys; os.environ["MONGO_REPLICA_TEST_URI"] = os.environ["MONGO_URI"]; subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_mongo_integration.py"], check=True)'
 ```
+
+### Whole-stack OAuth integration test
+
+This opt-in test uses only public HTTP endpoints: **no Auth0 dependency overrides,
+in-process app transport, direct database access, or private KMS credentials**.
+Run the backend with MongoDB and a provisioned OpenBao first (`make dev` locally,
+or deploy Helm). It exercises the currently configured ingestion publisher and
+reads accepted records through analysis, waiting for replication/processing.
+Deployment analysis must have a readable secondary; the local single-node profile
+uses its existing explicit development-only primary-read setting.
+
+Create **two different Auth0 Machine-to-Machine applications**, authorize both for
+the backend API audience, and enable the `client_credentials` grant. Neither
+application needs `manage:devices`: the workers act only as agents and never
+PATCH a device policy. These test-only credentials should not be deployed to
+ordinary agents.
+
+Each client authenticates as its own owner (typically `<client-id>@clients`), not
+as an interactive human user. The test obtains the verified subject from `/api/v1/me`
+instead of decoding an unverified token or assuming the subject format.
+
+Configure device policies before the test. The stable IDs default to
+`stack-test-plaintext` and `stack-test-encrypted`, or can be set with
+`STACK_TEST_PLAINTEXT_DEVICE_ID` and `STACK_TEST_ENCRYPTED_DEVICE_ID`. The plaintext
+device must use `tls_only`; the encrypted device must
+allow JWE (`optional` or `required`). An incompatible policy fails with a setup
+message instead of being changed automatically.
+
+Policy management remains a frontend/operator responsibility, subject to the
+existing backend ownership rules. **The current frontend cannot manage an M2M
+owner's devices from a different human subject.** That requires an explicit
+delegation model; the test does not bypass this restriction or provision it.
+
+```bash
+cp .env.stack-test.example .env.stack-test
+chmod 600 .env.stack-test
+# Edit .env.stack-test locally: set the backend URL, Auth0 token URL/audience,
+# and the separate plaintext/encrypted client IDs, secrets and stable device IDs.
+# Configure the devices' policies before running.
+make test-stack
+```
+
+Configure `STACK_TEST_TOKEN_URL` as `https://YOUR_TENANT.auth0.com/oauth/token`;
+the audience must match the running backend's `AUTH0_AUDIENCE`. The example is
+disabled for ordinary `pytest`; `make test-stack` explicitly enables it, so missing
+credentials fail rather than silently skipping. To select another credential file:
+
+```bash
+make test-stack STACK_TEST_ENV_FILE=/secure/stack-test.env
+```
+
+Alternatively export the `STACK_TEST_*` settings and run
+`STACK_TEST_ENABLED=true .venv/bin/python -m pytest -q integration_tests/test_stack.py`.
+The default `.env.stack-test` is optional when all values come from the environment.
+This standalone test does not load the application unit-test fixtures or `.env`.
+Environment variables override profile values. Both the two client IDs and the
+two device IDs must differ.
+
+Two worker threads independently obtain fresh bearer tokens, discover their
+identities, and read their existing device configurations without changing them.
+Both acknowledge the advertised policy version; the encrypted device reports the
+active key. It sends JSON -> gzip -> compact JWE using only the advertised suite
+and public key. If its existing policy is `required`, the test also verifies
+that a gzip-only upload is rejected. The plaintext device sends gzip JSON. Both
+submit three synthetic logs with unique per-run URLs.
+
+The test waits for records from each acknowledged batch, following analysis
+pagination as necessary. Older batches on the same stable device do not affect
+the counts. It verifies receipt IDs, ownership, redaction and body minimization,
+then checks cross-owner list/item isolation. Policies are never changed or reset.
+
+`STACK_TEST_HTTP_TIMEOUT` bounds each request (default 10 seconds);
+`STACK_TEST_VISIBILITY_TIMEOUT` bounds the read-back wait (default 30 seconds).
+Increase the latter for slower replicas or a queued publisher. A `503` or any other
+unexpected HTTP status fails explicitly; the test does not fall back to primary
+or retry an upload that could have partially persisted.
+
+Only loopback backend HTTP is allowed. The authorization server always requires
+HTTPS. For a private backend CA, set `STACK_TEST_CA_CERT` to its PEM bundle;
+system roots remain trusted. Certificate verification stays enabled, and redirects
+and environment proxies are not followed.
+
+The credential profile is ignored by Git and Docker builds. Keep it private; never
+commit secrets or print token responses. Do not enable HTTP debug logging or
+`pytest --showlocals` when using real credentials. Failure messages omit token
+responses, credentials and request bodies.
+
+Run only against an approved test stack. **Each run leaves six synthetic logs and
+updates status for the configured stable devices**; the API
+does not expose deletion. It does not modify existing device policies; do not
+target production. It needs no MongoDB/OpenBao administrator credentials. Unit tests for this
+client harness use an explicit mock transport; they do not claim a live Auth0 run.
 
 ## Storage initialization
 

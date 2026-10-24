@@ -58,6 +58,9 @@ amazing-http-logger/
     test_auth.py                # auth flow tests
     test_batches.py             # compressed ingestion, validation, authorization
     test_analysis.py            # owner-scoped log reads and pagination
+  integration_tests/
+    stack_client.py             # HTTP-only, threaded OAuth device emulator
+    test_stack.py               # opt-in encrypted/plain whole-stack scenario
   docs/
     PLAN.md                     # design, scope, architecture, decisions
     IMPLEMENTATION_STATUS.md    # status by area, gaps, next steps, test inventory
