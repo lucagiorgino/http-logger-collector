@@ -1,0 +1,171 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "logger.fullname" . }}
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "logger.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "logger.fullname" . }}-api
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-primary
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-c"]
+          args:
+            - |
+              import os
+              import time
+              from pymongo import MongoClient
+              from pymongo.errors import PyMongoError
+              from pymongo.read_preferences import ReadPreference
+
+              deadline = time.monotonic() + 300
+              with MongoClient(os.environ["MONGO_URI"], serverSelectionTimeoutMS=2000,
+                               read_preference=ReadPreference.PRIMARY) as client:
+                  while True:
+                      try:
+                          client.admin.command("ping")
+                          break
+                      except PyMongoError:
+                          if time.monotonic() >= deadline:
+                              raise
+                          print("Waiting for MongoDB primary", flush=True)
+                          time.sleep(2)
+          env:
+            {{- include "logger.mongoEnv" . | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+        - name: wait-for-openbao
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-c"]
+          args:
+            - |
+              import time
+              from app.core.encryption import get_encryption_keys
+              from app.core.openbao import KMSUnavailable
+              deadline = time.monotonic() + 300
+              while True:
+                  try:
+                      get_encryption_keys()
+                      break
+                  except KMSUnavailable:
+                      if time.monotonic() >= deadline:
+                          raise
+                      print("Waiting for OpenBao key provisioning", flush=True)
+                      time.sleep(2)
+          envFrom:
+            - configMapRef:
+                name: {{ include "logger.fullname" . }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- include "logger.openbaoMounts" . | nindent 12 }}
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "logger.fullname" . }}
+          env:
+            {{- include "logger.mongoEnv" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.app.port }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- include "logger.openbaoMounts" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: openbao-auth
+          {{- if .Values.openbao.auth.existingSecret }}
+          secret:
+            secretName: {{ .Values.openbao.auth.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.openbao.auth.tokenKey | quote }}
+                path: token
+          {{- else }}
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.openbao.auth.audience | quote }}
+                  expirationSeconds: 3600
+                  path: token
+          {{- end }}
+        {{- if .Values.openbao.ca.existingSecret }}
+        - name: openbao-ca
+          secret:
+            secretName: {{ .Values.openbao.ca.existingSecret | quote }}
+            items:
+              - key: {{ .Values.openbao.ca.key | quote }}
+                path: ca.crt
+        {{- end }}

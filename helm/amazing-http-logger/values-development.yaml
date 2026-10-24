@@ -1,0 +1,16 @@
+image:
+  tag: dev
+
+auth0:
+  domain: example.auth0.com
+  audience: https://example.test/api
+
+app:
+  environment: development
+  requireHttps: false
+
+mongodb:
+  enabled: true
+
+openbao:
+  enabled: true

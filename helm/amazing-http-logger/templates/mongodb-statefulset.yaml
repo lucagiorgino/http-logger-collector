@@ -1,0 +1,105 @@
+{{- if .Values.mongodb.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "logger.fullname" . }}-mongodb
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "logger.fullname" . }}-mongodb
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: mongodb
+  template:
+    metadata:
+      labels:
+        {{- include "logger.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: mongodb
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "logger.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: mongodb
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: mongodb
+          image: {{ .Values.mongodb.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["mongod"]
+          args: ["--replSet", "rs0", "--bind_ip_all", "--port", {{ .Values.mongodb.port | quote }}, "--wiredTigerCacheSizeGB", "0.25"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: MONGOSH_DISABLE_TELEMETRY
+              value: "1"
+          ports:
+            - name: mongodb
+              containerPort: {{ .Values.mongodb.port }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            tcpSocket:
+              port: mongodb
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - mongosh
+                - --quiet
+                - --port
+                - {{ .Values.mongodb.port | quote }}
+                - --eval
+                - "const h = db.hello(); if (!h.isWritablePrimary && !h.secondary) quit(1)"
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: mongodb
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.mongodb.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.mongodb.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.mongodb.persistence.size | quote }}
+{{- end }}

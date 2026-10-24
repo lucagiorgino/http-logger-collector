@@ -1,0 +1,26 @@
+{{- if .Values.mongodb.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "logger.fullname" . }}-mongodb
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: mongodb
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "logger.selectorLabels" . | nindent 14 }}
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values: ["api", "mongodb", "mongodb-init"]
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mongodb.port }}
+{{- end }}

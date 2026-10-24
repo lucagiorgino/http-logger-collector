@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["image", "auth0", "externalMongo", "mongodb", "openbao"],
+  "properties": {
+    "replicaCount": {"type": "integer", "minimum": 1},
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {"name": {"type": "string", "minLength": 1}}
+      }
+    },
+    "auth0": {
+      "type": "object",
+      "required": ["domain", "audience"],
+      "properties": {
+        "domain": {"type": "string", "minLength": 1},
+        "audience": {"type": "string", "minLength": 1}
+      }
+    },
+    "externalMongo": {
+      "type": "object",
+      "required": ["existingSecret", "uriKey"],
+      "properties": {
+        "existingSecret": {"type": "string"},
+        "uriKey": {"type": "string", "minLength": 1}
+      }
+    },
+    "app": {
+      "type": "object",
+      "properties": {
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "mongoServerSelectionTimeoutMs": {"type": "integer", "minimum": 1},
+        "requireHttps": {"type": "boolean"},
+        "forwardedAllowIps": {"type": "string"}
+      }
+    },
+    "encryption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyAlgorithm", "contentAlgorithm", "curve"],
+      "properties": {
+        "keyAlgorithm": {"enum": ["ECDH-ES+A128KW", "ECDH-ES+A192KW", "ECDH-ES+A256KW"]},
+        "contentAlgorithm": {"enum": ["A128GCM", "A192GCM", "A256GCM"]},
+        "curve": {"enum": ["P-256", "P-384", "P-521"]}
+      }
+    },
+    "openbao": {
+      "type": "object",
+      "required": ["enabled", "address", "image", "port", "auth"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "address": {"type": "string"},
+        "image": {"type": "string", "minLength": 1},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "timeoutSeconds": {"type": "number", "exclusiveMinimum": 0},
+        "transitMount": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$"},
+        "transitKey": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$"},
+        "kvMount": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$"},
+        "kvPath": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$"},
+        "auth": {
+          "type": "object",
+          "required": ["mount", "role", "audience", "existingSecret", "tokenKey"],
+          "properties": {
+            "mount": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$"},
+            "role": {"type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$"},
+            "audience": {"type": "string", "minLength": 1},
+            "existingSecret": {"type": "string"},
+            "tokenKey": {"type": "string", "minLength": 1}
+          }
+        },
+        "ca": {
+          "type": "object",
+          "required": ["existingSecret", "key"],
+          "properties": {
+            "existingSecret": {"type": "string"},
+            "key": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {"port": {"type": "integer", "minimum": 1, "maximum": 65535}}
+    },
+    "mongodb": {
+      "type": "object",
+      "required": ["enabled", "image", "clusterDomain"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "image": {"type": "string", "minLength": 1},
+        "clusterDomain": {"type": "string", "minLength": 1},
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "size": {"type": "string", "minLength": 1},
+            "storageClass": {"type": "string"}
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"openbao": {"properties": {"enabled": {"const": false}}}}},
+      "then": {
+        "properties": {
+          "openbao": {"properties": {"address": {"minLength": 1, "pattern": "^https?://"}}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "openbao": {"properties": {"enabled": {"const": false}}},
+          "app": {"properties": {"environment": {"not": {"const": "development"}}}}
+        }
+      },
+      "then": {
+        "properties": {
+          "openbao": {"properties": {"address": {"pattern": "^https://"}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"openbao": {"properties": {"enabled": {"const": true}}}}},
+      "then": {
+        "properties": {
+          "app": {"properties": {"environment": {"const": "development"}}},
+          "openbao": {
+            "properties": {
+              "auth": {"properties": {"existingSecret": {"const": ""}}},
+              "ca": {"properties": {"existingSecret": {"const": ""}}}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"mongodb": {"properties": {"enabled": {"const": false}}}}},
+      "then": {
+        "properties": {
+          "externalMongo": {
+            "properties": {"existingSecret": {"type": "string", "minLength": 1}}
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"mongodb": {"properties": {"enabled": {"const": true}}}}},
+      "then": {
+        "properties": {
+          "app": {
+            "properties": {"environment": {"const": "development"}}
+          }
+        }
+      }
+    }
+  ]
+}

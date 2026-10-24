@@ -1,0 +1,235 @@
+{{- if .Values.openbao.enabled }}
+{{- $name := include "logger.fullname" . }}
+{{- $secretName := printf "%s-openbao-dev" $name }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+type: Opaque
+data:
+  {{- if $existing }}
+  token: {{ index $existing.data "token" | quote }}
+  {{- else }}
+  token: {{ randAlphaNum 48 | b64enc | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-openbao
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-{{ $name }}-openbao-reviewer
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}-openbao
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-openbao
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "logger.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: openbao
+  ports:
+    - name: openbao
+      port: {{ .Values.openbao.port }}
+      targetPort: openbao
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-openbao
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: openbao
+  template:
+    metadata:
+      labels:
+        {{- include "logger.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: openbao
+    spec:
+      serviceAccountName: {{ $name }}-openbao
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: openbao
+          image: {{ .Values.openbao.image | quote }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              ROOT_TOKEN="$(cat /run/secrets/openbao-dev/token)"
+              test -n "$ROOT_TOKEN"
+              exec bao server -dev -dev-no-store-token \
+                -dev-root-token-id="$ROOT_TOKEN" \
+                -dev-listen-address="0.0.0.0:{{ .Values.openbao.port }}" >/dev/null
+          env:
+            - name: BAO_ADDR
+              value: "http://127.0.0.1:{{ .Values.openbao.port }}"
+          ports:
+            - name: openbao
+              containerPort: {{ .Values.openbao.port }}
+          startupProbe:
+            exec:
+              command: ["bao", "status"]
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["bao", "status"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["bao", "status"]
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.openbao.resources | nindent 12 }}
+          volumeMounts:
+            - name: root-token
+              mountPath: /run/secrets/openbao-dev
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: root-token
+          secret:
+            secretName: {{ $secretName }}
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-openbao
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: openbao
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "logger.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              {{- include "logger.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: openbao-bootstrap
+      ports:
+        - protocol: TCP
+          port: {{ .Values.openbao.port }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-openbao-bootstrap-{{ .Release.Revision }}
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        {{- include "logger.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: openbao-bootstrap
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "app.kms", "bootstrap-kubernetes"]
+          args:
+            - --admin-token-file
+            - /run/secrets/openbao-dev/token
+            - --service-account
+            - {{ printf "%s-api" $name | quote }}
+            - --namespace
+            - {{ .Release.Namespace | quote }}
+            - --audience
+            - {{ .Values.openbao.auth.audience | quote }}
+            - --policy
+            - {{ printf "%s-ingestion" $name | quote }}
+          envFrom:
+            - configMapRef:
+                name: {{ $name }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: root-token
+              mountPath: /run/secrets/openbao-dev
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: root-token
+          secret:
+            secretName: {{ $secretName }}
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+{{- end }}

@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "logger.fullname" . }}
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+data:
+  AUTH0_DOMAIN: {{ required "auth0.domain is required" .Values.auth0.domain | quote }}
+  AUTH0_AUDIENCE: {{ required "auth0.audience is required" .Values.auth0.audience | quote }}
+  MONGO_DB_NAME: {{ .Values.app.mongoDatabase | quote }}
+  MONGO_SERVER_SELECTION_TIMEOUT_MS: {{ .Values.app.mongoServerSelectionTimeoutMs | quote }}
+  APP_ENV: {{ .Values.app.environment | quote }}
+  APP_HOST: "0.0.0.0"
+  APP_PORT: {{ .Values.app.port | quote }}
+  APP_RELOAD: "false"
+  MONGO_ALLOW_PRIMARY_READS: "false"
+  REQUIRE_HTTPS: {{ .Values.app.requireHttps | quote }}
+  FORWARDED_ALLOW_IPS: {{ .Values.app.forwardedAllowIps | quote }}
+  ENCRYPTION_KEY_ALGORITHM: {{ .Values.encryption.keyAlgorithm | quote }}
+  ENCRYPTION_CONTENT_ALGORITHM: {{ .Values.encryption.contentAlgorithm | quote }}
+  ENCRYPTION_CURVE: {{ .Values.encryption.curve | quote }}
+  OPENBAO_ADDR: {{ include "logger.openbaoAddress" . | quote }}
+  OPENBAO_TRANSIT_MOUNT: {{ .Values.openbao.transitMount | quote }}
+  OPENBAO_TRANSIT_KEY: {{ .Values.openbao.transitKey | quote }}
+  OPENBAO_KV_MOUNT: {{ .Values.openbao.kvMount | quote }}
+  OPENBAO_KV_PATH: {{ .Values.openbao.kvPath | quote }}
+  OPENBAO_TIMEOUT_SECONDS: {{ .Values.openbao.timeoutSeconds | quote }}
+  OPENBAO_AUTH_MOUNT: {{ .Values.openbao.auth.mount | quote }}
+  OPENBAO_JWT_FILE: "/run/secrets/openbao-auth/token"
+  {{- if .Values.openbao.auth.existingSecret }}
+  OPENBAO_TOKEN_FILE: "/run/secrets/openbao-credentials/token"
+  OPENBAO_KUBERNETES_ROLE: ""
+  {{- else }}
+  OPENBAO_KUBERNETES_ROLE: {{ .Values.openbao.auth.role | quote }}
+  {{- end }}
+  {{- if .Values.openbao.ca.existingSecret }}
+  OPENBAO_CA_CERT: "/run/secrets/openbao-ca/ca.crt"
+  {{- else }}
+  OPENBAO_CA_CERT: ""
+  {{- end }}

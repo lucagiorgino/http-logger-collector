@@ -1,0 +1,18 @@
+{{- if .Values.mongodb.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "logger.fullname" . }}-mongodb
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "logger.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: mongodb
+  ports:
+    - name: mongodb
+      port: {{ .Values.mongodb.port }}
+      targetPort: mongodb
+{{- end }}

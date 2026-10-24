@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "logger.fullname" . }}
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "logger.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http

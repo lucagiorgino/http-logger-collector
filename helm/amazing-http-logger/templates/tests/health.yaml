@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "logger.fullname" . }}-health-test
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: health
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command: ["python", "-c"]
+      args:
+        - |
+          import json
+          import urllib.request
+          base = "http://{{ include "logger.fullname" . }}:{{ .Values.service.port }}"
+          with urllib.request.urlopen(base + "/health", timeout=10) as response:
+              assert json.load(response) == {"status": "ok"}
+          with urllib.request.urlopen(base + "/openapi.json", timeout=10) as response:
+              paths = json.load(response)["paths"]
+          assert "/api/v1/traffic-log-batches" in paths
+          assert "/api/v1/traffic-logs" in paths
+          assert "/api/v1/devices/{device_id}/configuration" in paths
+          assert "/api/v1/devices/{device_id}/configuration-status" in paths
+          print("API health and REST schema verified")
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi

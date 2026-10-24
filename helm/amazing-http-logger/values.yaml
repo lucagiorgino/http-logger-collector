@@ -1,0 +1,84 @@
+replicaCount: 1
+
+image:
+  repository: amazing-http-logger
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+auth0:
+  domain: ""
+  audience: ""
+
+app:
+  port: 8000
+  environment: production
+  mongoDatabase: amazing_http_logger
+  mongoServerSelectionTimeoutMs: 5000
+  requireHttps: true
+  forwardedAllowIps: "127.0.0.1"
+
+encryption:
+  keyAlgorithm: ECDH-ES+A256KW
+  contentAlgorithm: A256GCM
+  curve: P-384
+
+openbao:
+  # Bundled dev mode is ephemeral; use an externally managed service in production.
+  enabled: false
+  image: ghcr.io/openbao/openbao:2.7.1
+  port: 8200
+  address: ""
+  transitMount: transit
+  transitKey: log-keyset
+  kvMount: secret
+  kvPath: log-encryption
+  timeoutSeconds: 5
+  auth:
+    mount: kubernetes
+    role: logger-ingestion
+    audience: openbao
+    existingSecret: ""
+    tokenKey: token
+  ca:
+    existingSecret: ""
+    key: ca.crt
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+externalMongo:
+  existingSecret: ""
+  uriKey: MONGO_URI
+
+service:
+  port: 80
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+mongodb:
+  # Development only: no authentication or TLS. Use externalMongo for production.
+  enabled: false
+  port: 27017
+  image: mongo:7
+  clusterDomain: cluster.local
+  persistence:
+    size: 2Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
