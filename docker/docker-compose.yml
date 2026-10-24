@@ -1,27 +1,66 @@
-services:
-  mongo:
-    image: mongo:7
-    container_name: amazing-http-logger-mongo
-    restart: unless-stopped
-    ports:
-      - "27017:27017"
-    environment:
-      MONGO_INITDB_DATABASE: amazing_http_logger
+name: ${COMPOSE_PROJECT:-amazing-http-logger-dev}
 
-  app:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    container_name: amazing-http-logger-app
-    depends_on:
-      - mongo
-    env_file:
-      - ../.env
+services:
+  openbao:
+    image: ${OPENBAO_IMAGE:-ghcr.io/openbao/openbao:2.7.1}
+    user: "${OPENBAO_UID:-1000}:${OPENBAO_GID:-1000}"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ROOT_TOKEN="$$(cat /run/secrets/openbao-dev-root-token)"
+        test -n "$$ROOT_TOKEN"
+        exec bao server -dev -dev-no-store-token \
+          -dev-root-token-id="$$ROOT_TOKEN" \
+          -dev-listen-address="0.0.0.0:$${OPENBAO_PORT}" >/dev/null
     environment:
-      MONGO_URI: mongodb://mongo:27017
-      MONGO_DB_NAME: amazing_http_logger
-      APP_ENV: development
-      APP_PORT: 8000
+      OPENBAO_PORT: ${OPENBAO_PORT:-28200}
+      BAO_ADDR: http://127.0.0.1:${OPENBAO_PORT:-28200}
     ports:
-      - "8000:8000"
+      - "${OPENBAO_BIND_HOST:-127.0.0.1}:${OPENBAO_PORT:-28200}:${OPENBAO_PORT:-28200}"
+    secrets:
+      - openbao-dev-root-token
+    healthcheck:
+      test: ["CMD", "bao", "status"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  mongo:
+    image: ${MONGO_IMAGE:-mongo:7}
+    command: ["mongod", "--replSet", "${MONGO_REPLICA_SET:-rs0}", "--bind_ip_all", "--port", "${MONGO_PORT:-28017}"]
     restart: unless-stopped
+    ports:
+      - "${MONGO_BIND_HOST:-127.0.0.1}:${MONGO_PORT:-28017}:${MONGO_PORT:-28017}"
+    environment:
+      MONGO_PORT: ${MONGO_PORT:-28017}
+      MONGO_REPLICA_SET: ${MONGO_REPLICA_SET:-rs0}
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --port
+        - "${MONGO_PORT:-28017}"
+        - --eval
+        - |
+          try {
+            rs.status();
+          } catch (error) {
+            if (error.code !== 94) throw error;
+            rs.initiate({
+              _id: process.env.MONGO_REPLICA_SET,
+              members: [{_id: 0, host: "localhost:" + process.env.MONGO_PORT}]
+            });
+          }
+          if (!db.hello().isWritablePrimary) quit(1);
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  mongo-data:
+
+secrets:
+  openbao-dev-root-token:
+    file: ${OPENBAO_DEV_ROOT_TOKEN_FILE:-.secrets/openbao-dev-root-token}
