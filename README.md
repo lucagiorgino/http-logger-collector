@@ -17,7 +17,8 @@ The application is responsible for:
 - Python 3.11+
 - FastAPI
 - Pydantic
-- MongoDB
+- MongoDB with native async PyMongo
+- HTTPX2 for HTTP clients and API tests
 - OpenBao Transit and KV v2 for key management
 - pytest
 - Docker Compose for development MongoDB/OpenBao; Kubernetes and Helm for deployment

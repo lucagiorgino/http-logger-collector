@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Self
 from urllib.parse import urlsplit
 
-import httpx
+import httpx2 as httpx
 
 from app.core.config import settings
 

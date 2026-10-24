@@ -226,6 +226,14 @@ credential path in `.env` and use `make run` instead of `make dev`. Kubernetes M
 cluster-internal; forwarding a single member port does not preserve replica discovery.
 
 ## Run tests
+Install the current dependencies with `make install`. The backend uses native async
+PyMongo, the official Auth0FastAPI SDK for token verification, and HTTPX2 for HTTP
+clients and Starlette's supported test-client backend. The SDK also installs HTTPX
+for its own requests. Deprecation and pending-deprecation warnings are test failures,
+except the SDK's current `authlib.jose` import warning: that exact upstream warning
+remains visible in pytest output. No deprecated JOSE APIs are called by application
+code; application encryption uses `joserfc`.
+
 ```bash
 pytest -q
 ruff check app tests

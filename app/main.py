@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await repository.ensure_indexes()
         yield
     finally:
-        repository.close()
+        await repository.close()
 
 
 app = FastAPI(title="Amazing HTTP Logger", lifespan=lifespan)

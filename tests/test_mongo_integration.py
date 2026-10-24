@@ -6,8 +6,8 @@ from time import monotonic
 from uuid import uuid4
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-from motor.motor_asyncio import AsyncIOMotorClient
+from httpx2 import ASGITransport, AsyncClient
+from pymongo import AsyncMongoClient
 from pymongo.monitoring import CommandListener
 from pymongo.read_preferences import Secondary
 
@@ -68,10 +68,10 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
         database_name = "traffic_test_" + uuid4().hex
         repository = MongoRepository(uri=uri, db_name=database_name)
         listener = RoutingListener()
-        monitored = AsyncIOMotorClient(
+        monitored = AsyncMongoClient(
             uri, event_listeners=[listener], serverSelectionTimeoutMS=1000, tz_aware=True
         )
-        repository.client.close()
+        await repository.client.close()
         repository.client = monitored
         repository.database = monitored[database_name]
         repository.traffic_logs = repository.database.get_collection(
@@ -137,7 +137,7 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
             )
             assert [document["_id"] for document in next_page] == [documents[1]["_id"]]
             for operation, (host, port) in set(listener.operations):
-                node = AsyncIOMotorClient(
+                node = AsyncMongoClient(
                     f"mongodb://{host}:{port}/?directConnection=true",
                     serverSelectionTimeoutMS=1000,
                 )
@@ -147,7 +147,7 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
                     if operation == "find" and not allow_primary:
                         assert hello["secondary"] is True
                 finally:
-                    node.close()
+                    await node.close()
             repository.analysis_logs = repository.analysis_logs.with_options(
                 read_preference=Secondary(tag_sets=[{"unavailable": "true"}])
             )
@@ -156,7 +156,7 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
             await ingest_traffic_logs([payload], "owner", MongoIngestionPublisher(repository))
         finally:
             await repository.client.drop_database(database_name)
-            repository.close()
+            await repository.close()
 
     asyncio.run(scenario())
 
@@ -310,6 +310,6 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
             app.dependency_overrides.clear()
             get_encryption_keys.cache_clear()
             await repository.client.drop_database(repository.database.name)
-            repository.close()
+            await repository.close()
 
     asyncio.run(scenario())

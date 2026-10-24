@@ -19,7 +19,7 @@ def mongo(monkeypatch):
     try:
         yield repository
     finally:
-        repository.close()
+        asyncio.run(repository.close())
 
 
 def test_writes_use_primary_and_analysis_uses_strict_secondary(mongo):
@@ -40,7 +40,7 @@ def test_local_development_can_explicitly_select_primary(monkeypatch):
         assert repository.analysis_logs.read_preference == ReadPreference.PRIMARY
         assert repository.traffic_logs.write_concern.document == {"w": "majority"}
     finally:
-        repository.close()
+        asyncio.run(repository.close())
 
 
 def test_primary_analysis_reads_are_rejected_outside_development(monkeypatch):

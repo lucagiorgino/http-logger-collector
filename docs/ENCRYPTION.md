@@ -298,7 +298,7 @@ over authenticated HTTPS):
 ```python
 import gzip
 import json
-import httpx
+import httpx2 as httpx
 from joserfc import jwe
 from joserfc.jwk import ECKey
 

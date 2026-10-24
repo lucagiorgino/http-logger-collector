@@ -2,11 +2,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from bson import ObjectId
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
-from pymongo import ASCENDING, DESCENDING, IndexModel, ReturnDocument
+from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, IndexModel, ReturnDocument
+from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.errors import CollectionInvalid, DuplicateKeyError, OperationFailure, PyMongoError
 from pymongo.read_concern import ReadConcern
 from pymongo.read_preferences import ReadPreference
+from pymongo.uri_parser import parse_uri
 from pymongo.write_concern import WriteConcern
 
 from app.core.config import settings
@@ -22,23 +23,27 @@ class MongoRepository:
     def __init__(self, uri: str | None = None, db_name: str | None = None) -> None:
         if settings.mongo_allow_primary_reads and settings.app_env != "development":
             raise PersistenceError("Primary analysis reads are restricted to development")
-        self.client = AsyncIOMotorClient(
-            uri or settings.mongo_uri,
-            serverSelectionTimeoutMS=settings.mongo_server_selection_timeout_ms,
-            tz_aware=True,
-        )
-        if not self.client.options.replica_set_name or self.client.options.direct_connection:
-            self.client.close()
+        uri = uri or settings.mongo_uri
+        try:
+            options = parse_uri(uri)["options"]
+        except PyMongoError:
+            raise PersistenceError("Invalid MongoDB connection configuration") from None
+        if not options.get("replicaSet") or options.get("directConnection"):
             raise PersistenceError(
                 "MONGO_URI must specify replicaSet and must not enable directConnection"
             )
+        self.client: AsyncMongoClient[dict[str, Any]] = AsyncMongoClient(
+            uri,
+            serverSelectionTimeoutMS=settings.mongo_server_selection_timeout_ms,
+            tz_aware=True,
+        )
         self.database = self.client[db_name or settings.mongo_db_name]
-        self.traffic_logs: AsyncIOMotorCollection = self.database.get_collection(
+        self.traffic_logs: AsyncCollection[dict[str, Any]] = self.database.get_collection(
             self.collection_name,
             read_preference=ReadPreference.PRIMARY,
             write_concern=WriteConcern("majority"),
         )
-        self.analysis_logs: AsyncIOMotorCollection = self.database.get_collection(
+        self.analysis_logs: AsyncCollection[dict[str, Any]] = self.database.get_collection(
             self.collection_name,
             read_preference=(
                 ReadPreference.PRIMARY
@@ -47,7 +52,7 @@ class MongoRepository:
             ),
             read_concern=ReadConcern("majority"),
         )
-        self.device_configurations: AsyncIOMotorCollection = self.database.get_collection(
+        self.device_configurations: AsyncCollection[dict[str, Any]] = self.database.get_collection(
             "device_configurations",
             read_preference=ReadPreference.PRIMARY,
             read_concern=ReadConcern("majority"),
@@ -203,5 +208,5 @@ class MongoRepository:
         except PyMongoError as exc:
             raise PersistenceError("Failed to report device configuration") from exc
 
-    def close(self) -> None:
-        self.client.close()
+    async def close(self) -> None:
+        await self.client.close()
