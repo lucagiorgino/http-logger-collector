@@ -3,11 +3,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from starlette.middleware.base import RequestResponseEndpoint
 
 from app.api.auth import router as auth_router
 from app.api.batches import router as batches_router
+from app.api.devices import router as devices_router
 from app.api.traffic_logs import router as traffic_logs_router
+from app.core.config import settings
+from app.core.encryption import get_encryption_keys
+from app.core.openbao import KMSUnavailable
 from app.db.mongo import MongoRepository, PersistenceError
 
 logger = logging.getLogger(__name__)
@@ -15,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    get_encryption_keys()
     repository = MongoRepository()
     app.state.mongo_repository = repository
     try:
@@ -29,14 +35,34 @@ app = FastAPI(title="Amazing HTTP Logger", lifespan=lifespan)
 app.include_router(auth_router)
 app.include_router(batches_router)
 app.include_router(traffic_logs_router)
+app.include_router(devices_router)
+
+
+@app.middleware("http")
+async def require_secure_transport(
+    request: Request, call_next: RequestResponseEndpoint
+) -> Response:
+    if (
+        settings.require_https
+        and request.url.path.startswith("/api/v1/")
+        and request.url.scheme != "https"
+    ):
+        return JSONResponse(status_code=400, content={"detail": "HTTPS is required"})
+    response = await call_next(request)
+    if request.url.path.startswith("/api/v1/devices/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.exception_handler(PersistenceError)
-async def storage_unavailable(request: Request, exc: PersistenceError) -> JSONResponse:
-    logger.error("Storage is unavailable")
+@app.exception_handler(KMSUnavailable)
+async def storage_unavailable(
+    request: Request, exc: PersistenceError | KMSUnavailable
+) -> JSONResponse:
+    logger.error("Storage or key management is unavailable")
     return JSONResponse(
         status_code=503,
-        content={"detail": "Storage is temporarily unavailable"},
+        content={"detail": "Storage or key management is temporarily unavailable"},
     )
 
 

@@ -12,6 +12,7 @@ venv/
 !.env.example
 *.key
 *.pem
+.secrets/
 
 # Local tooling and outputs
 .pytest_cache/

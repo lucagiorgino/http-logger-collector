@@ -27,6 +27,9 @@ def test_writes_use_primary_and_analysis_uses_strict_secondary(mongo):
     assert mongo.traffic_logs.write_concern.document == {"w": "majority"}
     assert mongo.analysis_logs.read_preference == ReadPreference.SECONDARY
     assert mongo.analysis_logs.read_concern.document == {"level": "majority"}
+    assert mongo.device_configurations.read_preference == ReadPreference.PRIMARY
+    assert mongo.device_configurations.read_concern.document == {"level": "majority"}
+    assert mongo.device_configurations.write_concern.document == {"w": "majority"}
 
 
 def test_local_development_can_explicitly_select_primary(monkeypatch):
@@ -149,3 +152,21 @@ def test_database_errors_are_explicit_and_never_fall_back(mongo):
     with pytest.raises(PersistenceError, match="replica"):
         asyncio.run(mongo.get_traffic_log("owner", ObjectId()))
     mongo.traffic_logs.find_one.assert_not_awaited()
+
+
+def test_device_configuration_lookup_and_cas_are_owner_scoped(mongo):
+    mongo.device_configurations = AsyncMock()
+    mongo.device_configurations.find_one.return_value = None
+    document = asyncio.run(mongo.get_device_configuration("owner", "device"))
+    assert document == {"version": 0, "encryption_mode": "tls_only"}
+    mongo.device_configurations.find_one.assert_awaited_once_with(
+        {"_id": {"user_id": "owner", "device_id": "device"}}
+    )
+    asyncio.run(mongo.update_device_configuration("owner", "device", 3, "required"))
+    args, kwargs = mongo.device_configurations.find_one_and_update.call_args
+    assert args[0] == {"_id": {"user_id": "owner", "device_id": "device"}, "version": 3}
+    assert args[1]["$inc"] == {"version": 1}
+    assert kwargs["upsert"] is False
+    mongo.device_configurations.find_one.side_effect = ServerSelectionTimeoutError("no primary")
+    with pytest.raises(PersistenceError, match="configuration"):
+        asyncio.run(mongo.get_device_configuration("owner", "device"))

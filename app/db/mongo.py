@@ -1,10 +1,10 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
-from pymongo import ASCENDING, DESCENDING, IndexModel
-from pymongo.errors import CollectionInvalid, OperationFailure, PyMongoError
+from pymongo import ASCENDING, DESCENDING, IndexModel, ReturnDocument
+from pymongo.errors import CollectionInvalid, DuplicateKeyError, OperationFailure, PyMongoError
 from pymongo.read_concern import ReadConcern
 from pymongo.read_preferences import ReadPreference
 from pymongo.write_concern import WriteConcern
@@ -46,6 +46,12 @@ class MongoRepository:
                 else ReadPreference.SECONDARY
             ),
             read_concern=ReadConcern("majority"),
+        )
+        self.device_configurations: AsyncIOMotorCollection = self.database.get_collection(
+            "device_configurations",
+            read_preference=ReadPreference.PRIMARY,
+            read_concern=ReadConcern("majority"),
+            write_concern=WriteConcern("majority"),
         )
 
     async def ping(self) -> bool:
@@ -145,6 +151,57 @@ class MongoRepository:
             )
         except PyMongoError as exc:
             raise PersistenceError("Failed to read traffic log from a replica") from exc
+
+    async def get_device_configuration(self, subject: str, device_id: str) -> dict[str, Any]:
+        try:
+            document = await self.device_configurations.find_one(
+                {"_id": {"user_id": subject, "device_id": device_id}}
+            )
+            return document or {"version": 0, "encryption_mode": "tls_only"}
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to read device configuration") from exc
+
+    async def update_device_configuration(
+        self, subject: str, device_id: str, expected_version: int, mode: str
+    ) -> dict[str, Any] | None:
+        try:
+            return await self.device_configurations.find_one_and_update(
+                {
+                    "_id": {"user_id": subject, "device_id": device_id},
+                    "version": expected_version,
+                },
+                {
+                    "$set": {"encryption_mode": mode, "updated_at": datetime.now(UTC)},
+                    "$inc": {"version": 1},
+                },
+                upsert=expected_version == 0,
+                return_document=ReturnDocument.AFTER,
+            )
+        except DuplicateKeyError:
+            return None
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to update device configuration") from exc
+
+    async def report_device_configuration(
+        self, subject: str, device_id: str, report: dict[str, Any]
+    ) -> bool:
+        try:
+            result = await self.device_configurations.update_one(
+                {
+                    "_id": {"user_id": subject, "device_id": device_id},
+                    "version": report["version"],
+                },
+                {
+                    "$set": {"configuration_status": report},
+                    "$setOnInsert": {"encryption_mode": "tls_only"},
+                },
+                upsert=report["version"] == 0,
+            )
+            return result.matched_count == 1 or result.upserted_id is not None
+        except DuplicateKeyError:
+            return False
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to report device configuration") from exc
 
     def close(self) -> None:
         self.client.close()
