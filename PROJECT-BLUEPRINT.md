@@ -12,40 +12,52 @@ The repository is a Python service with a minimal, layered application structure
 amazing-http-logger/
   AGENT.md                     # coding guidance for the repository
   README.md                    # setup, commands, API overview, local run instructions
-  Makefile                     # common workflows: install, test, lint, run, docker
+  Makefile                     # install, test, lint, run, image, Helm lifecycle
   pyproject.toml               # optional project metadata and tooling config
   requirements.txt             # Python dependencies
   .gitignore                   # secrets first: .env, *.key, *.pem, .venv, __pycache__
   .env.example                 # sample environment variables
   docker/
     Dockerfile                 # application container image
-    docker-compose.yml         # optional local MongoDB + app orchestration
+    docker-compose.yml         # development MongoDB/OpenBao; backend runs on the host
+  helm/amazing-http-logger/
+    Chart.yaml                 # Kubernetes deployment chart
+    values.yaml                # external MongoDB and HTTPS OpenBao by default
+    values-development.yaml    # optional replica set and ephemeral OpenBao
+    templates/                 # API, MongoDB, OpenBao, bootstrap, policy, smoke test
+    files/init-replica-set.js   # idempotent replica-set initialization
   app/
     __init__.py
     main.py                     # FastAPI app factory and route registration
+    kms.py                      # OpenBao provisioning and EC/KEK rotation CLI
     deps.py                    # shared dependencies (DB session, auth checks)
     api/
       __init__.py
-      auth.py                   # /auth/authorize, /auth/token
-      agents.py                 # /agent/traffic_logs and similar endpoints
+      auth.py                   # /api/v1/me; login/token issuance stays with Auth0
+      batches.py                # gzip/JWE /api/v1/traffic-log-batches ingestion
+      devices.py                # device encryption policy and capability/status APIs
+      traffic_logs.py           # owner-scoped collection/item analysis reads
     core/
       config.py                 # settings and environment loading
+      encryption.py             # JWE decryption and unwrapped EC key-set validation
+      openbao.py                # KMS authentication, Transit wrapping, KV access
       security.py               # JWT validation, token handling, auth helpers
       logging.py                # structured logging and audit hooks
     db/
-      mongo.py                  # MongoDB connection and helpers
+      mongo.py                  # time-series storage, primary writes, secondary reads
       models.py                 # document models / ODM schemas
     schemas/
-      auth.py                   # auth request/response schemas
       traffic.py                # log payload schemas
+      devices.py                # device configuration and status schemas
     services/
-      auth_service.py           # login, token generation, authorization logic
       traffic_service.py        # receive, validate, and persist traffic logs
+      ingestion.py              # replaceable publisher and direct MongoDB adapter
+      analysis.py               # cursor handling and stored-log representations
   tests/
     conftest.py                 # shared fixtures and app test setup
     test_auth.py                # auth flow tests
-    test_agents.py              # agent API and log ingestion tests
-    test_security.py            # security validation and permission tests
+    test_batches.py             # compressed ingestion, validation, authorization
+    test_analysis.py            # owner-scoped log reads and pagination
   docs/
     PLAN.md                     # design, scope, architecture, decisions
     IMPLEMENTATION_STATUS.md    # status by area, gaps, next steps, test inventory
@@ -57,9 +69,21 @@ Rules:
 - `app/api` handles HTTP requests and call into `app/services`.
 - `app/services` contains domain logic and orchestrates calls into persistence or security utilities.
 - `app/db` is the only layer that talks to MongoDB.
+- Batch ingestion hands normalized, minimized records to `IngestionPublisher`;
+  the MVP adapter writes directly, while a future adapter can publish to a durable queue.
+- Deployment analysis uses strict secondary routing without fallback. The single-node
+  local profile explicitly selects primary reads, guarded to development only.
+- Device policy enforcement uses primary/majority reads, not analysis replicas.
+  OpenBao Transit protects EC keys stored as ciphertext in KV v2. Backend processes
+  unwrap keys into RAM and decrypt JWE locally; clients receive only public keys.
+  No plaintext EC files or private EC Secrets are used. See `docs/ENCRYPTION.md`.
+- See `docs/PLAN.md` for the time-series schema and queue contract, and
+  `docs/RUNBOOK.md` for replica-set setup and deployment commands.
 - `tests/` validates behavior and imports the application package, not vice versa.
-- Secrets live only in git-ignored root files such as `.env` and `.env.local`.
-- The app is containerized with Docker and can be run with Docker Compose for local development.
+- Secrets live only in git-ignored files/directories such as `.env` and `.secrets/`,
+  or externally provisioned Kubernetes Secrets.
+- Local development uses MongoDB/OpenBao Compose and host Python with auto-reload.
+- Docker builds deployment images; Kubernetes and Helm manage deployment.
 
 ---
 
@@ -93,20 +117,26 @@ Read the relevant file before starting a task and update it when the design chan
 - Keep the application Python-first and avoid introducing unrelated infrastructure complexity.
 
 ## Commands
-Prerequisites: Python 3.11+, pip, and Docker for local MongoDB if needed.
+Prerequisites: Python 3.11+, pip, Docker, and Docker Compose.
+Kubernetes, kubectl, and Helm are needed only for deployment.
 
 ```bash
 make install
+make dev
 make test
 make lint
 make run
-make docker-up
+make dev-down
+make image
+make helm-lint
+make helm-up
+make helm-test
 ```
 
 ## Architecture in brief
 - `app/main.py` creates the API app and registers all routes.
 - `app/api/` exposes endpoints for auth and traffic ingestion.
-- `app/services/` contains business logic for token issuance, authorization, and log handling.
+- `app/services/` contains business logic for authorization, ingestion, and log handling.
 - `app/db/` persists data to MongoDB.
 - `app/core/` contains config, security helpers, and structured logging.
 
@@ -255,9 +285,19 @@ Recommended targets:
 - `make install` — create a virtual environment and install dependencies
 - `make test` — run all unit and integration tests
 - `make lint` — run formatters and linters such as ruff or flake8
-- `make run` — launch the FastAPI app locally
-- `make docker-up` — start the application and supporting services via Docker Compose
-- `make docker-down` — stop local containers
+- `make run` — launch `python -m app` using the selected `.env` file
+- `make dev` — start MongoDB/OpenBao Compose and host Python with auto-reload
+- `make dev-up/down` — start or stop both development dependencies
+- `make mongo-up` — start the one-container, single-node development replica set
+- `make mongo-down` — stop local MongoDB, retaining its volumes
+- `make openbao-up` — start/bootstrap ephemeral OpenBao and refresh its runtime token
+- `make openbao-down` — stop OpenBao, losing its in-memory key state
+- `make image` — build the application OCI image
+- `make helm-lint` — validate the configured Helm chart
+- `make helm-up` — install or upgrade the Kubernetes release
+- `make helm-test` — test the deployed Service and API schema
+- `make helm-down` — uninstall the release, retaining MongoDB PVCs
+- `make helm-port-forward` — expose the Kubernetes API on a separate configurable local port
 - `make check` — run a structured validation pass for the project
 
 The Makefile should reflect a Python workflow and avoid Go-specific commands such as `go mod tidy` or `go test`.

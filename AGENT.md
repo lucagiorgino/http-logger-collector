@@ -16,28 +16,37 @@ Read the relevant file before starting a task and update it when the design chan
 - docs/RUNBOOK.md: local setup and operational steps.
 
 ## Always keep in mind
-- Secrets belong in `.env`, never in source files or logs.
+- Secrets belong in git-ignored `.env` files or externally provisioned Kubernetes Secrets, never in source files or logs.
 - Authentication and authorization are mandatory for every sensitive route.
 - Data minimization matters: do not log raw secrets, tokens, or credentials.
 - Keep the application Python-first and avoid introducing unrelated infrastructure complexity.
 
 ## Commands
-Prerequisites: Python 3.11+, pip, and Docker for local MongoDB if needed.
+Prerequisites: Python 3.11+, pip, Docker, and Docker Compose.
+Kubernetes, kubectl, and Helm are needed only for deployment.
 
 ```bash
 make install
+make dev
 make test
 make lint
 make run
-make docker-up
+make dev-down
+make image
+make helm-lint
+make helm-up
+make helm-test
 ```
 
 ## Architecture in brief
 - `app/main.py` creates the API app and registers all routes.
 - `app/api/` exposes endpoints for auth and traffic ingestion.
-- `app/services/` contains business logic for token issuance, authorization, and log handling.
+- `app/services/` contains business logic for authorization, ingestion, and log handling.
 - `app/db/` persists data to MongoDB.
 - `app/core/` contains config, security helpers, and structured logging.
+- OpenBao Transit wraps EC keys stored as ciphertext in KV v2; only the KEK is
+  non-exportable. Backend decryption uses EC keys cached in RAM, never plaintext
+  key files or private EC Kubernetes Secrets. See `docs/ENCRYPTION.md`.
 
 ## Change these together
 - API route and schema: if the request body changes, update both the HTTP contract and validation schema.

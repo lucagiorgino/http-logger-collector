@@ -18,8 +18,9 @@ The application is responsible for:
 - FastAPI
 - Pydantic
 - MongoDB
+- OpenBao Transit and KV v2 for key management
 - pytest
-- Docker / Docker Compose
+- Docker Compose for development MongoDB/OpenBao; Kubernetes and Helm for deployment
 - ruff or flake8
 
 ## Repository structure
@@ -36,6 +37,7 @@ The application is responsible for:
 │   └── deps.py
 ├── tests/
 ├── docker/
+├── helm/
 ├── .env.example
 ├── requirements.txt
 ├── Makefile
@@ -72,54 +74,200 @@ AUTH0_DOMAIN=your-domain.auth0.com
 AUTH0_AUDIENCE=https://my-fastapi-api
 ```
 
-### 4) Start MongoDB
+### 4) Run MongoDB/OpenBao in Docker and the backend locally
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+make dev
 ```
 
-### 5) Run the app
+This starts one MongoDB container as a single-node replica set and one OpenBao
+container, provisions the encryption keys, then runs the backend with the local
+virtual environment and Uvicorn auto-reload.
+Changes under `app/` restart Python automatically: **no backend image build is needed**.
+The API is available at `http://127.0.0.1:8001`.
+
+The development database uses loopback port **28017**, with persistent storage and
+automatic replica-set initialization. There are no secondary containers or separate
+initialization service.
+
+OpenBao uses loopback port **28200**. Bootstrap creates private, git-ignored
+root/runtime credential files under `.secrets/`; the backend uses only the
+least-privilege runtime token. OpenBao dev mode is **ephemeral**: restarting it
+loses its encryption keys and makes previously buffered encrypted uploads
+undecryptable. MongoDB data remains persistent. See [KMS operations](docs/ENCRYPTION.md).
+
+Local `.env` enables `MONGO_ALLOW_PRIMARY_READS=true` because a one-node replica set
+has no secondary. This option is rejected outside `APP_ENV=development`; Helm
+deployments explicitly keep it disabled.
+
+### 5) Run or stop components separately
 
 ```bash
-uvicorn app.main:app --reload
+make dev-up
+make run
 ```
 
-Application URL:
+`make run` (or `python -m app`) loads `.env` and starts Python only. Compose and Python
+read the same file, including interpolated MongoDB/OpenBao addresses. Stop Python
+with Ctrl+C and both containers with `make dev-down`; MongoDB volumes are retained.
+Individual targets are `mongo-up/down` and `openbao-up/down`. `make openbao-up`
+also refreshes the 24-hour runtime credential. Neither development service has TLS;
+MongoDB has no authentication. Do not use this loopback-only stack for production.
 
-```text
-http://127.0.0.1:8000
+Helm is not required for this development workflow.
+
+### Port configuration
+
+| Process | Default port | Configuration |
+| --- | --- | --- |
+| Docker MongoDB | 28017 (loopback) | `.env`: `MONGO_PORT` |
+| Docker OpenBao | 28200 (loopback) | `.env`: `OPENBAO_PORT` |
+| Host Python API | 8001 (loopback) | `.env`: `APP_HOST`, `APP_PORT` |
+| Kubernetes API pod | 8000 (cluster-internal) | Helm: `app.port` |
+| Kubernetes MongoDB pods | 27017 (cluster-internal) | Helm: `mongodb.port` |
+| Kubernetes OpenBao pod | 8200 (cluster-internal) | Helm: `openbao.port` |
+| Kubernetes API port-forward | 18000 (loopback) | `make helm-port-forward KUBE_LOCAL_PORT=...` |
+
+The defaults are separate; choose free values if another application occupies them.
+Changing `MONGO_PORT` or `OPENBAO_PORT` updates both Compose and the corresponding
+interpolated backend address. Use `ENV_FILE=path/to/local.env` to select another local profile, or
+override individual values with environment/Make command-line variables.
+`.env` is git-ignored and retains your Auth0 settings; `.env.example` documents the
+parameters. Restart Python after changing environment configuration.
+
+### 6) REST API
+
+All `/api/v1` endpoints require an Auth0 access token in `Authorization: Bearer <token>`.
+Clients authenticate with Auth0 directly (Authorization Code with PKCE for user-device
+agents); this API does not issue tokens or proxy the IdP's authorization/token endpoints.
+`GET /api/v1/me` verifies the resulting identity. Interactive OpenAPI docs are at `/docs`.
+
+| Method | Resource | Behavior |
+| --- | --- | --- |
+| GET | `/api/v1/me` | Return the authenticated `user_id` |
+| POST | `/api/v1/traffic-log-batches` | Accept gzip JSON or a JWE-encrypted batch; return `202` with a receipt |
+| GET | `/api/v1/devices/{id}/configuration` | Read the caller's effective device policy and public encryption key |
+| PATCH | `/api/v1/devices/{id}/configuration` | Change policy with `manage:devices` permission and an expected version |
+| PUT | `/api/v1/devices/{id}/configuration-status` | Report applied version, encryption support, or a client error |
+| GET | `/api/v1/traffic-logs` | List the caller's logs from a secondary |
+| GET | `/api/v1/traffic-logs/{id}` | Read one of the caller's logs from a secondary; otherwise `404` |
+| GET | `/health` | Process liveness, not database or replica readiness |
+
+#### Upload a batch
+
+Send `Content-Type: application/json` and `Content-Encoding: gzip`. The decompressed
+body is `{"logs": [...]}`, containing 1-500 traffic records.
+Every `user_id` must match the verified token subject. A batch is limited to 1 MiB
+compressed and 8 MiB decompressed; malformed/truncated gzip, trailing data, and
+concatenated gzip members are rejected.
+
+```bash
+printf '%s' '{"logs":[{"user_id":"YOUR_AUTH0_SUBJECT","device_id":"device-1","timestamp":"2026-10-24T05:00:00Z","method":"GET","url":"https://example.com/","status_code":200}]}' |
+  gzip -c |
+  curl -X POST http://localhost:8001/api/v1/traffic-log-batches \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    -H "Content-Type: application/json" \
+    -H "Content-Encoding: gzip" \
+    --data-binary @-
 ```
 
-### 6) Auth0-protected routes
+The receipt contains `batch_id`, `accepted_count`, and `status` (`stored` in the MVP;
+`queued` for a future durable queue adapter). Validation and authorization complete
+before any publishing. A storage failure returns `503`, never an accepted receipt.
+MongoDB bulk writes are not transactional: a failed batch can have partially persisted,
+and retries can create duplicates. Exactly-once delivery and retry deduplication are
+not provided by this MVP.
 
-The app exposes the following routes:
+#### Encryption and remote client configuration
 
-- `GET /api/public` — no authentication required
-- `GET /api/private` — requires valid Auth0 token
-- `GET /api/private-scoped` — requires valid token with `read:messages` scope
-- `POST /agent/traffic_logs` — stores a traffic record when the token subject matches `user_id`
+HTTPS is required outside local development; gzip alone is not encryption.
+Devices default to `tls_only`. Administrators can set `optional` or `required`
+application encryption, and clients poll their effective configuration every 300
+seconds. Required encryption rejects plaintext batches regardless of client claims.
+Clients must implement polling and JWE support; the backend cannot upgrade old agents.
 
-Traffic records are stored in MongoDB's `traffic_logs` collection. Startup creates indexes for
-user/device event-time queries and ingestion-time queries. Sensitive headers are redacted, and raw
-request bodies are replaced with their byte length and SHA-256 digest.
+Encrypted uploads use JSON -> gzip -> JWE compact serialization with
+the server-configured curve and algorithms (default: NIST `P-384`,
+`ECDH-ES+A256KW`, and `A256GCM`). Select them with `ENCRYPTION_CURVE`,
+`ENCRYPTION_KEY_ALGORITHM`, and `ENCRYPTION_CONTENT_ALGORITHM`, or their Helm
+`encryption` values. The API advertises the selected suite and only public keys.
+OpenBao Transit wraps the private EC key set under a non-exportable KEK; KV v2
+stores only its ciphertext. The backend unwraps the set into RAM at startup,
+then performs JWE decryption locally: this is not remote ECDH or non-exportable EC keys.
+No plaintext EC key files or private EC key Secrets are used. Decryption and
+redaction happen before the existing publisher boundary. Management/enforcement
+reads use primary to avoid stale policies; analysis remains secondary-only.
+
+See [encryption setup and client protocol](docs/ENCRYPTION.md) for KMS provisioning,
+management requests, encrypted uploads, HTTPS proxy settings, and key rotation.
+
+#### Analyze logs
+
+`GET /api/v1/traffic-logs` supports `device_id`, timezone-aware `start_time` (inclusive),
+`end_time` (exclusive), `limit` (1-100, default 50), and an opaque `cursor`. Results are
+ordered by event timestamp and record ID, descending. Pass `next_cursor` unchanged,
+with the same filters, to retrieve the next page; `null` marks the end. Concurrent or
+late-arriving events do not provide a snapshot across pages.
+
+All analysis queries are owner-scoped. Deployments use strict `SECONDARY` routing
+with majority read concern and never fall back to primary: no secondary means `503`.
+The single-node local profile explicitly selects primary reads instead.
+Replica reads are eventually consistent, so a just-ingested record may temporarily
+be absent (including `404` on a single-record lookup).
+
+#### Storage and ingestion boundary
+
+Logs use the `traffic_logs` MongoDB time-series collection, with `timestamp` as the
+time field and `{user_id, device_id}` as stable `metadata`. Startup validates the
+collection options and creates query indexes. Writes use the elected primary with
+majority acknowledgement. `MONGO_URI` must specify `replicaSet`; `directConnection=true`
+is rejected so analysis cannot accidentally read a standalone or primary.
+
+Sensitive headers are redacted and bodies replaced with byte length and SHA-256
+before the `IngestionPublisher` boundary. The MVP's `MongoIngestionPublisher` stores
+directly; a durable queue producer can replace it without changing the routes.
+See [the plan](docs/PLAN.md) for the producer/worker contract.
 
 ## Validation
 
 ```bash
 pytest
-ruff check .
+ruff check app tests
 ```
 
-## Containerization
+Set `MONGO_TEST_URI` to the local single-node replica-set URI for its integration
+test. Set `MONGO_REPLICA_TEST_URI` to an isolated multi-member replica set to test
+secondary-only deployment routing. Tests create/drop uniquely named `traffic_test_*`
+databases and verify time-series storage and the selected read policy.
+
+For OpenBao integration and KMS-to-API-to-MongoDB ingestion, see the runbook's
+opt-in test command. KMS tests use isolated test keys/records and never rotate
+the application's configured key set.
+
+## Kubernetes deployment
 
 ```bash
-docker build -f docker/Dockerfile -t amazing-http-logger .
-docker run -p 8000:8000 --env-file .env amazing-http-logger
+minikube start
+make image
+docker pull mongo:7
+docker pull ghcr.io/openbao/openbao:2.7.1
+minikube image load amazing-http-logger:dev mongo:7 ghcr.io/openbao/openbao:2.7.1
+make helm-lint
+make helm-up KUBE_CONTEXT=minikube
+make helm-test KUBE_CONTEXT=minikube
+make helm-port-forward KUBE_CONTEXT=minikube
 ```
+
+Helm remains the deployment path. Its development profile includes a three-member
+MongoDB StatefulSet, ephemeral OpenBao with Kubernetes-auth bootstrap, and placeholder
+Auth0 settings. The chart defaults to external MongoDB through
+`externalMongo.existingSecret` and external HTTPS OpenBao through `openbao.address`;
+supply a published application image and real Auth0 values. See the runbook for deployment, Secret management, and
+`make helm-down`. Image builds are needed for deployments, not local Python edits.
 
 ## Notes
 
-- keep secrets in environment variables, never in source files
+- keep credentials in ignored files or externally managed Secrets, never in source files
 - validate all inbound payloads before persistence
 - redact sensitive fields before logging or storage
 - keep the API layer thin and delegate business logic to services
