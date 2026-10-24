@@ -36,6 +36,29 @@ test-stack:
 lint:
 	$(PYTHON_VENV) -m ruff check app tests integration_tests
 
+frontend-install:
+	npm --prefix frontend ci
+
+frontend-dev: FRONTEND_PORT ?= 3000
+frontend-dev:
+	PORT="$(FRONTEND_PORT)" npm --prefix frontend run dev
+
+frontend-build:
+	npm --prefix frontend run build
+
+frontend-start: FRONTEND_PORT ?= 3001
+frontend-start:
+	PORT="$(FRONTEND_PORT)" npm --prefix frontend run start
+
+frontend-test:
+	npm --prefix frontend test
+	npm --prefix frontend run lint
+	npm --prefix frontend run format:check
+
+frontend-test-browser:
+	npm --prefix frontend run build
+	npm --prefix frontend run test:e2e
+
 run:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app
 
@@ -82,4 +105,4 @@ helm-down:
 helm-port-forward:
 	kubectl $(KUBECTL_CONTEXT) --namespace "$(KUBE_NAMESPACE)" port-forward "service/$(KUBE_SERVICE)" "$(KUBE_LOCAL_PORT):http"
 
-.PHONY: install test test-stack lint run mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image helm-lint helm-template helm-up helm-test helm-down helm-port-forward
+.PHONY: install test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image helm-lint helm-template helm-up helm-test helm-down helm-port-forward

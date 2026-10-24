@@ -61,6 +61,13 @@ amazing-http-logger/
   integration_tests/
     stack_client.py             # HTTP-only, threaded OAuth device emulator
     test_stack.py               # opt-in encrypted/plain whole-stack scenario
+  frontend/
+    app/                        # JavaScript/JSX Next.js SSR pages and policy action
+    components/ui/              # JavaScript shadcn/ui registry components
+    lib/                        # server Auth0 session and private API adapter
+    tests/                      # focused adapter tests and mocked browser flows
+    .env.example                # separate private frontend configuration
+    README.md                   # UI architecture, Auth0 setup and run commands
   docs/
     PLAN.md                     # design, scope, architecture, decisions
     IMPLEMENTATION_STATUS.md    # status by area, gaps, next steps, test inventory

@@ -226,6 +226,12 @@ credential path in `.env` and use `make run` instead of `make dev`. Kubernetes M
 cluster-internal; forwarding a single member port does not preserve replica discovery.
 
 ## Run tests
+For the JavaScript SSR management UI, see [`frontend/README.md`](../frontend/README.md).
+Run `make frontend-dev` on its separate default port 3000 with the backend running.
+It requires its own Auth0 Regular Web Application in `frontend/.env.local`, not
+agent M2M credentials. `make frontend-test` checks adapter tests and lint;
+`make frontend-test-browser` builds and runs isolated browser tests.
+
 Install the current dependencies with `make install`. The backend uses native async
 PyMongo, the official Auth0FastAPI SDK for token verification, and HTTPX2 for HTTP
 clients and Starlette's supported test-client backend. The SDK also installs HTTPX

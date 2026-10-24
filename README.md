@@ -21,6 +21,7 @@ The application is responsible for:
 - Auth0FastAPI SDK for access-token verification and cached discovery/JWKS
 - HTTPX2 for HTTP clients and API tests
 - OpenBao Transit and KV v2 for key management
+- Next.js SSR management console in `frontend/` (JavaScript/JSX, shadcn/ui)
 - pytest
 - Docker Compose for development MongoDB/OpenBao; Kubernetes and Helm for deployment
 - ruff or flake8
@@ -39,6 +40,7 @@ The application is responsible for:
 │   └── deps.py
 ├── tests/
 ├── integration_tests/
+├── frontend/
 ├── docker/
 ├── helm/
 ├── .env.example
@@ -50,6 +52,25 @@ The application is responsible for:
 ```
 
 ## Local development
+
+### Management dashboard
+
+The root-level [`frontend/`](frontend/README.md) provides an SSR overview, traffic
+explorer, request details, and owner-scoped device encryption policy management.
+It uses JavaScript (no TypeScript), shadcn/ui, and server-side Auth0 sessions.
+
+```bash
+make frontend-install
+cp frontend/.env.example frontend/.env.local
+# Configure the dedicated Auth0 Regular Web Application; see frontend/README.md.
+make frontend-dev
+```
+
+The development UI defaults to **http://localhost:3000** and calls the running backend at
+`http://127.0.0.1:8001` from its server. Ordinary agent credentials do not need
+`manage:devices`; only an operator changing policy does. The current backend has
+no cross-owner fleet access: a human session cannot manage a separate M2M
+subject's devices. See the frontend guide for Auth0 setup, permissions and tests.
 
 ### 1) Create a virtual environment
 

@@ -44,6 +44,10 @@ make helm-test
 - `app/services/` contains business logic for authorization, ingestion, and log handling.
 - `app/db/` persists data to MongoDB.
 - `app/core/` contains config, security helpers, and structured logging.
+- `frontend/` is the JavaScript/JSX Next.js SSR management console with shadcn/ui.
+  Read its README before changing it. API tokens stay server-side; no browser
+  token endpoint or cross-owner bypass is permitted. Use `make frontend-test`,
+  `make frontend-build`, and `make frontend-test-browser` for its validation.
 - OpenBao Transit wraps EC keys stored as ciphertext in KV v2; only the KEK is
   non-exportable. Backend decryption uses EC keys cached in RAM, never plaintext
   key files or private EC Kubernetes Secrets. See `docs/ENCRYPTION.md`.

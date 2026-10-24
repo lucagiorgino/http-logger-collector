@@ -1,6 +1,12 @@
 # Implementation status
 
 ## Current status
+- Root-level `frontend/` implements a Next.js SSR management dashboard using
+  JavaScript/JSX, Tailwind and shadcn/ui. Auth0 sessions/API tokens stay server-side.
+  Screens cover sample overview metrics, filtered/paginated traffic, request
+  details, exact-device policy management and acknowledgement, and verified owner.
+  It preserves current owner boundaries; cross-owner fleet management and inventory
+  require new backend contracts and are not implied by management permission.
 - Project structure initialized.
 - Core FastAPI app skeleton created.
 - API, service, publisher, and persistence layers are implemented.
