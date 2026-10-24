@@ -65,6 +65,13 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+Set the Auth0 values in `.env` before running the API:
+
+```env
+AUTH0_DOMAIN=your-domain.auth0.com
+AUTH0_AUDIENCE=https://my-fastapi-api
+```
+
 ### 4) Start MongoDB
 
 ```bash
@@ -82,6 +89,19 @@ Application URL:
 ```text
 http://127.0.0.1:8000
 ```
+
+### 6) Auth0-protected routes
+
+The app exposes the following routes:
+
+- `GET /api/public` — no authentication required
+- `GET /api/private` — requires valid Auth0 token
+- `GET /api/private-scoped` — requires valid token with `read:messages` scope
+- `POST /agent/traffic_logs` — stores a traffic record when the token subject matches `user_id`
+
+Traffic records are stored in MongoDB's `traffic_logs` collection. Startup creates indexes for
+user/device event-time queries and ingestion-time queries. Sensitive headers are redacted, and raw
+request bodies are replaced with their byte length and SHA-256 digest.
 
 ## Validation
 

@@ -1,6 +1,5 @@
 import logging
 
-
 logger = logging.getLogger("amazing_http_logger")
 if not logger.handlers:
     handler = logging.StreamHandler()
