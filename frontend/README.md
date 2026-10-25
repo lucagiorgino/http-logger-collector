@@ -21,7 +21,7 @@ openssl rand -hex 32
 make frontend-dev
 ```
 
-Start NGINX with `make proxy-up` and open **http://localhost:8080**.
+`make dev` starts NGINX; open **http://localhost:8080**.
 Without complete Auth0 configuration, the welcome
 page displays setup instructions instead of pretending to be authenticated.
 There is no mock/demo bypass in the application.
@@ -30,8 +30,9 @@ The frontend has its own environment file; it does not read the backend's `.env`
 Its listener is **3000** in development and production; Python uses **9090** in both.
 NGINX exposes the shared development origin on **8080**. Change the listener with
 `make frontend-dev FRONTEND_PORT=3010` (or `PORT=3010 npm --prefix frontend run dev`)
-and update `APP_BASE_URL` and the corresponding Auth0 URLs together. `PORT` must
-be supplied to the process, not placed in Next.js's `.env.local`.
+and update the proxy's upstream port. Change `APP_BASE_URL` and Auth0 URLs together
+only if the browser-facing origin changes. `PORT` belongs in the process
+environment, not Next.js's `.env.local`.
 
 `BACKEND_API_URL` is reached by the Next.js **server**, not the browser. When both
 processes run on the development host, use `http://127.0.0.1:9090`, even if
@@ -42,35 +43,18 @@ Use the origin only, without `/api` or `/api/v1`: request paths already contain
 The public frontend origin belongs in `APP_BASE_URL`; it does not determine the
 API address.
 
-For ngrok, point the **single public endpoint** at `http://127.0.0.1:8080`.
-NGINX sends `/api/v1/*`, API docs and health requests to **9090**, and everything
-else (including `/auth/*`) to **3000**, preserving paths. Set backend-stack
-`PROXY_EXTERNAL_SCHEME=https` only when that loopback listener is exclusively
-behind the trusted HTTPS tunnel. Use the public origin as `APP_BASE_URL` and in
-Auth0's callback/logout configuration. The Compose proxy publishes port 8080
-and uses the Docker Desktop host gateway by default. On native Linux, run
-`make proxy-up PROXY_SERVICE=proxy-host`
-to reach loopback-bound applications through host networking.
+For proxy routing, trusted HTTPS tunnels and native Linux's
+`PROXY_SERVICE=proxy-host`, see [local stack setup](../docs/RUNBOOK.md#run-the-live-development-stack)
+and [ports](../docs/RUNBOOK.md#environment-profiles-and-ports).
 
 If the UI reports **HTTP 502** while the local backend works, check
 `BACKEND_API_URL` from the frontend host. A proxy can return 502 HTML before the
 request ever reaches FastAPI. Check `/health` at that configured address and at
 the local API; direct unauthenticated `/api/v1/traffic-logs` requests should return
-401, not a gateway error. Ngrok's `ERR_NGROK_8012` indicates an upstream connection
-problem, not an OAuth rejection. Check its reported target against the API's
-actual listener, including HTTP versus HTTPS, host, port and IPv4/IPv6 resolution.
+401, not a gateway error. Check the proxy's target against the actual listener:
+HTTP versus HTTPS, host, port and IPv4/IPv6 resolution.
 Fix the proxy's upstream or use the reachable internal API address, then restart
 the frontend after changing environment settings.
-
-## Pipeline status
-
-Open **Status** in the sidebar (`/status`) to see the eight-stage ingestion
-diagram and per-node healthy/degraded/unavailable/unknown state. The page is
-server-rendered, works without browser JavaScript and refreshes on request.
-It requires `manage:devices`, calls `/api/v1/status` with the server-side token,
-and uses the same implementation for local MinIO/emulator and GCP GCS/Pub/Sub.
-Missing worker reports do not produce green nodes. Receipt counts are not native
-queue/DLQ depth. See the [runbook](../docs/RUNBOOK.md#pipeline-status).
 
 On GCP, Terraform supplies distinct Cloud Run HTTPS origins: `APP_BASE_URL` is
 the frontend `public_url`, while `BACKEND_API_URL` is `backend_url`, without an
@@ -164,7 +148,7 @@ In Auth0 Dashboard, open **Applications > Applications**, select the dedicated
 frontend Web application matching `AUTH0_CLIENT_ID`, and open **Settings**.
 Add the **exact `APP_BASE_URL` value** from the frontend environment file to
 **Allowed Logout URLs**, preserving any other valid entries, and save.
-For ngrok this is the public **frontend** HTTPS URL, not the backend URL,
+For a public proxy this is the **frontend** HTTPS URL, not the backend URL,
 `/auth/callback`, or `/auth/logout`. Callback URLs and logout URLs are separate
 allowlists; successful sign-in does not establish that sign-out is configured.
 
@@ -204,6 +188,7 @@ server-side access, not a browser SPA making credential-bearing API calls.
 | `/devices/:id`           | Device identity, policy editing, agent acknowledgement, public encryption suite and traffic link                 |
 | `/devices?device_id=...` | Exact policy lookup; redirects to the detail page's explicit configuration view                                  |
 | `/settings`              | Application-wide storage and encryption, ordinary/suspicious retention, API-verified identity and access context |
+| `/status`                | Eight-stage pipeline diagram; shared local/GCP health snapshot, manual refresh; requires `manage:devices`        |
 
 Pages render their API data on the server with `cache: no-store`. Read views
 work without browser JavaScript; client JavaScript enhances navigation and the
@@ -212,75 +197,26 @@ Next.js's same-origin protections. Policy edits carry `expected_version`; confli
 reload the current policy with an explicit error instead of overwriting it.
 Timeouts, permission denials, API outages, and empty results are different UI states.
 
-**Device-only scope:** resources use globally unique device IDs, not user/device
-pairs. Operators with `manage:devices` can manage and read fleet resources,
-including independent M2M devices. Tokens without the grant are restricted to
-their issuer-bound device. Authentication is still mandatory; broad management
-access must be granted only to trusted operators. Status reports always require
-the agent's own JWT-bound ID.
+**Devices:** register the ID returned by the agent's `/me`, then use its detail
+page for later edits/acknowledgements. Inventory uses **Unnamed device** and
+**Agent / policy record** labels without inventing registration data.
+Duplicate registration shows **Device already exists**, never an updated policy.
+Exact policy lookup does not create an inventory entry. Encoded IDs, including
+`@clients` and literal percent characters, preserve identity through navigation.
+See [registration and authorization contracts](../docs/API.md#register-a-device-and-configure-its-policy).
 
-Register a device using its exact issuer-bound ID, a name and its initial policy.
-The form calls `POST /api/v1/devices` with the server-side access token; the ID must
-match the agent's `/api/v1/me`. No Auth0 credentials or JWT
-claims are created by this form. Inventory comes from `GET /api/v1/devices` with
-keyset pagination. It includes named registrations and records created by agent
-acknowledgements or policy changes, including version-zero records without names
-or registration timestamps. These appear as **Unnamed device** and
-**Agent / policy record**; the UI does not fabricate registration metadata.
-Both IDs and names must be globally unique. Registration sends no version field;
-an existing ID (including a policy-only record) or name returns HTTP 400 and shows
-**Device already exists**, not a success message. Duplicate requests never change
-the existing policy. Use the policy editor, not registration, for existing devices.
-Exact names are case-sensitive; the form trims surrounding whitespace.
+**Workspace:** storage choices warn about discard/plaintext; retention warns
+about irreversible expiration. Both sections save together with one expected
+version. Detail views escape retained bodies; credentials stay redacted.
+The adapter supports flat historical and current API records without accessing
+Mongo internals. See [workspace API](../docs/API.md#workspace-configuration) and
+[retention failure recovery](../docs/RUNBOOK.md#retention-operations).
 
-Inventory and traffic links open dedicated device details using
-`GET /api/v1/devices/{id}`. Missing records and API failures are explicit error
-states. Exact policy lookup still works for unknown IDs through `/configuration`;
-it does not create a record until a policy is saved or the agent reports status.
-The API's default TLS-only/version-0 response does not prove that a device exists
-or is online. Encoded IDs, including `@clients` and literal percent characters,
-retain their identity through navigation and API calls. There is no aggregation API. Overview counts are labeled as **sample**
-metrics, not total fleet statistics. A saved policy is not proof that an agent has
-applied it; the acknowledgement/version is displayed separately.
-
-**Workspace configuration:** `/settings` reads and updates
-`/api/v1/workspace/configuration` with the server-side token. `manage:devices`
-is required for both operations. **Storage and encryption** provides a choice
-for each of request bodies, authorization headers and cookies:
-**Do not retain**, **Retain encrypted** (default), or **Retain plaintext**.
-Retained encrypted fields use a dedicated OpenBao AES-256-GCM key, separate
-from agent upload JWE. Parser workers discard selected fields before silver/Mongo
-storage or Transit; discarded
-bodies keep their byte length/SHA-256 digest, and discarded header entries are removed.
-Plaintext retention is an explicit encryption opt-out. The form warns about
-discarded data and plaintext storage, and uses
-`expected_version` to reject stale edits with HTTP 409. It works without JavaScript.
-Existing records are not rewritten; old discarded bodies cannot be recovered.
-Authorized request details display retained bodies as escaped text. Collection
-reads omit bodies; authorization/cookie values stay redacted even in details.
-MongoDB's nested `ingestion`/`logdata` storage layout is internal to the backend:
-the traffic-log API still returns the same flat fields consumed by these pages.
-Both historical flat records and new nested records are supported without a UI migration.
-
-The backend `/api/v1/traffic-log-uploads` endpoint temporarily stores original
-bytes in GCS/MinIO **before** applying discard rules. Object-event Pub/Sub triggers
-the parser/protect worker using the acceptance-time policy snapshot; silver Pub/Sub
-feeds a rate-limited Mongo loader. This raw-retention boundary
-and asynchronous status API are documented in the root README. There
-is no new raw-upload or DLQ management screen in this frontend.
-
-**Retention policies:** a separate Workspace section controls ordinary logs
-(enabled, 7 days by default) and suspicious logs (enabled, 30 days by default).
-Each has an independent enable switch and integer day window (1-24855).
-Disabling a category retains it indefinitely. The form saves both sections with
-the same expected version and works without JavaScript.
-Retention applies to existing records based on event timestamps, unlike field
-storage choices, which affect future uploads. The UI warns that expired data is permanently
-deleted and MongoDB background bucket expiration is not an exact deadline.
-Suspicious classification is server-owned and reserved for a future analysis job;
-agents cannot exempt uploads from ordinary retention. A failed save can leave
-desired settings stored without all index changes applied; reload and retry after
-backend recovery. See the [backend retention contract](../README.md#retention-policies).
+**Interpretation:** overview counts are samples, not fleet aggregation; a saved
+policy is not proof an agent applied it. Status metadata/heartbeats are not
+native queue depth or end-to-end guarantees; see [probe semantics](../docs/RUNBOOK.md#pipeline-status).
+There is no raw-upload or DLQ management screen. The [pipeline design](../docs/INGESTION.md)
+owns raw privacy, asynchronous processing and delivery guarantees.
 
 ## Validation
 

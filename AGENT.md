@@ -13,9 +13,12 @@ log raw payloads or credentials.
 
 ## The docs
 Read the relevant file before starting a task and update it when the design changes.
-- docs/PLAN.md: current design and decisions.
-- docs/IMPLEMENTATION_STATUS.md: status, gaps, and test coverage.
-- docs/RUNBOOK.md: local setup and operational steps.
+- [Project blueprint](PROJECT-BLUEPRINT.md): architecture and persistence model.
+- [API](docs/API.md), [ingestion](docs/INGESTION.md), and
+  [encryption](docs/ENCRYPTION.md): canonical contracts and guarantees.
+- [Implementation status](docs/IMPLEMENTATION_STATUS.md): capabilities and evidence.
+- [Runbook](docs/RUNBOOK.md): setup, tests and operations.
+- [Plan](docs/PLAN.md): remaining verification gates, not duplicated design.
 
 ## Always keep in mind
 - Secrets belong in git-ignored `.env` files or externally provisioned Kubernetes Secrets, never in source files or logs.
@@ -51,7 +54,7 @@ make helm-test
   documents cross silver Pub/Sub to `app.spool_worker load` for rate-limited
   majority Mongo writes and raw cleanup. This is the sole ingestion pipeline.
   POST acknowledges raw receipt; content validation fails asynchronously.
-  See README's core ingestion flow and the runbook.
+  See the [ingestion design](docs/INGESTION.md) and runbook.
 - `frontend/` is the JavaScript/JSX Next.js SSR management console with shadcn/ui.
   Read its README before changing it. API tokens stay server-side; no browser
   token endpoint or cross-owner bypass is permitted. Use `make frontend-test`,
@@ -75,4 +78,6 @@ make helm-test
 
 ## Conventions
 - Deliberate simplifications should be marked with a brief comment and an upgrade path.
-- Documentation reflects current design and current status only; decisions go in the plan document.
+- Keep detailed explanations in their canonical guide and link instead of copying.
+- Preserve the README's [manual roadmap](README.md#future-roadmap--architecture-enhancements)
+  verbatim. Do not edit it or derive plans, tasks or implementation from it.

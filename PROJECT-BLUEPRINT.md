@@ -1,374 +1,133 @@
-# Amazing HTTP Logger project blueprint
+# Project blueprint
 
-The ingestion pipeline is documented in the README's **Core
-ingestion flow**: GCS/Pub/Sub in production, MinIO/Pub/Sub emulator locally, a
-decrypt/parse/protect worker and a separate rate-limited Mongo loader linked by
-a dedicated Pub/Sub silver subscription. It is a temporary raw spool, not a
-historical datalake. Uploads acknowledge durable original bytes; content validation
-is asynchronous. Device policies, workspace retention and analysis reads remain independent.
+Implementation map and architectural rationale for [Amazing HTTP Logger](README.md).
+Detailed contracts live in the [API reference](docs/API.md),
+[ingestion design](docs/INGESTION.md) and [encryption protocol](docs/ENCRYPTION.md);
+commands belong in the [runbook](docs/RUNBOOK.md).
 
-This document defines the repository structure and engineering conventions for the Python backend implementation. It is intentionally implementation-focused and avoids repeating the original interview brief or writing a second project description.
+## Component boundaries
 
----
+The Python/FastAPI API authenticates and authorizes, bounds input and orchestrates
+services. The parser handles expensive cryptography/validation; the independent
+loader controls Mongo throughput. Native async PyMongo handles persistence;
+HTTPX2 handles outbound HTTP. Next.js is a JavaScript/JSX SSR console, not a SPA
+holding API credentials.
 
-## 1. Repository structure
+| Code | Responsibility |
+| --- | --- |
+| [`app/main.py`](app/main.py), [`app/deps.py`](app/deps.py) | Application lifecycle, routes and dependency wiring |
+| [`app/api/`](app/api/) | Identity, uploads, devices, workspace, analysis and Status HTTP handlers |
+| [`app/schemas/`](app/schemas/) | Closed request schemas and explicit response models |
+| [`app/core/auth.py`](app/core/auth.py), [`security.py`](app/core/security.py) | Auth0 validation, identity/permission and HTTPS boundaries |
+| [`app/core/encryption.py`](app/core/encryption.py), [`storage_encryption.py`](app/core/storage_encryption.py) | JWE and field protection |
+| [`app/core/openbao.py`](app/core/openbao.py), [`app/kms.py`](app/kms.py) | KMS adapter and administrative key lifecycle |
+| [`app/services/upload_pipeline.py`](app/services/upload_pipeline.py) | Parser/loader orchestration, retry, replay and cleanup |
+| [`upload_cloud.py`](app/services/upload_cloud.py), [`upload_queue.py`](app/services/upload_queue.py) | Object storage and Pub/Sub adapters |
+| [`upload_state.py`](app/services/upload_state.py), [`queued_batch.py`](app/services/queued_batch.py) | Receipt leases/state and bounded silver encoding |
+| [`traffic_service.py`](app/services/traffic_service.py), [`batch_codec.py`](app/services/batch_codec.py) | Batch validation, normalization and protection |
+| [`analysis.py`](app/services/analysis.py), [`pipeline_status.py`](app/services/pipeline_status.py) | Analysis representation/cursors and portable health snapshot |
+| [`app/db/mongo.py`](app/db/mongo.py) | Collections/indexes, primary operations and secondary analysis |
+| [`app/spool_worker.py`](app/spool_worker.py), [`app/spool_dev.py`](app/spool_dev.py) | Worker/operator entry point and local event bootstrap |
+| [`frontend/`](frontend/README.md) | Auth0 sessions, private API adapter, SSR pages and forms |
+| [`docker/`](docker/) | Deployment image and profile-based local dependency stack |
+| [`helm/amazing-http-logger/`](helm/amazing-http-logger/) | Optional Kubernetes workloads; cloud resources remain external |
+| [`infra/gcp/`](infra/gcp/README.md) | Terraform, direct Cloud Run services, cloud-only KMS overlay and secret bootstrap |
 
-The repository is a Python service with a minimal, layered application structure and a clear separation between API layer, business logic, persistence, and tests.
+Tests import the application, never vice versa. Add HTTP contracts with matching
+schemas and refusal-path tests; keep business logic out of route handlers.
+Use [contributor guidance](AGENT.md) for repository rules, not copied scaffolding.
 
-```text
-amazing-http-logger/
-  AGENT.md                     # coding guidance for the repository
-  README.md                    # setup, commands, API overview, local run instructions
-  Makefile                     # install, test, lint, run, image, Helm lifecycle
-  pyproject.toml               # optional project metadata and tooling config
-  requirements.txt             # Python dependencies
-  .gitignore                   # secrets first: .env, *.key, *.pem, .venv, __pycache__
-  .env.example                 # sample environment variables
-  docker/
-    Dockerfile                 # application container image
-    docker-compose.yml         # all development dependencies; profiles select groups/proxy mode
-  helm/amazing-http-logger/
-    Chart.yaml                 # Kubernetes deployment chart
-    values.yaml                # external MongoDB and HTTPS OpenBao by default
-    values-development.yaml    # optional replica set and ephemeral OpenBao
-    templates/                 # API, MongoDB, OpenBao, bootstrap, policy, smoke test
-    files/init-replica-set.js   # idempotent replica-set initialization
-  app/
-    __init__.py
-    main.py                     # FastAPI app factory and route registration
-    kms.py                      # OpenBao provisioning and EC/KEK rotation CLI
-    deps.py                    # shared dependencies (DB session, auth checks)
-    api/
-      __init__.py
-      auth.py                   # /api/v1/me; login/token issuance stays with Auth0
-      uploads.py                # durable raw upload and device-scoped receipt status
-      devices.py                # device encryption policy and capability/status APIs
-      traffic_logs.py           # owner-scoped collection/item analysis reads
-    core/
-      config.py                 # settings and environment loading
-      encryption.py             # JWE decryption and unwrapped EC key-set validation
-      openbao.py                # KMS authentication, Transit wrapping, KV access
-      security.py               # JWT validation, token handling, auth helpers
-      logging.py                # structured logging and audit hooks
-    db/
-      mongo.py                  # time-series storage, primary writes, secondary reads
-      models.py                 # document models / ODM schemas
-    schemas/
-      traffic.py                # log payload schemas
-      devices.py                # device configuration and status schemas
-    services/
-      traffic_service.py        # receive, validate, and persist traffic logs
-      upload_workers.py         # parse/protect, silver publishing, Mongo loading
-    spool_worker.py             # parse/load processes and replay/cleanup CLI
-      analysis.py               # cursor handling and stored-log representations
-  tests/
-    conftest.py                 # shared fixtures and app test setup
-    test_auth.py                # auth flow tests
-    test_uploads.py             # raw receipts, async validation, workers and recovery
-    test_analysis.py            # owner-scoped log reads and pagination
-  integration_tests/
-    stack_client.py             # HTTP-only, threaded OAuth device emulator
-    test_stack.py               # opt-in encrypted/plain whole-stack scenario
-  frontend/
-    app/                        # JavaScript/JSX Next.js SSR pages and policy action
-    components/ui/              # JavaScript shadcn/ui registry components
-    lib/                        # server Auth0 session and private API adapter
-    tests/                      # focused adapter tests and mocked browser flows
-    .env.example                # separate private frontend configuration
-    README.md                   # UI architecture, Auth0 setup and run commands
-  docs/
-    PLAN.md                     # design, scope, architecture, decisions
-    IMPLEMENTATION_STATUS.md    # status by area, gaps, next steps, test inventory
-    RUNBOOK.md                  # run, debug, and maintenance procedures
+## Trust and availability decisions
+
+- Auth0, not this service, issues tokens. Globally unique device identity and
+  fleet permission are trusted JWT claims, not uploaded/user-editable fields.
+- Gateways terminate TLS and sanitize forwarding metadata; only trusted ingress
+  can supply upload peer identity. Captured traffic is untrusted observation.
+- Raw durability precedes acknowledgement; minimization/protection precedes
+  silver publication. Raw is a deliberate, restricted privacy/replay boundary.
+- Parser and loader have different privileges. The loader has no upload EC/KMS
+  credentials. Neither worker has an unbounded in-memory backlog.
+- Operational settings/receipts use primary/majority; analysis uses strict
+  secondary/majority, accepting replica lag instead of increasing primary load
+  during replica outages. Replica-set URIs are mandatory; direct connections fail.
+- OpenBao wraps EC keys at rest, but JWE private keys enter process RAM. If this
+  is unacceptable, remote ECDH or a protocol redesign is needed. Cloud KMS keeps
+  wrapping/storage master keys non-exportable; its envelope is not OpenBao-compatible.
+
+No ciphertext/key authority migration is automatic. Use fresh test/cloud databases
+when changing identity/storage authorities; startup never resets data.
+
+## Stored document layout
+
+MongoDB 7+ `traffic_logs` is a time-series collection with `timeField=timestamp`,
+`metaField=metadata` and seconds granularity:
+
+```javascript
+{
+  _id: ObjectId("6add2bcd3a25072164dd8cc9"),
+  timestamp: ISODate("2026-10-24T22:06:05.206Z"),
+  metadata: {device_id: "example-device", suspicious: false},
+  ingestion: {
+    batch_id: "4d737a07-51a6-4164-abb3-6ea75350b6fd",
+    client_id: "example-oauth-client",
+    source_ip: "127.0.0.1",
+    received_at: ISODate("2026-10-24T22:06:05.211Z")
+  },
+  logdata: {
+    method: "GET",
+    url: "https://example.test/",
+    status_code: 200,
+    request_headers: {},
+    response_headers: {},
+    captured_source_ip: null,
+    destination_ip: "203.0.113.50",
+    http_version: "2",
+    response_size_bytes: 1024,
+    duration_ms: 12.5,
+    process_name: "example-agent",
+    body_length: 0,
+    body_sha256: null
+  }
+}
 ```
 
-Rules:
-- The project is a Python app, not a Go workspace, and it is not structured as several independent modules.
-- `app/api` handles HTTP requests and call into `app/services`.
-- `app/services` contains domain logic and orchestrates calls into persistence or security utilities.
-- `app/db` is the only layer that talks to MongoDB.
-- Upload ingestion durably stores original bytes in GCS/MinIO before HTTP 202.
-  Object-event Pub/Sub triggers parsing, minimization and field encryption;
-  silver Pub/Sub buffers protected documents for rate-limited majority Mongo writes.
-  Raw deletion follows the majority `stored` receipt. Delivery is at least once,
-  not exactly once. Both workers use `app.spool_worker parse/load`.
-- Deployment analysis uses strict secondary routing without fallback. The single-node
-  local profile explicitly selects primary reads, guarded to development only.
-- Device policy enforcement uses primary/majority reads, not analysis replicas.
-  OpenBao Transit protects EC keys stored as ciphertext in KV v2. Backend processes
-  unwrap keys into RAM and decrypt JWE locally; clients receive only public keys.
-  No plaintext EC files or private EC Secrets are used. See `docs/ENCRYPTION.md`.
-- MongoDB 7+ time-series retention uses separate partial TTL indexes on the time
-  field for ordinary and suspicious metadata buckets, never a collection-wide TTL.
-  Workspace policy defaults to 7/30 days and can independently disable either.
-  Suspicious classification is server-owned; the analysis job is not implemented.
-- See `docs/PLAN.md` for the time-series schema and pipeline contract, and
-  `docs/RUNBOOK.md` for replica-set setup and deployment commands.
-- `tests/` validates behavior and imports the application package, not vice versa.
-- Secrets live only in git-ignored files/directories such as `.env` and `.secrets/`,
-  or externally provisioned Kubernetes Secrets.
-- Local development uses MongoDB/OpenBao/NGINX plus MinIO/emulator/bridge Compose
-  services and host Python API/parser/loader processes.
-- Docker builds deployment images; Kubernetes and Helm manage deployment.
-
----
-
-## 2. AI layer
-
-### 2.1 `AGENT.md`: what every session needs, nothing more
-
-Use this skeleton:
-
-````markdown
-# AGENT.md
-Guidance for the coding agent in this repository. It contains only the persistent instructions needed for this project.
-
-## What this is
-This repository implements the backend service for collecting HTTP traffic generated by client agents and persisting it for security analysis.
-
-The success criterion is a working backend that authenticates users and agents, accepts traffic logs securely, and stores them in MongoDB without leaking sensitive data.
-
-Authenticate and bound uploads before durable raw receipt; validate, minimize and
-protect content in the parser before silver/Mongo log persistence. Never log raw payloads.
-
-## The docs
-Read the relevant file before starting a task and update it when the design changes.
-- docs/PLAN.md: current design and decisions.
-- docs/IMPLEMENTATION_STATUS.md: status, gaps, and test coverage.
-- docs/RUNBOOK.md: local setup and operational steps.
-
-## Always keep in mind
-- Secrets belong in `.env`, never in source files or logs.
-- Authentication and authorization are mandatory for every sensitive route.
-- Data minimization matters: do not log raw secrets, tokens, or credentials.
-- Keep the application Python-first and avoid introducing unrelated infrastructure complexity.
-
-## Commands
-Prerequisites: Python 3.11+, pip, Docker, and Docker Compose.
-Kubernetes, kubectl, and Helm are needed only for deployment.
-
-```bash
-make install
-make dev
-make test
-make lint
-make run
-make dev-down
-make image
-make helm-lint
-make helm-up
-make helm-test
-```
-
-## Architecture in brief
-- `app/main.py` creates the API app and registers all routes.
-- `app/api/` exposes endpoints for auth and traffic ingestion.
-- `app/services/` contains business logic for authorization, ingestion, and log handling.
-- `app/db/` persists data to MongoDB.
-- `app/core/` contains config, security helpers, and structured logging.
-
-## Change these together
-- API route and schema: if the request body changes, update both the HTTP contract and validation schema.
-- Service logic and tests: every auth or ingestion rule must be covered by tests.
-- Storage model and persistence code: schema changes must be reflected in MongoDB models and any consumer code.
-
-## Tests
-- Unit tests cover validation, auth decisions, and service logic.
-- Integration tests validate MongoDB-backed flows.
-- Security tests ensure unauthorized access is rejected and sensitive data is not logged.
-
-## Conventions
-- Deliberate simplifications should be marked with a brief comment and an upgrade path.
-- Documentation reflects current design and current status only; decisions go in the plan document.
-````
-
-### 2.2 Memory
-
-Project facts that the code cannot show should live in the design and status docs instead of chat history: the chosen authentication strategy, security assumptions, environment constraints, and any decisions that affect the app design.
-
-### 2.3 Skills: recipes for the repeated kinds of change
-
-A skill is created per repeated change type under `.agent/skills/<verb>-<thing>/SKILL.md`, with a matching `places.md` file when needed. The front matter should describe when the skill applies.
-
-````markdown
----
-name: add-auth-flow
-description: Use when someone asks to add authentication flows, token validation, or role-based access checks.
----
-# Adding an auth flow
-One new auth flow, with the schema, service logic, tests and docs, as a single change.
-
-## Rules
-1. Ask when there are multiple viable auth strategies.
-2. Keep the change focused on the auth flow and what it needs.
-3. Do not bypass security validation or silently weaken authorization.
-4. Never hardcode secrets.
-5. Update tests and docs in the same change.
-````
-
-Example skills: `add-auth-flow`, `add-traffic-log-handler`, `add-storage-model`.
-
----
-
-## 3. Backend architecture
-
-The backend is a Python API application built around FastAPI, with explicit layering and strong validation.
-
-```text
-app/main.py
-   ↓
-app/api/
-   ↓
-app/services/
-   ↓
-app/db/
-   ↓
-MongoDB
-```
-
-Key rules:
-- `app/api` authenticates requests, bounds wire input, persists raw receipts and delegates content work to workers.
-- `app/services` should contain business logic: auth, authorization, traffic validation, storage orchestration.
-- `app/db` should handle MongoDB access, queries, and document persistence.
-- `app/core/security.py` centralizes token validation, permission checks, and sensitive data handling.
-- `app/core/logging.py` should provide structured logs without leaking secrets or raw payload data.
-- Every sensitive route must enforce authentication and authorization before processing the request.
-
-The implementation centers on two concerns:
-- authentication and authorization flows for users and agents
-- ingestion and storage of HTTP traffic records generated on devices
-
-A successful design supports:
-- per-user and per-agent identity validation
-- secure token issuance and verification
-- safe handling of HTTP metadata, headers, and payload fragments
-- strict validation of inbound traffic log content
-- auditing and structured logging for security analysis
-
----
-
-## 4. Data model and storage
-
-The project stores captured HTTP traffic data in MongoDB.
-
-Key responsibilities:
-- `app/db/models.py` defines the documents for users, agents, sessions, traffic logs, and access events.
-- `app/schemas/traffic.py` validates incoming log payloads.
-- `app/services/traffic_service.py` is responsible for transforming raw requests into valid stored records.
-- Sensitive fields such as credentials, cookies, tokens, and authorization headers should be redacted or excluded by policy.
-
-The system should support queries such as:
-- the latest traffic logs for a given user or device
-- logs matching a time window or suspicious pattern
-- security findings associated with an agent or user session
-
----
-
-## 5. Security expectations
-
-Security is not optional in this project. The app should be implemented with strong defaults.
-
-Required behaviors:
-- validate all incoming data with Pydantic schemas
-- enforce JWT or equivalent token validation for protected routes
-- deny unauthenticated requests by default
-- restrict authorization according to user or agent role
-- redact sensitive data before logging or persistence
-- protect temporary raw uploads with scoped storage access and remove them only
-  after confirmed persistence; minimize/protect sensitive fields before silver/Mongo
-- use HTTPS in production and environment-based configuration
-- take a least-privilege approach to database access
-
-Security tests should ensure that:
-- unauthorized access is rejected
-- invalid tokens are rejected
-- malformed agent content fails asynchronously before silver publishing
-- unauthenticated traffic upload attempts fail
-- sensitive fields are redacted or excluded from logs and storage
-
----
-
-## 6. Tests
-
-| Level | Where | Notes |
-|---|---|---|
-| Unit | `tests/` next to the app modules | Validate schema parsing, service logic, validation rules, and auth decisions |
-| Security | `tests/test_security.py` | Confirm denial-by-default behavior and data redaction |
-| Integration | `tests/` with a test MongoDB fixture or container | Validate agent traffic ingestion and persistence end-to-end |
-| API | `tests/test_auth.py`, `tests/test_agents.py` | Assert HTTP contracts and error responses |
-
-Recommended test rules:
-- write failing tests before implementing new auth or logging logic
-- test both success and refusal paths
-- validate JSON schema and response codes
-- use realistic but sanitized sample payloads
-
----
-
-## 7. Makefile
-
-The `Makefile` should cover the standard workflows needed for the project.
-
-Recommended targets:
-- `make install` — create a virtual environment and install dependencies
-- `make test` — run all unit and integration tests
-- `make lint` — run formatters and linters such as ruff or flake8
-- `make run` — launch `python -m app` using the selected `.env` file
-- `make dev` — start development dependencies, host API with auto-reload, and parser/loader
-- `make dev-up/down` — start or stop MongoDB/OpenBao/NGINX and MinIO/emulator/bridge
-- `make spool-parser` / `make spool-loader` — run the individual host workers
-- `make mongo-up` — start the one-container, single-node development replica set
-- `make mongo-down` — stop local MongoDB, retaining its volumes
-- `make openbao-up` — start/bootstrap ephemeral OpenBao and refresh its runtime token
-- `make openbao-down` — stop OpenBao, losing its in-memory key state
-- `make image` — build the application OCI image
-- `make helm-lint` — validate the configured Helm chart
-- `make helm-up` — install or upgrade the Kubernetes release
-- `make helm-test` — test the deployed Service and API schema
-- `make helm-down` — uninstall the release, retaining MongoDB PVCs
-- `make helm-port-forward` — expose the Kubernetes API on a separate configurable local port
-- `make check` — run a structured validation pass for the project
-
-The Makefile should reflect a Python workflow and avoid Go-specific commands such as `go mod tidy` or `go test`.
-
----
-
-## 8. Docs
-
-The documentation should stay aligned with the real project goals.
-
-- **Plan doc:** scope, requirements, architecture, threat model, data model, API design, and decisions
-- **Implementation status doc:** what is built, what is tested, what is open, and where the risks remain
-- **Runbook:** setup, troubleshooting, local environment notes, and operational guidance
-- **README:** prerequisites, commands, sample endpoints, and local development instructions
-
-The project should maintain a clean separation between current state and historical notes. Decisions go into the design document, not into scattered prose.
-
----
-
-## 9. Commits
-
-One commit per significant decision. Each commit should be a single, well-scoped update that explains both what changed and why.
-
-The message should read like a clear feature update, for example:
-
-```bash
-git commit -m "feat: add traffic log ingestion API with auth validation"
-```
-
-Keep commit scope aligned with the actual work: schemas, services, tests, or docs together when they are part of the same decision.
-
----
-
-## Bootstrap checklist for a new project
-
-1. Create the repository root and initialize the Python project files (`requirements.txt`, `pyproject.toml`, `.gitignore`, `.env.example`).
-2. Create the `app/` package structure and keep the layering clear: API → services → persistence.
-3. Add the FastAPI app entry point and route registration in `app/main.py`.
-4. Implement auth and traffic-log endpoints using validated Pydantic schemas.
-5. Add MongoDB models and persistence utilities in `app/db/`.
-6. Add unit and integration tests for auth, ingestion, and authorization rejection paths.
-7. Write the docs: `README.md`, `PLAN.md`, `IMPLEMENTATION_STATUS.md`, and `RUNBOOK.md`.
-8. Fill in `AGENT.md` with the project-specific architecture and rules.
-
-This project should remain Python-first, security-first, and focused on collecting and analyzing HTTP traffic data generated on end-user devices for threat detection and response workflows.
+Other optional observations are omitted here. Plaintext retained body is
+`logdata.body`; encrypted values live in root `storage_encryption`, with
+`[ENCRYPTED]` header placeholders. Discarded bodies retain length/hash.
+Upload/read records are flat; database consumers use these nested paths.
+
+`metadata` is the **bucket grouping key**, not a generic bag. High-cardinality
+batch IDs, reception times and upload IPs belong in `ingestion` to avoid
+fragmenting buckets/compression. Classification stays in metadata for partial TTL.
+New records are server-classified `suspicious=false`; no classifier is implemented.
+
+Indexes cover `(metadata.device_id, timestamp, _id)`, `(timestamp, _id)`,
+`ingestion.received_at` and `(ingestion.batch_id, _id)` for replay checks.
+Timestamp/ID keysets avoid growing offsets; current queries need no additional
+HTTP-field indexes. Measurement IDs are not uniqueness-enforced by time-series
+storage, so ambiguous inserts remain an at-least-once risk.
+
+Ordinary/suspicious partial TTL indexes operate on event time, never a global
+collection TTL. See [storage initialization](docs/RUNBOOK.md#storage-initialization)
+and [retention operations](docs/RUNBOOK.md#retention-operations) for index
+reconciliation, update restrictions and asynchronous bucket deletion.
+
+Regular collections hold device configurations/acknowledgements, versioned
+workspace settings, upload receipts/leases and per-instance worker heartbeats.
+They are operational state, not measurements or alternative ingestion triggers.
+
+## Documentation ownership
+
+| Document | Source of truth |
+| --- | --- |
+| [README](README.md) | Interviewer-facing product overview and navigation |
+| [This blueprint](PROJECT-BLUEPRINT.md) | Code map, boundaries and persistence rationale |
+| [API](docs/API.md) / [ingestion](docs/INGESTION.md) / [encryption](docs/ENCRYPTION.md) | Detailed contracts and guarantees |
+| [Runbook](docs/RUNBOOK.md) | Local/Kubernetes setup, tests and operations |
+| [Frontend](frontend/README.md) / [GCP](infra/gcp/README.md) | Component-specific setup and deployment |
+| [Implementation status](docs/IMPLEMENTATION_STATUS.md) | Capability/test inventory and known limitations |
+| [Plan](docs/PLAN.md) | Actionable verification gates; links instead of copied design |
+
+Keep one canonical explanation and link to it from other guides.
+The README's [protected manual roadmap](README.md#future-roadmap--architecture-enhancements)
+is author-maintained prose, excluded from automated editing and planning.

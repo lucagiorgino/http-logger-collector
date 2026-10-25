@@ -11,9 +11,9 @@ rotation, see [Log encryption and device configuration](ENCRYPTION.md).
 
 ## Upload ingestion
 
-All uploads follow GCS/MinIO -> object-event Pub/Sub -> parser/protect worker ->
-silver Pub/Sub -> rate-limited Mongo loader. POST acknowledges durable raw bytes;
-content errors are asynchronous. See the README's **Core ingestion flow**.
+The [pipeline design](INGESTION.md) defines stages, acknowledgement, policy and
+delivery guarantees. This section owns setup and recovery; see the
+[API reference](API.md#upload-a-batch) for payloads and receipt polling.
 
 ### Local MinIO and Pub/Sub emulator
 
@@ -39,23 +39,9 @@ starting a Compose profile alone does not replace these bootstrap steps.
 Synthetic data only: this local MinIO volume does not provide production
 encryption-at-rest guarantees.
 
-Set the following in your ignored `.env`, preserving existing Auth0/OpenBao values:
-
-```env
-SPOOL_STORAGE_BACKEND=minio
-SPOOL_ENDPOINT_URL=http://localhost:29000
-PUBSUB_EMULATOR_HOST=localhost:28681
-GOOGLE_CLOUD_PROJECT=logger-local
-SPOOL_BUCKET=traffic-uploads
-SPOOL_EVENT_TOPIC=projects/logger-local/topics/uploads
-SPOOL_SUBSCRIPTION=projects/logger-local/subscriptions/uploads
-SPOOL_SILVER_TOPIC=projects/logger-local/topics/uploads-silver
-SPOOL_SILVER_SUBSCRIPTION=projects/logger-local/subscriptions/uploads-silver
-SPOOL_PARSE_DLQ_TOPIC=projects/logger-local/topics/parse-dlq
-SPOOL_LOAD_DLQ_TOPIC=projects/logger-local/topics/load-dlq
-SPOOL_MINIO_ACCESS_KEY_FILE=.secrets/minio-access-key
-SPOOL_MINIO_SECRET_KEY_FILE=.secrets/minio-secret-key
-```
+Use the local `SPOOL_*`, `PUBSUB_EMULATOR_HOST` and `GOOGLE_CLOUD_PROJECT`
+defaults in [`.env.example`](../.env.example), preserving existing Auth0/OpenBao
+values in your ignored `.env`. Keep both MinIO credential-file paths.
 
 `make dev` starts the API and both workers. To run separate host processes:
 
@@ -66,28 +52,16 @@ make spool-parser    # decrypt / decompress / validate / minimize / encrypt
 make spool-loader    # rate-limited Mongo writes / raw cleanup
 ```
 
-Post gzip/JWE wire bytes to `/api/v1/traffic-log-uploads`; optionally
-include a stable `X-Batch-Id` for identical-byte retries. Poll
-`/api/v1/traffic-log-uploads/{upload_id}` using the same device token.
-No frontend changes or new identity claims are needed.
 Stop host processes with Ctrl+C; `make dev-down` stops the development
 containers and retains MongoDB/MinIO volumes.
 Do not delete MinIO credential files while retaining its volume.
 
 ### Production GCP and Helm
 
-In `infra/gcp`, configure `notification_channels` and follow that directory's
-reviewed plan/apply procedure. Terraform always creates a private encrypted
-GCS bucket, OBJECT_FINALIZE notification, Pub/Sub
-objects/silver/parse-DLQ/load-DLQ topics and subscriptions, scoped service identities,
-DLQ alerts and four workload identities (backend/frontend/spool-parse/spool-load).
-`deploy_services` still gates Cloud Run services, including the two private
-always-on workers. The existing Cloud KMS/
-Secret Manager adapter is reused by the parser. No AWS resources are used.
-The loader receives Mongo, silver-subscriber, load-DLQ publisher and raw-delete
-access, not EC/KMS access.
-`terraform output spool_environment` provides the nonsecret connection settings.
-Use workload identity/ADC; do not store service-account JSON keys in the repository.
+For Cloud Run, follow the [GCP deployment summary](../infra/gcp/README.md#deployment-summary),
+including `notification_channels`, secret bootstrap and scoped identities.
+`terraform output spool_environment` provides nonsecret connection settings.
+Use workload identity/ADC, never repository-stored service-account JSON keys.
 
 For GKE, both workers always deploy. Set `bucket`, `eventTopic`, `subscription`,
 `silverTopic`, `silverSubscription`, `parseDlqTopic`, `loadDlqTopic` and
@@ -120,25 +94,17 @@ for in-flight operations and keep the lease longer than processing/network margi
 Both hops use explicit Pub/Sub ACK and deadline-expiry redelivery; receipt leases prevent competing ordinary
 Mongo writes. Ambiguous Mongo inserts remain at-least-once, not exactly-once.
 
-Rate is `SPOOL_MONGO_DOCUMENTS_PER_SECOND=500` **per loader process**, at most one
-initial 500-document batch. Configure replica count and per-replica rate together.
-The loader waits before pulling so throttling does not hold a delivery past its
-deadline. Pub/Sub manages backlog outside worker memory; each worker
-pulls one message at a time. Subscription retention defaults to 14 days
-(`spool_message_retention_seconds` in Terraform). If messages expire or the local
-emulator restarts, replay nonterminal receipt IDs after restoring capacity.
-Monitor cloud backlog depth/age and quotas; the emulator is not a production
-durability/monitoring substitute. Never bucket-list as a normal
-processing trigger. Querying operational receipts to identify recovery work is
-an administrative task, not the ingestion trigger.
+Configure replica count and per-replica rate together; the
+[buffering contract](INGESTION.md#buffering-and-backpressure) owns defaults/limits.
+After notification expiry or emulator restart, identify nonterminal receipt IDs
+and replay after restoring capacity. This is administrative receipt inspection,
+not bucket listing as a normal ingestion trigger.
 
 On parse/load DLQ depth > 0 or a persistent lag alarm:
 
-Application DLQs contain pointers/error codes; native Pub/Sub redrive wraps the
-original message, which on the load stage includes normalized policy-protected
-documents. Access must be restricted, and inspection must not print payloads.
-Native redrive or message expiration can leave a receipt nonterminal; inspect
-its current state before deciding whether to replay or perform cleanup only.
+Native redrive/expiry can leave receipts nonterminal; inspect state before
+choosing replay or cleanup. Restrict DLQ access: native load messages can contain
+documents, not just sanitized pointers. Never print payloads.
 
 1. Inspect only receipt IDs and sanitized error codes; do not dump raw bodies,
    headers, token values or KMS errors into logs or tickets.
@@ -157,14 +123,10 @@ For `stored` with `raw_deleted=false`, run
 This also handles a lost Pub/Sub cleanup message and a prior delete whose reply was
 lost. It never repeats Mongo loading.
 
-Normal successful uploads are deleted immediately after Mongo persistence.
-Pending/failed raw uploads and idempotency receipts are deliberately retained
-without TTL. Before production, define an incident/privacy escalation deadline
-and an explicit approval process for abandoning failed raw uploads; automatic
-age expiration is not implemented. Subscriptions retain messages for 14 days by
-default in GCP, but expiration of a notification does not delete its raw upload.
-Do not enable GCS versioning/soft deletion or blanket object expiry on this bucket.
-Mongo hot retention remains the existing workspace policy; there is no cold tier.
+Before production, approve an incident/privacy escalation deadline and operator
+process for abandoning failed raw; automatic age expiry is not implemented.
+Follow the [raw-retention constraints](INGESTION.md#dead-letters-cleanup-and-raw-retention)
+before changing bucket lifecycle, versioning, soft deletion or backups.
 
 ## Pipeline status
 
@@ -243,11 +205,12 @@ authenticate with live Auth0 or validate live GCS IAM/event latency.
 
 ## Local setup
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+make install
 cp .env.example .env
 ```
+
+Set backend Auth0 tenant/audience in `.env`; configure the
+[frontend's separate environment](../frontend/README.md#run-locally).
 
 ## Run the live development stack
 
@@ -267,10 +230,13 @@ and starts NGINX. `make dev` then runs the API plus parser and loader host proce
 Backend and Compose share `.env`, preserving
 Auth0 settings. The backend listens on `127.0.0.1:9090`; the separately started
 frontend listens on `127.0.0.1:3000`. Open the public development origin
-`http://127.0.0.1:8080`: NGINX routes API/docs/health paths to the backend and
+`http://localhost:8080`: NGINX routes API/docs/health paths to the backend and
 all other paths, including `/auth/*`, to the frontend without stripping prefixes.
-Configure frontend `APP_BASE_URL` and `BACKEND_API_URL` for that same origin in
-`frontend/.env.local`; keep frontend Auth0 Web application credentials there.
+Set frontend `APP_BASE_URL=http://localhost:8080` and
+`BACKEND_API_URL=http://127.0.0.1:9090` in `frontend/.env.local`: the former is
+the browser/Auth0 origin, the latter is reached by the SSR server.
+Keep frontend Auth0 Web application credentials there and use `localhost`
+consistently in callback/logout URLs; it is not interchangeable with `127.0.0.1`.
 
 Compose publishes proxy port 8080 by default and uses the Docker Desktop host
 gateway. No selector is needed on Docker Desktop. On native Linux, select the
@@ -340,6 +306,23 @@ on the lost storage key are also unreadable; only unrelated/plaintext data survi
 The runtime token lasts 24 hours; rerun `make openbao-up` before starting Python
 after expiry. Do not print tokens, commit `.secrets`, or use the root token as
 the application's runtime credential.
+
+### Shared public origin
+
+NGINX preserves paths and gzip/JWE bytes: `/api/v1`, `/docs`, `/redoc`,
+`/openapi.json` and `/health` go to Python; `/auth/*`, dashboard pages,
+assets and HMR go to Next.js. `/proxy-health` checks NGINX itself.
+The response-header buffer is 16 KiB for Auth0/Next.js cookies; a smaller
+default can cause sign-in `502` errors. For community NGINX Ingress use
+`nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"` under `ingress.annotations`.
+
+No tunnel is needed for localhost. If deliberately using a trusted HTTPS tunnel,
+point it at loopback proxy port 8080 and set `PROXY_EXTERNAL_SCHEME=https` only
+while that listener is exclusively behind the tunnel. NGINX replaces untrusted
+forwarding headers; keep applications loopback-bound and trust only the actual
+proxy peer. Update frontend `APP_BASE_URL` and Auth0 allowlists to the public
+origin, keeping the reachable internal `BACKEND_API_URL` for SSR.
+Restart applications and proxy after changing addresses or upstream ports.
 
 ## Environment profiles and ports
 
@@ -632,49 +615,28 @@ Registration is create-only: existing IDs (including policy/status-only records)
 or names return `400`; updates still use the versioned policy PATCH API.
 
 ## Run tests
-For the JavaScript SSR management UI, see [`frontend/README.md`](../frontend/README.md).
-Run `make frontend-dev` on loopback port 3000 with the backend (9090) and NGINX
-proxy running; browse through the shared public development origin on port 8080.
-It requires its own Auth0 Regular Web Application in `frontend/.env.local`, not
-agent M2M credentials. `make frontend-test` checks adapter tests and lint;
-`make frontend-test-browser` builds and runs isolated browser tests.
-The **Device policies** screen now registers named devices with an initial
-encryption policy and loads all accessible persisted devices from the API,
-including unnamed/version-zero records created by agent acknowledgements or policy
-changes. Open a row to inspect device identity, edit policy, check acknowledgement
-and public encryption details, or view its traffic. A missing registration timestamp
-does not hide a stored device. Use the agent's
-JWT-bound ID, not an arbitrary upload-supplied ID. IDs and names are globally unique.
-Registration and policy changes need `manage:devices`; credentials are provisioned
-separately through the issuer. See the [registration contract](../README.md#register-a-device-and-configure-its-policy)
-and [real browser/API/MongoDB test](../frontend/README.md#validation).
 
-The **Workspace > Storage and encryption** section (`/settings`) controls original
-bodies, authorization headers and cookies for all devices. Each category offers
-**Do not retain**, **Retain encrypted** (default), or **Retain plaintext**.
-Discard removes body content before publishing/KMS but preserves its byte length
-and SHA-256 digest; discarded header entries disappear from both maps.
-Changes affect future uploads only, not existing records. Discarded data cannot
-be recovered; plaintext retention is a deliberate opt-out from encryption.
-Both workspace API reads and versioned updates require `manage:devices`.
-Existing installations can run `python -m app.kms initialize` to provision the
-dedicated `OPENBAO_STORAGE_KEY` and runtime ACL without replacing existing keys.
-Rotate with `python -m app.kms rotate-storage`; retain old versions and persistent
-OpenBao backups throughout log retention. Follow the
-[algorithm, nonce, usage-limit and retention requirements](ENCRYPTION.md#workspace-storage-encryption).
-
-Install the current dependencies with `make install`. The backend uses native async
-PyMongo, the official Auth0FastAPI SDK for token verification, and HTTPX2 for HTTP
-clients and Starlette's supported test-client backend. The SDK also installs HTTPX
-for its own requests. Deprecation and pending-deprecation warnings are test failures,
-except the SDK's current `authlib.jose` import warning: that exact upstream warning
-remains visible in pytest output. No deprecated JOSE APIs are called by application
-code; application encryption uses `joserfc`.
+Install dependencies with `make install`. For SSR adapter/lint/browser checks
+and the optional real browser/API/Mongo fixture, use
+[frontend validation](../frontend/README.md#validation).
+Deprecation/pending-deprecation warnings fail Python tests except the exact,
+still-visible upstream Auth0/Authlib JOSE import warning.
 
 ```bash
-pytest -q
-ruff check app tests integration_tests
+make test
+make lint
 ```
+
+With Docker available, validate real NGINX forwarding, gzip/JWE body preservation,
+wire limits and WebSocket upgrades:
+
+```bash
+PROXY_TEST_ENABLED=true .venv/bin/python -m pytest -q tests/test_proxy_integration.py
+```
+
+The proxy test selects native Linux networking when necessary and removes its
+temporary container. [Upload service validation](#measuring-ingestion-latency)
+covers real MinIO/emulator/Mongo separately.
 
 To exercise local time-series storage and primary analysis, point `MONGO_TEST_URI` at
 the single-node replica set. Use `MONGO_REPLICA_TEST_URI` for a separate multi-member
@@ -825,6 +787,7 @@ client harness use an explicit mock transport; they do not claim a live Auth0 ru
 
 Use **Workspace > Retention policies** to enable/disable or change each category's
 window. Ordinary logs default to 7 days; suspicious logs default to 30 days.
+Windows must be integer days from 1 through 24855 (Mongo's TTL seconds limit).
 Disabled means indefinite retention for that category; its chosen window remains
 saved. `manage:devices` is required. Retention applies to existing records too,
 using event timestamps. Back up evidence before enabling or shortening a window:
@@ -880,7 +843,7 @@ New records use `{_id, timestamp, metadata, ingestion, logdata, storage_encrypti
 `metadata` contains only device/classification bucket identity. Batch/client IDs,
 upload peer and reception time are under `ingestion`; captured HTTP/network/process
 fields and body length/digest are under `logdata`. Do not move per-upload values
-into time-series metadata. See the [document example](../README.md#stored-document-layout).
+into time-series metadata. See the [document example](../PROJECT-BLUEPRINT.md#stored-document-layout).
 HTTP upload events and analysis responses are flat; the storage layout is internal.
 
 Startup creates `ingestion_received_at` on `ingestion.received_at` and
@@ -892,39 +855,23 @@ Deployment/startup never resets the database.
 
 ## Operational semantics
 
-- Uploads accept one gzip member with `application/json`, or compact JWE with
-  `application/jose`. Content limits are 500 records, 1 MiB gzip and 8 MiB expanded;
-  JWE wire is limited to 1,500,000 bytes. Wire limits fail synchronously; malformed
-  content/expanded limits fail asynchronously in the parser.
-- HTTP `202` acknowledges durable raw receipt only. Optional `X-Batch-Id` retries
-  return `200` for matching bytes/format and `409` for conflicting reuse.
-  Poll receipt state for `stored` and `raw_deleted`. There is no synchronous
-  traffic-log write fallback.
-- Mongo policy/receipt and raw-storage dependencies can affect acceptance latency.
-  Workers isolate content/KMS work from Mongo loading. Deterministic IDs and
-  lease checks are best-effort duplicate protection, not exactly-once time-series
-  persistence; partial/ambiguous writes can duplicate measurements.
-- Replica reads are eventually consistent. New records may briefly be missing; `404`
-  does not prove that a just-accepted record was never written.
-- No secondary means analysis returns `503`, even while ingestion remains healthy.
-  The explicit local-development primary-read profile does not require a secondary.
-- `/health` reports process liveness only; monitor Pub/Sub backlog/DLQs, both workers, raw cleanup and primary/secondary availability
-  and ingestion/read error rates separately, along with OpenBao seal/auth/error metrics.
-- Fresh startup requires OpenBao. EC keys stay cached in RAM for the process lifetime;
-  a running backend may continue decrypting during a KMS outage. Revoking a KMS token
-  does not remove cached keys. Restart all processes after EC rotation/retirement.
+Use [API limits/read semantics](API.md) and [pipeline guarantees](INGESTION.md)
+when interpreting errors and receipt state. In particular, `stored` can precede
+secondary visibility, and analysis `503` can coexist with healthy ingestion.
+
+`/health` is process liveness only. Monitor backlog/DLQs, both workers, raw cleanup,
+primary/secondary availability, ingestion/read errors and OpenBao seal/auth/errors.
+Fresh startup requires KMS; cached EC keys can remain usable in a running process
+after token revocation. Follow [key rotation](ENCRYPTION.md#key-rotation) and
+restart all API/parser instances.
 
 ## Worker operations
 
 Use the [retry, backpressure and recovery](#retry-backpressure-and-recovery)
 procedure for both Pub/Sub stages. Scale parser and loader independently;
 multiply the per-loader document rate by replica count when budgeting Mongo load.
-Keep `SPOOL_LEASE_SECONDS` / Helm `spool.leaseSeconds` above processing time plus
-network margins, and allow shutdown grace for in-flight operations.
-After a forced stop, delivery deadlines and receipt leases recover work.
-Never delete raw just because silver was published or drain a DLQ before recovery.
-`queued` is not a Mongo read-after-write guarantee; even `stored` can precede
-secondary visibility.
+After forced stops, delivery deadlines and receipt leases recover work.
+Never delete raw merely because silver was published.
 
 ## Troubleshooting
 - For local MongoDB, inspect `make compose-ps` and

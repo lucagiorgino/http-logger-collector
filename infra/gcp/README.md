@@ -13,17 +13,18 @@ Keep the existing Auth0 tenant and API audience.
 1. Prepare a billing-enabled GCP project, Terraform, Google Cloud CLI, Docker,
    Python and authenticated deployment credentials.
 2. Bootstrap Terraform state, configure `terraform.tfvars`, then apply foundation
-   resources with `deploy_services = false` (section 1).
+   resources with `deploy_services = false` ([foundation setup](#1-tools-authentication-and-state)).
 3. Provision MongoDB Atlas with healthy secondaries and allowlist Terraform's
-   `egress_ip` (section 2).
+   `egress_ip` ([Atlas and Auth0](#2-atlas-generated-urls-and-auth0)).
 4. Run `make gcp-secrets-bootstrap` with the cloud venv, project and environment
-   (section 3). It fills missing values and reports numeric secret versions to pin.
+   ([secret initialization](#3-populate-secret-manager)). It fills missing values
+   and reports numeric secret versions to pin.
 5. Read `terraform -chdir=infra/gcp output -raw public_url`. Register
    `<public_url>/auth/callback`, `<public_url>` as logout URL and web origin in
    Auth0. Keep the existing API audience and any required localhost entries.
-6. Build and push both images (section 4), configure immutable image tags and
+6. [Build and push both images](#4-build-and-push-images), configure immutable image tags and
    secret versions, then set `deploy_services = true` and review/apply the plan
-   (section 5).
+   ([service rollout](#5-deploy-services)).
 7. Open `public_url`, configure agents with `backend_url`, and verify sign-in,
    the Status page and an ingestion round trip through Mongo storage/raw cleanup.
 
@@ -66,35 +67,15 @@ replace Pub/Sub backlog/DLQ alerts. See the
 
 ### Ingestion contract and recovery
 
-- POST returns `202` after durable raw receipt, before content validation.
-  Optional device-scoped `X-Batch-Id` returns `200` for identical-byte/format
-  retries and `409` for conflicting content.
-- `GET /api/v1/traffic-log-uploads/{upload_id}` reports asynchronous parsing,
-  Mongo storage and raw cleanup. Malformed JWE/gzip/JSON/events fail asynchronously.
-- `app.spool_worker parse` decrypts, validates, normalizes and applies the
-  acceptance-time workspace discard/encryption snapshot. Silver is gzip BSON,
-  bounded to **9,500,000 wire bytes / 32 MiB expanded**.
-- `app.spool_worker load` throttles Mongo writes per replica, uses atomic receipt
-  leases and deletes raw only after majority Mongo persistence plus a majority
-  `stored` receipt. Cleanup retries do not reload stored records.
-- The parser has raw-read, object-subscription consume, silver/parse-DLQ publish,
-  Mongo and Cloud KMS/Secret Manager access. The loader has raw-delete,
-  silver-subscription consume, load-DLQ publish and Mongo, without EC/KMS access.
-  Replay operators separately need raw-read, receipt-update and event-publish access.
-- Both workers default to three application attempts; native Pub/Sub redrive
-  defaults to five delivery attempts, the platform minimum. Failed DLQ publish
-  leaves work unacknowledged. Application DLQs contain sanitized pointers;
-  native load redrive can contain protected normalized documents, including fields
-  intentionally plaintext by policy. Restrict access and never dump payloads.
-- `spool_message_retention_seconds` defaults to 14 days. Notification expiry does
-  not delete raw; replay retained raw after fixing capacity/dependencies.
-  Pending/failed raw has **no age TTL, versioning or soft deletion**.
-  This is a temporary replay source, not a historical data lake.
-- Delivery is at least once, not exactly once: deterministic IDs/leases cannot
-  eliminate every ambiguous Mongo time-series insert duplicate.
-- Use `python -m app.spool_worker replay <upload_id>` after repairs, or
-  `cleanup <upload_id>` for stored uploads with pending raw deletion. Inspect the
-  receipt first; never replay active leases or drain DLQs before recovery.
+The [pipeline design](../../docs/INGESTION.md) defines acknowledgement, policy,
+buffering, retention and at-least-once guarantees. Use the
+[recovery runbook](../../docs/RUNBOOK.md#retry-backpressure-and-recovery) for replay
+and cleanup; native load DLQs may contain protected documents, not just pointers.
+
+The parser has raw-read, object-subscription consume, silver/parse-DLQ publish,
+Mongo and Cloud KMS/Secret Manager access. The loader has raw-delete,
+silver-subscription consume, load-DLQ publish and Mongo, without EC/KMS access.
+Replay operators separately need raw-read, receipt-update and event-publish access.
 
 `terraform output spool_environment` exposes nonsecret runtime settings.
 Runtime uses ADC/workload identity, never downloaded service-account keys.
@@ -105,8 +86,6 @@ overrides into production.
 by `worker_instances`. Worker supervision lives in `runtime/spool.py`.
 Configure `notification_channels`; backlog defaults warn above 500 messages or
 3600 seconds, below message retention. Monitor both DLQs and raw cleanup.
-See [root README](../../README.md#core-ingestion-flow) and
-[runbook](../../docs/RUNBOOK.md#upload-ingestion).
 
 ### Cloud-only encryption adapter
 

@@ -14,6 +14,8 @@ never raw forwarding headers. Gateways must sanitize forwarded addresses.
 Never trust arbitrary callers or use `*` on an externally reachable backend.
 Restrict direct pod access to the gateway; use TLS on internal hops when required.
 This chart does not install a gateway or provision certificates.
+The [GCP runtime](../infra/gcp/README.md#5-deploy-services) instead uses Cloud Run's
+native TLS and a platform-specific forwarded-identity adapter.
 
 Application encryption supplements HTTPS; it does not replace authentication.
 The backend decrypts logs for validation, redaction, and analysis. This is not
@@ -25,39 +27,19 @@ the raw spool described below.
 
 ### Durable upload boundary
 
-`POST /api/v1/traffic-log-uploads` is the sole ingestion endpoint.
-It persists the original gzip/JWE wire bytes before content
-decryption/validation and returns a raw-receipt acknowledgement. Consequently raw
-objects temporarily retain even fields later discarded by workspace rules.
-GCS encryption at rest/public-access prevention is mandatory; gzip alone is not
-application encryption. The local MinIO volume is for synthetic development data
-and does not promise production encryption at rest.
-
-Worker #1 loads the same retained EC key set into RAM, decrypts JWE locally, uses
-the same bounded decompression/schema rules, and applies a collector-time snapshot
-of discard/field-encryption settings. Only protected normalized documents reach
-the dedicated Pub/Sub silver topic. Worker #2 has no EC keys or KMS credential.
+The [pipeline design](INGESTION.md#acknowledgement-and-policy-boundaries) owns
+raw acknowledgement, acceptance-time policy, privacy and delivery guarantees.
+Original bytes can contain fields later discarded; gzip alone is not encryption.
+The parser loads retained EC keys into RAM and applies field protection before
+silver publication; the loader has no EC/KMS credentials.
 Retain old EC keys and decrypt capability until **all pending/failed raw uploads
 using them** are processed or explicitly abandoned; restart parser workers as well
 as API processes after key-set changes. The existing ephemeral OpenBao development
 warning applies to this backlog too.
 
-Successful Mongo persistence is recorded before raw deletion; failed cleanup retries.
-The dedicated GCS bucket has neither object versioning nor soft deletion, so raw
-deletion is not merely a hidden retained version. Pending/failed raw objects do not
-expire automatically. Existing Mongo TTL and field-decryption behavior are unchanged.
-See the README core ingestion flow and the runbook before accepting real traffic.
-
 Both encrypted and plaintext batches carry the same
-[typed HTTP event schema](../README.md#strict-event-validation). Captured endpoints,
-sizes/timing and process context survive ingestion. Request bodies and captured
-authorization/cookie values are retained under the default-on storage policy.
-Credential header values remain redacted in API responses; only authorized
-single-record reads decrypt retained bodies. Collection reads omit bodies.
-Unknown/duplicate fields, unsafe header keys, invalid types and per-field or
-batch size violations fail the whole batch asynchronously before silver publishing.
-Captured source IP
-is an agent observation (`captured_source_ip`), never the trusted upload `source_ip`.
+[typed HTTP event schema](API.md#strict-event-validation) and
+[trusted attribution](API.md#identity-and-permissions).
 
 ## Configured cryptographic suite
 
@@ -153,7 +135,7 @@ The primary/majority-backed singleton in `workspace_configurations` defaults to:
 The same workspace response includes independent ordinary/suspicious log
 retention settings (enabled by default, 7/30 days). These are not encryption
 settings: they apply to existing data and determine permanent deletion using
-MongoDB TTL indexes. See [retention policies](../README.md#retention-policies).
+MongoDB TTL indexes. See [retention operations](RUNBOOK.md#retention-operations).
 
 `PATCH /api/v1/workspace/configuration` requires `expected_version` and all three
 strict Boolean switches; unexpected fields are rejected. Atomic version matching
@@ -365,29 +347,11 @@ References: [Transit](https://openbao.org/docs/secrets/transit/),
 
 ## Management protocol
 
-Every resource is keyed only by globally unique device ID. Agents discover their JWT-bound `device_id` through
-`GET /api/v1/me` before polling configuration: it is the signed
-`https://amazing-http-logger/device_id` claim, or `sub` if absent. This ID, not a
-batch field, selects the ingestion policy. Issuer-managed device claims must not
-come from editable user metadata or token-request parameters. There is no separate
-device enrollment/credential service. Tokens bound to the same device share its
-access, regardless of their subject; different devices cannot access each other's
-data without the global management grant.
-
-Operators can register a named device and initial encryption policy through
-`POST /api/v1/devices` or the frontend's **Device policies** form. This uses the
-JWT-bound device ID and `manage:devices` authorization as policy management;
-it does not issue credentials. Inventory uses primary-backed collection/item
-reads, independently of traffic-analysis replica routing. All persisted records,
-including unnamed/version-zero agent and policy records, appear in inventory;
-`name` and `registered_at` may be null. The dedicated device detail page combines
-identity, policy editing, acknowledgement, public suite metadata and a traffic link.
-Item reads return `404` only when the record is absent; effective default
-configuration lookups alone do not persist a device. See
-[device registration](../README.md#register-a-device-and-configure-its-policy).
-IDs and names are globally unique; duplicate registration returns `400`, including
-attempts to register an existing policy-only ID. Initial registration is an insert,
-not a policy update.
+Agents discover their JWT-bound device ID through `GET /api/v1/me` before
+polling configuration. The [API reference](API.md#identity-and-permissions)
+defines identity and fleet permissions; [device registration](API.md#register-a-device-and-configure-its-policy)
+defines create-only inventory. Neither operation provisions credentials.
+Tokens bound to the same device share access regardless of subject.
 
 `GET /api/v1/devices/{id}/configuration` returns:
 
@@ -521,23 +485,13 @@ response.raise_for_status()
 ```
 
 Limits: 1,500,000 bytes encrypted wire size, 1 MiB decrypted gzip, 8 MiB expanded.
-Authentication, trusted attribution, media/wire limits and device transfer policy
-are checked synchronously. Wrong media encoding returns `415`, wire overflow `413`,
-policy violations `403`, and unavailable raw storage/policy services `503`.
-HTTP `202` acknowledges durable raw receipt, not valid content or Mongo log writes.
-Optional device-scoped `X-Batch-Id` gives identical-byte/format retries `200` and
-conflicting reuse `409`. Poll `GET /api/v1/traffic-log-uploads/{upload_id}`.
+See the [upload API](API.md#upload-a-batch) for synchronous checks/status codes
+and the [pipeline](INGESTION.md) for receipts, policy snapshots and retry identity.
 Malformed/tampered/unknown-key envelopes, decompression/schema errors and KMS
-failures are asynchronous parser failures. The parser requires EC and
+failures are asynchronous parser failures, retaining raw. The parser requires EC and
 field-encryption access; the Mongo loader does not.
-
-Control-plane policy reads use primary with majority read concern, never a stale
-analysis replica. Analysis retains its existing secondary-only deployment routing.
-Policy is checked during each request; changes do not retroactively cancel a
-request already being accepted. The acceptance-time workspace policy snapshot
-governs parsing. JWE itself does not provide replay deduplication; use `X-Batch-Id`
-for request retries. Workers reuse deterministic IDs and check persisted records on replay, but
-time-series collections cannot enforce unique IDs, so delivery is at-least-once.
+Policy changes do not retroactively cancel a request already being accepted.
+JWE itself provides no replay deduplication or exactly-once delivery.
 
 ## Key rotation
 
