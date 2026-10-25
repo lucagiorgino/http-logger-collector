@@ -30,6 +30,9 @@ def test_writes_use_primary_and_analysis_uses_strict_secondary(mongo):
     assert mongo.device_configurations.read_preference == ReadPreference.PRIMARY
     assert mongo.device_configurations.read_concern.document == {"level": "majority"}
     assert mongo.device_configurations.write_concern.document == {"w": "majority"}
+    assert mongo.workspace_configurations.read_preference == ReadPreference.PRIMARY
+    assert mongo.workspace_configurations.read_concern.document == {"level": "majority"}
+    assert mongo.workspace_configurations.write_concern.document == {"w": "majority"}
 
 
 def test_local_development_can_explicitly_select_primary(monkeypatch):
@@ -129,6 +132,7 @@ def test_analysis_query_contains_device_and_stable_cursor(mongo):
                 {"timestamp": position[0], "_id": {"$lt": position[1]}},
             ],
         },
+        {"body": 0, "storage_encryption.ciphertext": 0},
     )
     cursor.sort.assert_called_once_with([("timestamp", -1), ("_id", -1)])
     cursor.limit.assert_called_once_with(11)

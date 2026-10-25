@@ -40,6 +40,7 @@ class Settings:
     openbao_timeout_seconds: float = float(os.getenv("OPENBAO_TIMEOUT_SECONDS", "5"))
     openbao_transit_mount: str = os.getenv("OPENBAO_TRANSIT_MOUNT", "transit")
     openbao_transit_key: str = os.getenv("OPENBAO_TRANSIT_KEY", "log-keyset")
+    openbao_storage_key: str = os.getenv("OPENBAO_STORAGE_KEY", "log-storage")
     openbao_kv_mount: str = os.getenv("OPENBAO_KV_MOUNT", "secret")
     openbao_kv_path: str = os.getenv("OPENBAO_KV_PATH", "log-encryption")
     openbao_kubernetes_role: str = os.getenv("OPENBAO_KUBERNETES_ROLE", "")

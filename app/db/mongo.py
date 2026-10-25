@@ -11,6 +11,7 @@ from pymongo.uri_parser import parse_uri
 from pymongo.write_concern import WriteConcern
 
 from app.core.config import settings
+from app.schemas.workspace import WorkspaceConfiguration
 
 
 class PersistenceError(RuntimeError):
@@ -62,6 +63,43 @@ class MongoRepository:
             read_concern=ReadConcern("majority"),
             write_concern=WriteConcern("majority"),
         )
+        self.workspace_configurations: AsyncCollection[dict[str, Any]] = (
+            self.database.get_collection(
+                "workspace_configurations",
+                read_preference=ReadPreference.PRIMARY,
+                read_concern=ReadConcern("majority"),
+                write_concern=WriteConcern("majority"),
+            )
+        )
+
+    async def get_workspace_configuration(self) -> dict[str, Any]:
+        try:
+            document = await self.workspace_configurations.find_one(
+                {"_id": "workspace"}, {"_id": 0}
+            )
+            return document if document is not None else WorkspaceConfiguration().model_dump()
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to read workspace configuration") from exc
+
+    async def update_workspace_configuration(
+        self, expected_version: int, policy: dict[str, bool | int]
+    ) -> dict[str, Any] | None:
+        try:
+            document = await self.workspace_configurations.find_one_and_update(
+                {"_id": "workspace", "version": expected_version},
+                {"$set": {**policy, "updated_at": datetime.now(UTC)}, "$inc": {"version": 1}},
+                upsert=expected_version == 0,
+                return_document=ReturnDocument.AFTER,
+            )
+            return (
+                {key: value for key, value in document.items() if key != "_id"}
+                if document is not None
+                else None
+            )
+        except DuplicateKeyError:
+            return None
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to update workspace configuration") from exc
 
     async def ping(self) -> bool:
         try:
@@ -147,7 +185,7 @@ class MongoRepository:
             ]
         try:
             return await (
-                self.analysis_logs.find(query)
+                self.analysis_logs.find(query, {"body": 0, "storage_encryption.ciphertext": 0})
                 .sort([("timestamp", DESCENDING), ("_id", DESCENDING)])
                 .limit(limit)
                 .to_list(length=limit)

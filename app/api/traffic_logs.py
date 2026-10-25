@@ -3,9 +3,10 @@ from typing import Annotated
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Path, Query
 from pydantic import AwareDatetime
+from starlette.concurrency import run_in_threadpool
 
 from app.core.auth import AuthenticatedClaims
-from app.deps import MongoRepositoryDep
+from app.deps import MongoRepositoryDep, StorageEncryptionDep
 from app.schemas.traffic import StoredTrafficLog, TrafficLogPage
 from app.services.analysis import decode_cursor, encode_cursor, stored_log
 from app.services.traffic_service import authorized_device_id
@@ -16,6 +17,7 @@ router = APIRouter(prefix="/api/v1/traffic-logs", tags=["traffic logs"])
 @router.get(
     "",
     response_model=TrafficLogPage,
+    response_model_exclude={"items": {"__all__": {"body"}}},
     responses={401: {}, 403: {}, 422: {}, 503: {}},
 )
 async def list_traffic_logs(
@@ -48,10 +50,11 @@ async def get_traffic_log(
     record_id: Annotated[str, Path(pattern=r"^[0-9a-f]{24}$")],
     claims: AuthenticatedClaims,
     repository: MongoRepositoryDep,
+    storage: StorageEncryptionDep,
 ) -> StoredTrafficLog:
     document = await repository.get_traffic_log(
         ObjectId(record_id), device_id=authorized_device_id(claims)
     )
     if document is None:
         raise HTTPException(status_code=404, detail="Traffic log not found")
-    return stored_log(document)
+    return stored_log(await run_in_threadpool(storage.decrypt, document), include_body=True)

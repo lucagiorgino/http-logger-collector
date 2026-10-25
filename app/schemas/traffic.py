@@ -189,6 +189,10 @@ class StoredTrafficLog(BaseModel):
     request_id: str | None = None
     body_length: int
     body_sha256: str | None
+    body: str | None = None
+    storage_encrypted_fields: list[Literal["body", "authorization", "cookies"]] = Field(
+        default_factory=list
+    )
 
 
 class TrafficLogPage(BaseModel):

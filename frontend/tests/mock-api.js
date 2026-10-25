@@ -1,6 +1,13 @@
 import { createServer } from "node:http";
 
 const configurations = new Map();
+let workspace = {
+  version: 0,
+  updated_at: null,
+  encrypt_request_body: true,
+  encrypt_authorization_header: true,
+  encrypt_cookies: true,
+};
 for (const deviceId of [
   "agent-discovered@clients",
   "device-alpha",
@@ -47,6 +54,8 @@ const record = {
   request_id: "agent-request-123",
   body_length: 12,
   body_sha256: "a".repeat(64),
+  body: "Captured body <script>window.bodyExecuted = true</script>",
+  storage_encrypted_fields: ["body", "authorization", "cookies"],
   source_ip: null,
 };
 
@@ -61,6 +70,24 @@ const server = createServer(async (request, response) => {
     return reply(401, { detail: "Unauthorized" });
   if (url.pathname === "/api/v1/me")
     return reply(200, { device_id: "operator-test", client_id: "test-client" });
+  if (url.pathname === "/api/v1/workspace/configuration") {
+    if (request.method === "PATCH") {
+      let content = "";
+      for await (const chunk of request) content += chunk;
+      const { expected_version, ...policy } = JSON.parse(content);
+      if (expected_version !== workspace.version)
+        return reply(409, {
+          detail: "Workspace configuration version has changed",
+        });
+      workspace = {
+        ...workspace,
+        ...policy,
+        version: workspace.version + 1,
+        updated_at: new Date().toISOString(),
+      };
+    }
+    return reply(200, workspace);
+  }
   if (url.pathname === "/api/v1/traffic-logs") {
     if (url.searchParams.get("device_id") === "gateway-failure") {
       response.writeHead(502, { "Content-Type": "text/html" });

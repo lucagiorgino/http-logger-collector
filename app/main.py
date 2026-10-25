@@ -10,10 +10,12 @@ from app.api.auth import router as auth_router
 from app.api.batches import router as batches_router
 from app.api.devices import router as devices_router
 from app.api.traffic_logs import router as traffic_logs_router
+from app.api.workspace import router as workspace_router
 from app.core.auth import AuthenticationUnavailable
 from app.core.config import settings
 from app.core.encryption import get_encryption_keys
 from app.core.openbao import KMSUnavailable
+from app.core.storage_encryption import get_storage_encryption
 from app.db.mongo import MongoRepository, PersistenceError
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     get_encryption_keys()
+    get_storage_encryption().validate()
     repository = MongoRepository()
     app.state.mongo_repository = repository
     try:
@@ -37,6 +40,7 @@ app.include_router(auth_router)
 app.include_router(batches_router)
 app.include_router(traffic_logs_router)
 app.include_router(devices_router)
+app.include_router(workspace_router)
 
 
 @app.middleware("http")
@@ -50,7 +54,9 @@ async def require_secure_transport(
     ):
         return JSONResponse(status_code=400, content={"detail": "HTTPS is required"})
     response = await call_next(request)
-    if request.url.path.startswith("/api/v1/devices"):
+    if request.url.path.startswith(
+        ("/api/v1/devices", "/api/v1/workspace/", "/api/v1/traffic-logs")
+    ):
         response.headers["Cache-Control"] = "no-store"
     return response
 

@@ -148,6 +148,20 @@ function expectedVersion(form) {
   return Number(version);
 }
 
+export function workspaceUpdate(form) {
+  const body = { expected_version: expectedVersion(form) };
+  for (const field of [
+    "encrypt_request_body",
+    "encrypt_authorization_header",
+    "encrypt_cookies",
+  ]) {
+    const value = form.get(field);
+    if (value !== null && value !== "on") throw new ApiError(422);
+    body[field] = value === "on";
+  }
+  return body;
+}
+
 export function deviceRegistration(form) {
   const { mode, deviceId } = devicePolicy(form);
   const name = form.get("name");

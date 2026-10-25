@@ -71,6 +71,73 @@ test("authenticated overview is SSR HTML without JavaScript or exposed tokens", 
   await context.close();
 });
 
+test("workspace encryption settings persist and reject stale edits without JavaScript", async ({
+  browser,
+}) => {
+  const context = await browser.newContext({ javaScriptEnabled: false });
+  await signIn(context);
+  const page = await context.newPage();
+  await page.goto("/settings");
+  await expect(
+    page.getByRole("heading", { name: "Storage encryption", exact: true }),
+  ).toBeVisible();
+  for (const name of [
+    "Encrypt request body",
+    "Encrypt authorization header",
+    "Cookies",
+  ])
+    await expect(
+      page.getByRole("checkbox", { name, exact: false }),
+    ).toBeChecked();
+  const stale = await context.newPage();
+  await stale.goto("/settings");
+  await page
+    .getByRole("checkbox", { name: "Encrypt request body", exact: false })
+    .uncheck();
+  await page
+    .getByRole("checkbox", { name: "Encrypt cookies", exact: false })
+    .uncheck();
+  await page
+    .getByRole("button", { name: "Save workspace configuration", exact: true })
+    .click();
+  await expect(
+    page.getByText("Workspace configuration saved", { exact: true }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(
+    page.getByRole("checkbox", { name: "Encrypt request body", exact: false }),
+  ).not.toBeChecked();
+  await expect(
+    page.getByRole("checkbox", {
+      name: "Encrypt authorization header",
+      exact: false,
+    }),
+  ).toBeChecked();
+  await expect(
+    page.getByRole("checkbox", { name: "Encrypt cookies", exact: false }),
+  ).not.toBeChecked();
+  await stale
+    .getByRole("button", { name: "Save workspace configuration", exact: true })
+    .click();
+  await expect(stale.getByText(/HTTP 409/)).toBeVisible();
+  await expect(
+    stale.getByText("Workspace configuration saved", { exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("checkbox", { name: "Encrypt request body", exact: false })
+    .check();
+  await page
+    .getByRole("checkbox", { name: "Encrypt cookies", exact: false })
+    .check();
+  await page
+    .getByRole("button", { name: "Save workspace configuration", exact: true })
+    .click();
+  await expect(
+    page.getByText("Workspace configuration saved", { exact: true }),
+  ).toBeVisible();
+  await context.close();
+});
+
 test("policy forms progressively submit without browser JavaScript", async ({
   browser,
 }) => {
@@ -289,6 +356,15 @@ test("traffic filters, cursor pagination, detail links and failure states work",
   await expect(page.getByText("192.0.2.10", { exact: true })).toBeVisible();
   await expect(page.getByText("1.0 KB", { exact: true })).toBeVisible();
   await expect(page.getByText("12.5 ms", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(
+      "Captured body <script>window.bodyExecuted = true</script>",
+      {
+        exact: true,
+      },
+    ),
+  ).toBeVisible();
+  expect(await page.evaluate(() => window.bodyExecuted)).toBeUndefined();
   await expect(
     page.getByText('chrome.exe <script>alert("untrusted")</script>', {
       exact: true,

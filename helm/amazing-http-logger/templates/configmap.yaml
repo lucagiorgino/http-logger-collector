@@ -22,6 +22,7 @@ data:
   OPENBAO_ADDR: {{ include "logger.openbaoAddress" . | quote }}
   OPENBAO_TRANSIT_MOUNT: {{ .Values.openbao.transitMount | quote }}
   OPENBAO_TRANSIT_KEY: {{ .Values.openbao.transitKey | quote }}
+  OPENBAO_STORAGE_KEY: {{ .Values.openbao.storageKey | quote }}
   OPENBAO_KV_MOUNT: {{ .Values.openbao.kvMount | quote }}
   OPENBAO_KV_PATH: {{ .Values.openbao.kvPath | quote }}
   OPENBAO_TIMEOUT_SECONDS: {{ .Values.openbao.timeoutSeconds | quote }}

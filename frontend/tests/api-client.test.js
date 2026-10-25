@@ -7,8 +7,25 @@ import {
   deviceRegistration,
   logQuery,
   policyUpdate,
+  workspaceUpdate,
 } from "../lib/api-client.js";
 import { backendSettings, missingAuthSettings } from "../lib/config.js";
+
+test("workspace updates parse encryption choices and the expected version", () => {
+  const form = new FormData();
+  form.set("expected_version", "2");
+  form.set("encrypt_request_body", "on");
+  form.set("encrypt_cookies", "on");
+
+  assert.deepEqual(workspaceUpdate(form), {
+    expected_version: 2,
+    encrypt_request_body: true,
+    encrypt_authorization_header: false,
+    encrypt_cookies: true,
+  });
+  form.set("encrypt_cookies", "false");
+  assert.throws(() => workspaceUpdate(form), ApiError);
+});
 
 test("server requests keep tokens in headers, bypass caches, and never follow redirects", async () => {
   const requests = [];

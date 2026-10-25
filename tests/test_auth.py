@@ -11,6 +11,7 @@ from joserfc.jwk import OctKey, RSAKey
 
 from app.core import auth
 from app.core.encryption import EncryptionKeys, get_encryption_keys
+from app.core.storage_encryption import get_storage_encryption
 from app.deps import get_mongo_repository
 from app.main import app
 from app.services.traffic_service import DEVICE_ID_CLAIM
@@ -52,6 +53,7 @@ def test_api_exposes_only_current_resources() -> None:
         "/api/v1/traffic-log-batches",
         "/api/v1/traffic-logs",
         "/api/v1/traffic-logs/{record_id}",
+        "/api/v1/workspace/configuration",
     }
     operation = schema["paths"]["/api/v1/me"]["get"]
     assert operation["security"] == [{"Auth0Bearer": []}]
@@ -115,7 +117,7 @@ def test_auth0_sdk_verifies_signed_tokens_and_caches_discovery_and_keys(signed_t
 
 @pytest.mark.parametrize("client_claim", ["azp", "client_id"])
 def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
-    signed_tokens, repository, traffic_payload, monkeypatch, client_claim
+    signed_tokens, repository, traffic_payload, monkeypatch, client_claim, storage_encryption
 ):
     mint, state = signed_tokens
     token = mint(
@@ -124,6 +126,9 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
     )
     monkeypatch.setitem(app.dependency_overrides, get_mongo_repository, lambda: repository)
     monkeypatch.setitem(app.dependency_overrides, get_encryption_keys, lambda: EncryptionKeys({}))
+    monkeypatch.setitem(
+        app.dependency_overrides, get_storage_encryption, lambda: storage_encryption
+    )
     signed_client = TestClient(app, base_url="https://testserver", client=("2001:db8::1", 50000))
     response = signed_client.post(
         "/api/v1/traffic-log-batches",

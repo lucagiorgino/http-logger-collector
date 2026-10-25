@@ -3,10 +3,14 @@ import { ApiFailure } from "@/components/api-error";
 import { PageHeading } from "@/components/page-heading";
 import { Card, CardContent } from "@/components/ui/card";
 import { api, ApiError } from "@/lib/api";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { PolicySubmit } from "@/components/policy-submit";
+import { updateWorkspace } from "./actions";
 
 export const metadata = { title: "Workspace" };
 
-export default async function Workspace() {
+export default async function Workspace({ searchParams }) {
+  const query = await searchParams;
   let identity;
   try {
     identity = await api("/api/v1/me");
@@ -14,13 +18,108 @@ export default async function Workspace() {
     if (!(error instanceof ApiError)) throw error;
     return <ApiFailure error={error} />;
   }
+  let configuration;
+  let configurationError;
+  try {
+    configuration = await api("/api/v1/workspace/configuration");
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    configurationError = error;
+  }
   return (
     <>
       <PageHeading
-        eyebrow="Workspace / access & architecture"
+        eyebrow="Workspace / configuration"
         title="Workspace"
-        description="Verified API identity, permissions and data access."
+        description="Application-wide retention, storage and encryption, verified identity and data access."
       />
+      {query.saved === "1" && (
+        <Alert>
+          <AlertTitle>Workspace configuration saved</AlertTitle>
+          <AlertDescription>
+            Storage encryption settings apply to future uploads. Retention
+            policies also apply to existing logs; expired logs are deleted
+            automatically.
+          </AlertDescription>
+        </Alert>
+      )}
+      {query.error && <ApiFailure error={new ApiError(Number(query.error))} />}
+      {configurationError && <ApiFailure error={configurationError} />}
+      {configuration && (
+        <form action={updateWorkspace} className="space-y-6">
+          <Card className="border shadow-none">
+            <CardContent className="space-y-6 px-6">
+              <div>
+                <h2 className="font-semibold">Storage encryption</h2>
+                <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                  Applies to all devices in this application. Enabled fields use
+                  a dedicated, non-exportable OpenBao AES-256-GCM storage key,
+                  separate from upload encryption. Authorization and cookie
+                  values remain redacted in API responses.
+                </p>
+              </div>
+              <input
+                type="hidden"
+                name="expected_version"
+                value={configuration.version}
+              />
+              {[
+                [
+                  "encrypt_request_body",
+                  "Encrypt request body",
+                  "Retain the original body encrypted at rest; authorized request details can display it.",
+                ],
+                [
+                  "encrypt_authorization_header",
+                  "Encrypt authorization header",
+                  "Protect Authorization and Proxy-Authorization header values.",
+                ],
+                [
+                  "encrypt_cookies",
+                  "Encrypt cookies",
+                  "Protect Cookie and Set-Cookie values in captured request and response headers.",
+                ],
+              ].map(([name, title, description]) => (
+                <label
+                  key={name}
+                  className="flex cursor-pointer items-start gap-3 rounded-lg border p-4"
+                >
+                  <input
+                    type="checkbox"
+                    name={name}
+                    defaultChecked={configuration[name]}
+                    className="mt-1 size-4 accent-primary"
+                  />
+                  <span>
+                    <span className="block text-sm font-medium">{title}</span>
+                    <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                      {description}
+                    </span>
+                  </span>
+                </label>
+              ))}
+              <Alert variant="destructive">
+                <AlertTitle>Disabling encryption stores plaintext</AlertTitle>
+                <AlertDescription>
+                  Unchecked categories are retained without field encryption for
+                  new uploads. Changes do not rewrite existing logs or recover
+                  previously discarded bodies. Only trusted operators with
+                  manage:devices can change these settings.
+                </AlertDescription>
+              </Alert>
+              <div className="flex items-center gap-4">
+                <PolicySubmit
+                  label="Save workspace configuration"
+                  pendingLabel="Saving configuration..."
+                />
+                <span className="mono text-xs text-muted-foreground">
+                  Version {configuration.version}
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        </form>
+      )}
       <Card className="border shadow-none">
         <CardContent className="px-6">
           <Fingerprint

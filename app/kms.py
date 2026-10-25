@@ -9,6 +9,7 @@ from joserfc.jwk import ECKey
 from app.core.config import settings
 from app.core.encryption import KEY_ID, parse_keyset
 from app.core.openbao import KMSUnavailable, OpenBaoClient, read_credential
+from app.core.storage_encryption import validate_storage_key
 
 
 def write_credential(path: str, value: str, *, create_only: bool = False) -> None:
@@ -74,6 +75,21 @@ def ensure_engines(client: OpenBaoClient) -> None:
         or key.get("allow_plaintext_backup") is not False
     ):
         raise KMSUnavailable("OpenBao wrapping key must be non-exportable AES-256-GCM")
+    storage_path = f"{settings.openbao_transit_mount}/keys/{settings.openbao_storage_key}"
+    if client.request("GET", storage_path, missing_ok=True) is None:
+        client.request(
+            "POST",
+            storage_path,
+            {
+                "type": "aes256-gcm96",
+                "exportable": False,
+                "allow_plaintext_backup": False,
+                "derived": False,
+                "convergent_encryption": False,
+                "auto_rotate_period": "720h",
+            },
+        )
+    validate_storage_key(client)
 
 
 def generate_key(key_id: str) -> dict:
@@ -101,6 +117,12 @@ def configure_runtime_policy(client: OpenBaoClient, policy_name: str) -> None:
     policy = (
         f'path "{client.kv_path}" {{ capabilities = ["read"] }}\n'
         f'path "{settings.openbao_transit_mount}/decrypt/{settings.openbao_transit_key}" '
+        '{ capabilities = ["update"] }\n'
+        f'path "{settings.openbao_transit_mount}/keys/{settings.openbao_storage_key}" '
+        '{ capabilities = ["read"] }\n'
+        f'path "{settings.openbao_transit_mount}/encrypt/{settings.openbao_storage_key}" '
+        '{ capabilities = ["update"] }\n'
+        f'path "{settings.openbao_transit_mount}/decrypt/{settings.openbao_storage_key}" '
         '{ capabilities = ["update"] }\n'
     )
     client.request("PUT", f"sys/policies/acl/{policy_name}", {"policy": policy})
@@ -146,7 +168,9 @@ def configure_kubernetes(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Manage OpenBao-protected ingestion keys")
+    parser = argparse.ArgumentParser(
+        description="Manage OpenBao ingestion and storage encryption keys"
+    )
     parser.add_argument(
         "command",
         choices=[
@@ -159,6 +183,7 @@ def main() -> None:
             "activate",
             "retire",
             "rotate-kek",
+            "rotate-storage",
         ],
     )
     parser.add_argument("--admin-token-file")
@@ -234,6 +259,13 @@ def main() -> None:
                         raise ValueError("The active key cannot be retired")
                     document["keys"] = [k for k in document["keys"] if k["kid"] != args.key_id]
             client.store_keyset(document, record["metadata"]["version"])
+        elif args.command == "rotate-storage":
+            validate_storage_key(client)
+            client.request(
+                "POST",
+                f"{settings.openbao_transit_mount}/keys/{settings.openbao_storage_key}/rotate",
+                {},
+            )
         elif args.command == "rotate-kek":
             client.request(
                 "POST",

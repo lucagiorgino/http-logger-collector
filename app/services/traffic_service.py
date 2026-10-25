@@ -9,7 +9,9 @@ from bson import ObjectId
 from fastapi import HTTPException, Request
 
 from app.core.security import redact_sensitive_headers
+from app.core.storage_encryption import StorageEncryption
 from app.schemas.traffic import BatchReceipt, TrafficLogRequest
+from app.schemas.workspace import StoragePolicy
 from app.services.ingestion import IngestionPublisher
 
 DEVICE_ID_CLAIM = "https://amazing-http-logger/device_id"
@@ -86,9 +88,12 @@ async def ingest_traffic_logs(
     payloads: list[TrafficLogRequest],
     context: IngestionContext,
     publisher: IngestionPublisher,
+    policy: StoragePolicy,
+    storage: StorageEncryption,
 ) -> BatchReceipt:
     batch_id = str(uuid4())
     documents = [normalize_traffic_log(payload, batch_id, context) for payload in payloads]
+    await storage.protect(documents, payloads, policy)
     return await publisher.publish(batch_id, documents)
 
 

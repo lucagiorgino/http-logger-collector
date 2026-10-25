@@ -50,8 +50,10 @@ class RoutingListener(CommandListener):
     not os.getenv("MONGO_TEST_URI"), reason="Set MONGO_TEST_URI for device registration"
 )
 def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
-    monkeypatch, encryption_keys, traffic_payload
+    monkeypatch, encryption_keys, traffic_payload, storage_encryption
 ):
+    from app.core.storage_encryption import get_storage_encryption
+
     traffic_payload["timestamp"] = datetime.now(UTC).isoformat()
     monkeypatch.setattr(settings, "mongo_allow_primary_reads", True)
     monkeypatch.setattr(settings, "app_env", "development")
@@ -68,6 +70,7 @@ def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
         app.dependency_overrides[require_bearer_token] = lambda: claims.copy()
         app.dependency_overrides[get_mongo_repository] = lambda: repository
         app.dependency_overrides[get_encryption_keys] = lambda: encryption_keys
+        app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
         try:
             await repository.ensure_indexes()
             async with AsyncClient(
@@ -227,7 +230,10 @@ def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
         ),
     ],
 )
-def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, uri):
+def test_time_series_ingestion_and_analysis_routing(
+    monkeypatch, allow_primary, uri, storage_encryption
+):
+    from app.schemas.workspace import StoragePolicy
 
     monkeypatch.setattr(settings, "mongo_server_selection_timeout_ms", 1000)
     monkeypatch.setattr(settings, "mongo_allow_primary_reads", allow_primary)
@@ -259,6 +265,12 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
             read_concern=repository.device_configurations.read_concern,
             write_concern=repository.device_configurations.write_concern,
         )
+        repository.workspace_configurations = repository.database.get_collection(
+            "workspace_configurations",
+            read_preference=repository.workspace_configurations.read_preference,
+            read_concern=repository.workspace_configurations.read_concern,
+            write_concern=repository.workspace_configurations.write_concern,
+        )
         try:
             await repository.ensure_indexes()
             await repository.ensure_indexes()
@@ -284,6 +296,8 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
                 [payload, payload],
                 context,
                 MongoIngestionPublisher(repository),
+                StoragePolicy(),
+                storage_encryption,
             )
             assert receipt.status == "stored"
             deadline = monotonic() + 15
@@ -309,7 +323,7 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
             assert documents[0]["destination_ip"] == "203.0.113.50"
             assert documents[0]["response_size_bytes"] == 1024
             assert documents[0]["process_name"] == "chrome.exe"
-            assert documents[0]["request_headers"]["Authorization"] == "[REDACTED]"
+            assert documents[0]["request_headers"]["Authorization"] == "[ENCRYPTED]"
             assert "body" not in documents[0]
             assert (
                 await repository.get_traffic_log(documents[0]["_id"], device_id="other-device")
@@ -349,6 +363,8 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
                 [payload],
                 context,
                 MongoIngestionPublisher(repository),
+                StoragePolicy(),
+                storage_encryption,
             )
         finally:
             await repository.client.drop_database(database_name)
@@ -372,19 +388,24 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
     ],
 )
 def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
-    monkeypatch, encryption_keys, traffic_payload, key_source
+    monkeypatch, encryption_keys, traffic_payload, key_source, storage_encryption
 ):
     from joserfc import jwe
     from joserfc.jwk import ECKey
+
+    from app.core.storage_encryption import get_storage_encryption
 
     traffic_payload["timestamp"] = datetime.now(UTC).isoformat()
     monkeypatch.setattr(settings, "mongo_allow_primary_reads", True)
     monkeypatch.setattr(settings, "app_env", "development")
     if key_source == "openbao":
+        from app.core.storage_encryption import StorageEncryption
+
         monkeypatch.setattr(settings, "openbao_addr", os.environ["OPENBAO_TEST_ADDR"])
         monkeypatch.setattr(settings, "openbao_token_file", os.environ["OPENBAO_TEST_TOKEN_FILE"])
         get_encryption_keys.cache_clear()
         encryption_keys = get_encryption_keys()
+        storage_encryption = StorageEncryption()
 
     async def scenario():
         repository = MongoRepository(
@@ -398,6 +419,7 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
         app.dependency_overrides[require_bearer_token] = lambda: claims
         app.dependency_overrides[get_mongo_repository] = lambda: repository
         app.dependency_overrides[get_encryption_keys] = lambda: encryption_keys
+        app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
         config_url = "/api/v1/devices/device-456/configuration"
         upload_url = "/api/v1/traffic-log-batches"
         try:
@@ -507,12 +529,98 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
                 )
                 assert len(documents) == 2
                 assert all(
-                    document["request_headers"]["Authorization"] == "[REDACTED]"
+                    document["request_headers"]["Authorization"] == "[ENCRYPTED]"
                     for document in documents
                 )
         finally:
             app.dependency_overrides.clear()
             get_encryption_keys.cache_clear()
+            await repository.client.drop_database(repository.database.name)
+            await repository.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not os.getenv("MONGO_TEST_URI"), reason="Set MONGO_TEST_URI for local MongoDB")
+def test_workspace_settings_control_storage_and_survive_concurrent_edits(
+    monkeypatch,
+    storage_encryption,
+    traffic_payload,
+):
+    from app.core.encryption import EncryptionKeys
+    from app.core.storage_encryption import get_storage_encryption
+
+    traffic_payload["timestamp"] = datetime.now(UTC).isoformat()
+    monkeypatch.setattr(settings, "mongo_allow_primary_reads", True)
+    monkeypatch.setattr(settings, "app_env", "development")
+
+    async def scenario():
+        repository = MongoRepository(
+            uri=os.environ["MONGO_TEST_URI"], db_name="workspace_test_" + uuid4().hex
+        )
+        app.dependency_overrides[require_bearer_token] = lambda: {
+            "sub": "test-device",
+            "permissions": ["manage:devices"],
+        }
+        app.dependency_overrides[get_mongo_repository] = lambda: repository
+        app.dependency_overrides[get_encryption_keys] = lambda: EncryptionKeys({})
+        app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
+        url = "/api/v1/workspace/configuration"
+        flags = ("encrypt_request_body", "encrypt_authorization_header", "encrypt_cookies")
+        wire = gzip.compress(json.dumps({"logs": [traffic_payload]}).encode())
+        headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+        try:
+            await repository.ensure_indexes()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="https://testserver"
+            ) as client:
+                assert (await client.get(url)).json()["version"] == 0
+                assert (
+                    await client.post("/api/v1/traffic-log-batches", content=wire, headers=headers)
+                ).status_code == 202
+                encrypted = await repository.traffic_logs.find_one({})
+                assert traffic_payload["body"] not in repr(encrypted)
+                assert encrypted["request_headers"]["Authorization"] == "[ENCRYPTED]"
+                changes = await asyncio.gather(
+                    *(
+                        client.patch(
+                            url, json={"expected_version": 0, **dict.fromkeys(flags, False)}
+                        )
+                        for _ in range(2)
+                    )
+                )
+                assert sorted(response.status_code for response in changes) == [200, 409]
+                assert (await client.get(url)).json()["version"] == 1
+                assert (
+                    await client.post("/api/v1/traffic-log-batches", content=wire, headers=headers)
+                ).status_code == 202
+                plain = await repository.traffic_logs.find_one(
+                    {"storage_encryption": {"$exists": False}}
+                )
+                assert plain["body"] == traffic_payload["body"]
+                assert plain["request_headers"]["Authorization"] == "secret"
+                assert plain["request_headers"]["Cookie"] == "session=secret"
+                for document in (encrypted, plain):
+                    detail = await client.get(f"/api/v1/traffic-logs/{document['_id']}")
+                    assert detail.status_code == 200
+                    assert detail.json()["body"] == traffic_payload["body"]
+                    assert detail.json()["request_headers"]["Authorization"] == "[REDACTED]"
+                summaries = await repository.list_traffic_logs(
+                    device_id="test-device", start_time=None, end_time=None, before=None, limit=10
+                )
+                assert len(summaries) == 2
+                assert all("body" not in document for document in summaries)
+                assert all(
+                    "ciphertext" not in document.get("storage_encryption", {})
+                    for document in summaries
+                )
+                await client.patch(url, json={"expected_version": 1, **dict.fromkeys(flags, True)})
+                stored = await repository.workspace_configurations.find_one({"_id": "workspace"})
+                assert stored["version"] == 2
+                assert all(stored[flag] for flag in flags)
+                assert await repository.traffic_logs.count_documents({}) == 2
+        finally:
+            app.dependency_overrides.clear()
             await repository.client.drop_database(repository.database.name)
             await repository.close()
 

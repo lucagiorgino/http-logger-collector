@@ -13,8 +13,10 @@ from app.deps import (
     EncryptionKeysDep,
     IngestionPublisherDep,
     MongoRepositoryDep,
+    StorageEncryptionDep,
 )
 from app.schemas.traffic import BatchReceipt, TrafficLogBatch, TrafficLogRequest
+from app.schemas.workspace import WorkspaceConfiguration
 from app.services.traffic_service import ingest_traffic_logs, ingestion_context
 
 router = APIRouter(prefix="/api/v1/traffic-log-batches", tags=["traffic logs"])
@@ -134,6 +136,7 @@ async def create_traffic_log_batch(
     claims: AuthenticatedClaims,
     publisher: IngestionPublisherDep,
     repository: MongoRepositoryDep,
+    storage: StorageEncryptionDep,
     payload: Annotated[TrafficLogBatch, Depends(read_compressed_batch)],
 ) -> BatchReceipt:
     context = ingestion_context(claims, request)
@@ -143,4 +146,7 @@ async def create_traffic_log_batch(
         raise HTTPException(status_code=403, detail="Device requires application encryption")
     if mode == "tls_only" and request.state.batch_encrypted:
         raise HTTPException(status_code=403, detail="Application encryption is not enabled")
-    return await ingest_traffic_logs(payload.logs, context, publisher)
+    workspace = WorkspaceConfiguration.model_validate(
+        await repository.get_workspace_configuration()
+    )
+    return await ingest_traffic_logs(payload.logs, context, publisher, workspace, storage)

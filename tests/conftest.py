@@ -1,15 +1,24 @@
 from unittest.mock import AsyncMock
 
 import pytest
+from fake_storage import FakeStorageEncryption
 from fastapi.testclient import TestClient
 from joserfc.jwk import ECKey
 
 from app.core.auth import require_bearer_token
 from app.core.config import settings
 from app.core.encryption import EncryptionKeys, get_encryption_keys
+from app.core.storage_encryption import get_storage_encryption
 from app.deps import get_mongo_repository
 from app.main import app
+from app.schemas.workspace import WorkspaceConfiguration
 from app.services.traffic_service import DEVICE_ID_CLAIM, ClientIdentity, IngestionContext
+
+
+@pytest.fixture
+def storage_encryption(monkeypatch):
+    monkeypatch.setattr(settings, "openbao_addr", "https://test-openbao.invalid")
+    return FakeStorageEncryption()
 
 
 @pytest.fixture
@@ -19,11 +28,12 @@ def repository():
     repository.get_traffic_log.return_value = None
     repository.get_device_configuration.return_value = {"version": 0, "encryption_mode": "tls_only"}
     repository.list_devices.return_value = []
+    repository.get_workspace_configuration.return_value = WorkspaceConfiguration().model_dump()
     return repository
 
 
 @pytest.fixture
-def authorized_client(repository):
+def authorized_client(repository, storage_encryption):
     app.dependency_overrides[require_bearer_token] = lambda: {
         "sub": "user-123",
         DEVICE_ID_CLAIM: "device-456",
@@ -31,6 +41,7 @@ def authorized_client(repository):
     }
     app.dependency_overrides[get_mongo_repository] = lambda: repository
     app.dependency_overrides[get_encryption_keys] = lambda: EncryptionKeys({})
+    app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
     try:
         yield TestClient(app, client=("203.0.113.10", 50000))
     finally:

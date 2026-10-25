@@ -42,8 +42,8 @@ def test_encrypted_single_log_is_decrypted_validated_and_redacted(
     assert response.status_code == 202
     assert response.json()["accepted_count"] == 1
     stored = repository.insert_traffic_logs.call_args.args[0][0]
-    assert stored["request_headers"]["Authorization"] == "[REDACTED]"
-    assert stored["response_headers"]["Set-Cookie"] == "[REDACTED]"
+    assert stored["request_headers"]["Authorization"] == "[ENCRYPTED]"
+    assert stored["response_headers"]["Set-Cookie"] == "[ENCRYPTED]"
     assert stored["destination_ip"] == rich_traffic_payload["destination_ip"]
     assert stored["response_size_bytes"] == rich_traffic_payload["response_size_bytes"]
     assert stored["process_name"] == rich_traffic_payload["process_name"]

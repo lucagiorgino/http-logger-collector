@@ -149,11 +149,19 @@ export default async function RequestDetail({ params }) {
               className="mb-4 size-6 text-primary"
               aria-hidden="true"
             />
-            <h2 className="font-semibold">Request body metadata</h2>
+            <h2 className="font-semibold">Request body</h2>
             <p className="mt-3 text-sm leading-6 text-muted-foreground">
-              The original request body is not stored. Only its byte length and
-              SHA-256 digest remain for correlation.
+              {log.body == null
+                ? "No retained body is available for this record. Older records may contain only a byte length and SHA-256 digest."
+                : log.storage_encrypted_fields?.includes("body")
+                  ? "Encrypted at rest with the dedicated OpenBao storage key; decrypted for this authorized detail view."
+                  : "Stored without field encryption under the workspace settings at ingestion time."}
             </p>
+            {log.body != null && (
+              <pre className="mono mt-5 max-h-96 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-muted p-4 text-xs">
+                {log.body || "(empty body)"}
+              </pre>
+            )}
             <dl className="mt-6 space-y-5">
               <div>
                 <dt className="eyebrow">Original body length</dt>

@@ -46,12 +46,15 @@ class OpenBaoClient:
         for value in (
             settings.openbao_transit_mount,
             settings.openbao_transit_key,
+            settings.openbao_storage_key,
             settings.openbao_kv_mount,
             settings.openbao_kv_path,
             settings.openbao_auth_mount,
         ):
             if not PATH_COMPONENT.fullmatch(value) or value in {".", ".."}:
                 raise ValueError("OpenBao mount and key names must be single safe path components")
+        if settings.openbao_storage_key == settings.openbao_transit_key:
+            raise ValueError("Storage encryption must use a dedicated OpenBao key")
         if settings.openbao_timeout_seconds <= 0:
             raise ValueError("OPENBAO_TIMEOUT_SECONDS must be positive")
         self.http = httpx.Client(
@@ -77,6 +80,7 @@ class OpenBaoClient:
         payload: dict[str, Any] | None = None,
         *,
         missing_ok: bool = False,
+        max_response_bytes: int = 1_048_576,
     ) -> dict[str, Any] | None:
         try:
             response = self.http.request(
@@ -90,7 +94,7 @@ class OpenBaoClient:
             response.raise_for_status()
             if not response.content:
                 return {}
-            if len(response.content) > 1_048_576:
+            if len(response.content) > max_response_bytes:
                 raise ValueError()
             document = response.json()
             if not isinstance(document, dict):

@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import os
 import sys
@@ -10,7 +11,11 @@ from joserfc.jwk import ECKey
 from app.core.config import settings
 from app.core.encryption import InvalidEnvelope, parse_keyset
 from app.core.openbao import KMSUnavailable, OpenBaoClient, read_credential
+from app.core.storage_encryption import StorageEncryption
 from app.kms import configure_runtime_policy, initialize, main
+from app.schemas.traffic import TrafficLogRequest
+from app.schemas.workspace import StoragePolicy
+from app.services.traffic_service import ClientIdentity, IngestionContext, normalize_traffic_log
 
 
 @pytest.mark.skipif(
@@ -24,6 +29,8 @@ def test_real_transit_envelope_rotation_cas_and_runtime_permissions(monkeypatch)
     monkeypatch.setattr(settings, "app_env", "development")
     monkeypatch.setattr(settings, "openbao_addr", os.environ["OPENBAO_TEST_ADDR"])
     monkeypatch.setattr(settings, "openbao_transit_key", key_name)
+    storage_key_name = "storage-" + suffix
+    monkeypatch.setattr(settings, "openbao_storage_key", storage_key_name)
     monkeypatch.setattr(settings, "openbao_kv_path", key_name)
     root = read_credential(os.environ["OPENBAO_TEST_ADMIN_TOKEN_FILE"])
     runtime_token = None
@@ -65,6 +72,37 @@ def test_real_transit_envelope_rotation_cas_and_runtime_permissions(monkeypatch)
             )
             runtime_token = response["auth"]["client_token"]
             with OpenBaoClient(runtime_token) as runtime:
+                storage = StorageEncryption()
+                monkeypatch.setattr(storage, "client", lambda: OpenBaoClient(runtime_token))
+                payload = TrafficLogRequest(
+                    timestamp="2026-01-15T10:00:00Z",
+                    method="POST",
+                    url="https://example.test",
+                    status_code=200,
+                    request_headers={"Authorization": "test-secret", "Cookie": "test-cookie"},
+                    response_headers={"Set-Cookie": "test-response-cookie"},
+                    body="x" * 900_000,
+                )
+                context = IngestionContext(ClientIdentity("storage-test", None), "127.0.0.1")
+                documents = [
+                    normalize_traffic_log(payload, "storage-batch", context) for _ in range(2)
+                ]
+                asyncio.run(storage.protect(documents, [payload, payload], StoragePolicy()))
+                first, second = [
+                    document["storage_encryption"]["ciphertext"] for document in documents
+                ]
+                assert first.startswith("vault:v1:") and second.startswith("vault:v1:")
+                assert first != second
+                assert storage.decrypt(documents[0])["body"] == payload.body
+                tampered = {**documents[0], "batch_id": "different-batch"}
+                with pytest.raises(KMSUnavailable):
+                    storage.decrypt(tampered)
+                command("rotate-storage")
+                assert storage.decrypt(documents[0])["body"] == payload.body
+                current = normalize_traffic_log(payload, "storage-batch", context)
+                asyncio.run(storage.protect([current], [payload], StoragePolicy()))
+                assert current["storage_encryption"]["ciphertext"].startswith("vault:v2:")
+                assert storage.decrypt(current)["request_headers"]["Authorization"] == "test-secret"
                 keys = parse_keyset(runtime.load_keyset())
                 compressed = gzip.compress(b'{"logs": []}')
                 envelope = jwe.encrypt_compact(
@@ -84,6 +122,16 @@ def test_real_transit_envelope_rotation_cas_and_runtime_permissions(monkeypatch)
                     ("POST", runtime.kv_path, {"data": {"ciphertext": "invalid"}}),
                     ("POST", f"{settings.openbao_transit_mount}/keys/{key_name}/rotate", {}),
                     ("POST", f"{settings.openbao_transit_mount}/encrypt/{key_name}", {}),
+                    (
+                        "POST",
+                        f"{settings.openbao_transit_mount}/keys/{storage_key_name}/rotate",
+                        {},
+                    ),
+                    (
+                        "GET",
+                        f"{settings.openbao_transit_mount}/export/encryption-key/{storage_key_name}",
+                        None,
+                    ),
                 ]:
                     with pytest.raises(KMSUnavailable):
                         runtime.request(method, path, payload)
@@ -119,4 +167,10 @@ def test_real_transit_envelope_rotation_cas_and_runtime_permissions(monkeypatch)
                 {"deletion_allowed": True},
             )
             admin.request("DELETE", f"{settings.openbao_transit_mount}/keys/{key_name}")
+            admin.request(
+                "POST",
+                f"{settings.openbao_transit_mount}/keys/{storage_key_name}/config",
+                {"deletion_allowed": True},
+            )
+            admin.request("DELETE", f"{settings.openbao_transit_mount}/keys/{storage_key_name}")
             admin.request("DELETE", f"sys/policies/acl/{policy_name}")

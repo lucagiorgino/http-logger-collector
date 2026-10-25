@@ -35,7 +35,7 @@ def encode_cursor(document: dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw).decode()
 
 
-def stored_log(document: dict[str, Any]) -> StoredTrafficLog:
+def stored_log(document: dict[str, Any], *, include_body: bool = False) -> StoredTrafficLog:
     request_headers = redact_sensitive_headers(
         document.get("request_headers", document.get("headers", {}))
     )
@@ -46,6 +46,8 @@ def stored_log(document: dict[str, Any]) -> StoredTrafficLog:
         headers=request_headers,
         request_headers=request_headers,
         response_headers=redact_sensitive_headers(document.get("response_headers", {})),
+        body=document.get("body") if include_body else None,
+        storage_encrypted_fields=document.get("storage_encryption", {}).get("fields", []),
         **{
             key: document[key]
             for key in (

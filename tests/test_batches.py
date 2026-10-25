@@ -44,11 +44,12 @@ def test_compressed_batch_is_normalized_before_durable_acceptance(
         assert document["timestamp"].isoformat() == "2026-01-15T08:00:00+00:00"
         assert document["method"] == "GET"
         assert document["request_headers"] == {
-            "Authorization": "[REDACTED]",
-            "Cookie": "[REDACTED]",
+            "Authorization": "[ENCRYPTED]",
+            "Cookie": "[ENCRYPTED]",
             "User-Agent": "TestAgent",
         }
         assert "body" not in document
+        assert document["storage_encryption"]["ciphertext"].startswith("vault:v1:")
         assert document["body_length"] == len(traffic_payload["body"].encode())
         assert document["body_sha256"]
 
@@ -377,9 +378,10 @@ def test_publisher_can_be_replaced_without_changing_api(
     assert response.json()["status"] == "queued"
     publisher.publish.assert_awaited_once()
     assert (
-        publisher.publish.call_args.args[1][0]["request_headers"]["Authorization"] == "[REDACTED]"
+        publisher.publish.call_args.args[1][0]["request_headers"]["Authorization"] == "[ENCRYPTED]"
     )
     queued = publisher.publish.call_args.args[1][0]
+    assert queued["storage_encryption"]["ciphertext"].startswith("vault:v1:")
     assert traffic_payload["body"] not in repr(queued)
     repository.insert_traffic_logs.assert_not_awaited()
 

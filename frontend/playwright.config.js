@@ -14,9 +14,13 @@ export default defineConfig({
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: [
     {
-      command: "node tests/mock-api.js",
+      command:
+        process.env.DASHBOARD_E2E_REAL_BACKEND === "true"
+          ? "cd .. && exec .venv/bin/python -m uvicorn --app-dir tests dashboard_backend:app --host 127.0.0.1 --port 38002"
+          : "node tests/mock-api.js",
       url: "http://127.0.0.1:38002/health",
       reuseExistingServer: false,
+      gracefulShutdown: { signal: "SIGTERM", timeout: 10000 },
     },
     {
       command: "npm run start",
