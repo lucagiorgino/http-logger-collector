@@ -1,5 +1,12 @@
 # Amazing HTTP Logger project blueprint
 
+The ingestion pipeline is documented in the README's **Core
+ingestion flow**: GCS/Pub/Sub in production, MinIO/Pub/Sub emulator locally, a
+decrypt/parse/protect worker and a separate rate-limited Mongo loader linked by
+a dedicated Pub/Sub silver subscription. It is a temporary raw spool, not a
+historical datalake. Uploads acknowledge durable original bytes; content validation
+is asynchronous. Device policies, workspace retention and analysis reads remain independent.
+
 This document defines the repository structure and engineering conventions for the Python backend implementation. It is intentionally implementation-focused and avoids repeating the original interview brief or writing a second project description.
 
 ---
@@ -19,7 +26,7 @@ amazing-http-logger/
   .env.example                 # sample environment variables
   docker/
     Dockerfile                 # application container image
-    docker-compose.yml         # development MongoDB/OpenBao; backend runs on the host
+    docker-compose.yml         # all development dependencies; profiles select groups/proxy mode
   helm/amazing-http-logger/
     Chart.yaml                 # Kubernetes deployment chart
     values.yaml                # external MongoDB and HTTPS OpenBao by default
@@ -34,7 +41,7 @@ amazing-http-logger/
     api/
       __init__.py
       auth.py                   # /api/v1/me; login/token issuance stays with Auth0
-      batches.py                # gzip/JWE /api/v1/traffic-log-batches ingestion
+      uploads.py                # durable raw upload and device-scoped receipt status
       devices.py                # device encryption policy and capability/status APIs
       traffic_logs.py           # owner-scoped collection/item analysis reads
     core/
@@ -51,12 +58,13 @@ amazing-http-logger/
       devices.py                # device configuration and status schemas
     services/
       traffic_service.py        # receive, validate, and persist traffic logs
-      ingestion.py              # replaceable publisher and direct MongoDB adapter
+      upload_workers.py         # parse/protect, silver publishing, Mongo loading
+    spool_worker.py             # parse/load processes and replay/cleanup CLI
       analysis.py               # cursor handling and stored-log representations
   tests/
     conftest.py                 # shared fixtures and app test setup
     test_auth.py                # auth flow tests
-    test_batches.py             # compressed ingestion, validation, authorization
+    test_uploads.py             # raw receipts, async validation, workers and recovery
     test_analysis.py            # owner-scoped log reads and pagination
   integration_tests/
     stack_client.py             # HTTP-only, threaded OAuth device emulator
@@ -79,10 +87,11 @@ Rules:
 - `app/api` handles HTTP requests and call into `app/services`.
 - `app/services` contains domain logic and orchestrates calls into persistence or security utilities.
 - `app/db` is the only layer that talks to MongoDB.
-- Batch ingestion hands normalized, minimized records to `IngestionPublisher`;
-  Redis Streams durably accepts them before HTTP 200. A separate worker batch-inserts
-  into MongoDB and acknowledges only after majority persistence, with pending-message
-  recovery and best-effort replay deduplication, not exactly-once delivery.
+- Upload ingestion durably stores original bytes in GCS/MinIO before HTTP 202.
+  Object-event Pub/Sub triggers parsing, minimization and field encryption;
+  silver Pub/Sub buffers protected documents for rate-limited majority Mongo writes.
+  Raw deletion follows the majority `stored` receipt. Delivery is at least once,
+  not exactly once. Both workers use `app.spool_worker parse/load`.
 - Deployment analysis uses strict secondary routing without fallback. The single-node
   local profile explicitly selects primary reads, guarded to development only.
 - Device policy enforcement uses primary/majority reads, not analysis replicas.
@@ -93,12 +102,13 @@ Rules:
   field for ordinary and suspicious metadata buckets, never a collection-wide TTL.
   Workspace policy defaults to 7/30 days and can independently disable either.
   Suspicious classification is server-owned; the analysis job is not implemented.
-- See `docs/PLAN.md` for the time-series schema and queue contract, and
+- See `docs/PLAN.md` for the time-series schema and pipeline contract, and
   `docs/RUNBOOK.md` for replica-set setup and deployment commands.
 - `tests/` validates behavior and imports the application package, not vice versa.
 - Secrets live only in git-ignored files/directories such as `.env` and `.secrets/`,
   or externally provisioned Kubernetes Secrets.
-- Local development uses MongoDB/OpenBao Compose and host Python with auto-reload.
+- Local development uses MongoDB/OpenBao/NGINX plus MinIO/emulator/bridge Compose
+  services and host Python API/parser/loader processes.
 - Docker builds deployment images; Kubernetes and Helm manage deployment.
 
 ---
@@ -118,7 +128,8 @@ This repository implements the backend service for collecting HTTP traffic gener
 
 The success criterion is a working backend that authenticates users and agents, accepts traffic logs securely, and stores them in MongoDB without leaking sensitive data.
 
-The core architectural invariant is that all inbound traffic is validated, authenticated, and logged with explicit security checks before it reaches persistence.
+Authenticate and bound uploads before durable raw receipt; validate, minimize and
+protect content in the parser before silver/Mongo log persistence. Never log raw payloads.
 
 ## The docs
 Read the relevant file before starting a task and update it when the design changes.
@@ -216,7 +227,7 @@ MongoDB
 ```
 
 Key rules:
-- `app/api` should only parse requests, validate input using schemas, and delegate to services.
+- `app/api` authenticates requests, bounds wire input, persists raw receipts and delegates content work to workers.
 - `app/services` should contain business logic: auth, authorization, traffic validation, storage orchestration.
 - `app/db` should handle MongoDB access, queries, and document persistence.
 - `app/core/security.py` centralizes token validation, permission checks, and sensitive data handling.
@@ -263,14 +274,15 @@ Required behaviors:
 - deny unauthenticated requests by default
 - restrict authorization according to user or agent role
 - redact sensitive data before logging or persistence
-- avoid storing raw secrets or credentials
+- protect temporary raw uploads with scoped storage access and remove them only
+  after confirmed persistence; minimize/protect sensitive fields before silver/Mongo
 - use HTTPS in production and environment-based configuration
 - take a least-privilege approach to database access
 
 Security tests should ensure that:
 - unauthorized access is rejected
 - invalid tokens are rejected
-- malformed agent payloads are rejected
+- malformed agent content fails asynchronously before silver publishing
 - unauthenticated traffic upload attempts fail
 - sensitive fields are redacted or excluded from logs and storage
 
@@ -302,8 +314,9 @@ Recommended targets:
 - `make test` — run all unit and integration tests
 - `make lint` — run formatters and linters such as ruff or flake8
 - `make run` — launch `python -m app` using the selected `.env` file
-- `make dev` — start MongoDB/OpenBao Compose and host Python with auto-reload
-- `make dev-up/down` — start or stop both development dependencies
+- `make dev` — start development dependencies, host API with auto-reload, and parser/loader
+- `make dev-up/down` — start or stop MongoDB/OpenBao/NGINX and MinIO/emulator/bridge
+- `make spool-parser` / `make spool-loader` — run the individual host workers
 - `make mongo-up` — start the one-container, single-node development replica set
 - `make mongo-down` — stop local MongoDB, retaining its volumes
 - `make openbao-up` — start/bootstrap ephemeral OpenBao and refresh its runtime token

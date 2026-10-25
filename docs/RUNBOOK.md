@@ -2,13 +2,244 @@
 
 ## Prerequisites
 - Python 3.11+
-- Docker and Docker Compose for development MongoDB, OpenBao, Redis and NGINX
+- Docker and Docker Compose for MongoDB/OpenBao/NGINX and MinIO/emulator/bridge
 - For Kubernetes deployment only: Kubernetes 1.27+, kubectl, Helm 3 or 4, and a
-  StorageClass when using bundled MongoDB/Redis
-- Redis >=7.2 with persistent AOF and `maxmemory-policy noeviction`
+  StorageClass when using bundled MongoDB
 
 For HTTPS proxy configuration, device encryption policies, OpenBao provisioning, and
 rotation, see [Log encryption and device configuration](ENCRYPTION.md).
+
+## Upload ingestion
+
+All uploads follow GCS/MinIO -> object-event Pub/Sub -> parser/protect worker ->
+silver Pub/Sub -> rate-limited Mongo loader. POST acknowledges durable raw bytes;
+content errors are asynchronous. See the README's **Core ingestion flow**.
+
+### Local MinIO and Pub/Sub emulator
+
+```bash
+make install
+make dev-up
+```
+
+`make dev-up` generates two ignored private MinIO credential files, builds
+pinned MinIO community server/client releases from source, starts MinIO on
+loopback **29000** (console **29001**), a Pub/Sub emulator on **28681**, and a
+private unexposed MinIO-notification bridge. Archived public MinIO images/binaries
+are no longer available, so the first source build can take several minutes.
+The API/workers run on the host without application image builds;
+the bridge/MinIO setup builds images.
+The MinIO volume persists raw uploads; the Pub/Sub emulator is ephemeral.
+After emulator restart rerun `make dev-up` and replay outstanding raw uploads.
+`make spool-dev-up` remains a convenience setup target.
+All services live in `docker/docker-compose.yml`: `spool` selects these three
+services, while `tools` also enables the one-shot MinIO initializer.
+Make handles credentials, topic provisioning and notification initialization;
+starting a Compose profile alone does not replace these bootstrap steps.
+Synthetic data only: this local MinIO volume does not provide production
+encryption-at-rest guarantees.
+
+Set the following in your ignored `.env`, preserving existing Auth0/OpenBao values:
+
+```env
+SPOOL_STORAGE_BACKEND=minio
+SPOOL_ENDPOINT_URL=http://localhost:29000
+PUBSUB_EMULATOR_HOST=localhost:28681
+GOOGLE_CLOUD_PROJECT=logger-local
+SPOOL_BUCKET=traffic-uploads
+SPOOL_EVENT_TOPIC=projects/logger-local/topics/uploads
+SPOOL_SUBSCRIPTION=projects/logger-local/subscriptions/uploads
+SPOOL_SILVER_TOPIC=projects/logger-local/topics/uploads-silver
+SPOOL_SILVER_SUBSCRIPTION=projects/logger-local/subscriptions/uploads-silver
+SPOOL_PARSE_DLQ_TOPIC=projects/logger-local/topics/parse-dlq
+SPOOL_LOAD_DLQ_TOPIC=projects/logger-local/topics/load-dlq
+SPOOL_MINIO_ACCESS_KEY_FILE=.secrets/minio-access-key
+SPOOL_MINIO_SECRET_KEY_FILE=.secrets/minio-secret-key
+```
+
+`make dev` starts the API and both workers. To run separate host processes:
+
+```bash
+make run
+# Other terminals:
+make spool-parser    # decrypt / decompress / validate / minimize / encrypt
+make spool-loader    # rate-limited Mongo writes / raw cleanup
+```
+
+Post gzip/JWE wire bytes to `/api/v1/traffic-log-uploads`; optionally
+include a stable `X-Batch-Id` for identical-byte retries. Poll
+`/api/v1/traffic-log-uploads/{upload_id}` using the same device token.
+No frontend changes or new identity claims are needed.
+Stop host processes with Ctrl+C; `make dev-down` stops the development
+containers and retains MongoDB/MinIO volumes.
+Do not delete MinIO credential files while retaining its volume.
+
+### Production GCP and Helm
+
+In `infra/gcp`, configure `notification_channels` and follow that directory's
+reviewed plan/apply procedure. Terraform always creates a private encrypted
+GCS bucket, OBJECT_FINALIZE notification, Pub/Sub
+objects/silver/parse-DLQ/load-DLQ topics and subscriptions, scoped service identities,
+DLQ alerts and four workload identities (backend/frontend/spool-parse/spool-load).
+`deploy_services` still gates Cloud Run services, including the two private
+always-on workers. The existing Cloud KMS/
+Secret Manager adapter is reused by the parser. No AWS resources are used.
+The loader receives Mongo, silver-subscriber, load-DLQ publisher and raw-delete
+access, not EC/KMS access.
+`terraform output spool_environment` provides the nonsecret connection settings.
+Use workload identity/ADC; do not store service-account JSON keys in the repository.
+
+For GKE, both workers always deploy. Set `bucket`, `eventTopic`, `subscription`,
+`silverTopic`, `silverSubscription`, `parseDlqTopic`, `loadDlqTopic` and
+`leaseSeconds` under Helm `spool`, plus workload-identity annotations under
+`spool.apiServiceAccountAnnotations` / `spool.loaderServiceAccountAnnotations`.
+Provision GCS/Pub/Sub/IAM independently and bind the annotated Kubernetes service
+accounts to their Google identities. Parser and API share the existing API
+ServiceAccount/OpenBao role; the loader gets its own account and no OpenBao token.
+Helm deploys workers, not cloud resources. Production must leave
+`SPOOL_ENDPOINT_URL` and `PUBSUB_EMULATOR_HOST` unset.
+
+Provision separate object and silver subscriptions with 14-day retention (or an
+explicit reviewed policy), no subscription expiration, and retry backoff 10-600s.
+Object redrive targets the parse DLQ; silver redrive targets the load DLQ, both
+with five native delivery attempts. Give the Pub/Sub service agent subscriber
+permission on each source subscription and publisher permission on its DLQ topic.
+Give the parser object-subscriber and silver/parse-DLQ publisher roles; give the
+loader silver-subscriber and load-DLQ publisher roles. Retain inspection
+subscriptions on both DLQs. Configure Cloud Monitoring alerts for DLQ depth > 0,
+silver undelivered messages > 500 and oldest unacknowledged age > 3600 seconds,
+with the age warning strictly below retention. The GCP Terraform deployment
+provisions these resources/policies; Helm needs them provisioned externally.
+
+### Retry, backpressure and recovery
+
+`SPOOL_PROCESSING_SECONDS=60` bounds a worker operation;
+`SPOOL_LEASE_SECONDS=180` protects its atomic stage claim. The notification
+ack deadline is lease + 30 seconds (Pub/Sub maximum 600). Size shutdown grace
+for in-flight operations and keep the lease longer than processing/network margins.
+Both hops use explicit Pub/Sub ACK and deadline-expiry redelivery; receipt leases prevent competing ordinary
+Mongo writes. Ambiguous Mongo inserts remain at-least-once, not exactly-once.
+
+Rate is `SPOOL_MONGO_DOCUMENTS_PER_SECOND=500` **per loader process**, at most one
+initial 500-document batch. Configure replica count and per-replica rate together.
+The loader waits before pulling so throttling does not hold a delivery past its
+deadline. Pub/Sub manages backlog outside worker memory; each worker
+pulls one message at a time. Subscription retention defaults to 14 days
+(`spool_message_retention_seconds` in Terraform). If messages expire or the local
+emulator restarts, replay nonterminal receipt IDs after restoring capacity.
+Monitor cloud backlog depth/age and quotas; the emulator is not a production
+durability/monitoring substitute. Never bucket-list as a normal
+processing trigger. Querying operational receipts to identify recovery work is
+an administrative task, not the ingestion trigger.
+
+On parse/load DLQ depth > 0 or a persistent lag alarm:
+
+Application DLQs contain pointers/error codes; native Pub/Sub redrive wraps the
+original message, which on the load stage includes normalized policy-protected
+documents. Access must be restricted, and inspection must not print payloads.
+Native redrive or message expiration can leave a receipt nonterminal; inspect
+its current state before deciding whether to replay or perform cleanup only.
+
+1. Inspect only receipt IDs and sanitized error codes; do not dump raw bodies,
+   headers, token values or KMS errors into logs or tickets.
+2. Fix parser/key availability, field-encryption/KMS, Pub/Sub quota/IAM or Mongo.
+   Retain upload EC keys for the complete raw backlog, including failed uploads.
+3. Run `python -m app.spool_worker replay <upload_id>` with the environment and
+   operator credentials for that deployment. This checks raw availability,
+   resets retry state and publishes an object notification; it refuses active
+   leases and already stored/deleted uploads. Operator IAM needs raw read,
+   receipt updates and event-topic publisher access.
+4. Verify `stored` and `raw_deleted=true`, then acknowledge the corresponding
+   inspected DLQ message. Do not bulk-drain a DLQ before successful replay.
+
+For `stored` with `raw_deleted=false`, run
+`python -m app.spool_worker cleanup <upload_id>` with raw-delete permission.
+This also handles a lost Pub/Sub cleanup message and a prior delete whose reply was
+lost. It never repeats Mongo loading.
+
+Normal successful uploads are deleted immediately after Mongo persistence.
+Pending/failed raw uploads and idempotency receipts are deliberately retained
+without TTL. Before production, define an incident/privacy escalation deadline
+and an explicit approval process for abandoning failed raw uploads; automatic
+age expiration is not implemented. Subscriptions retain messages for 14 days by
+default in GCP, but expiration of a notification does not delete its raw upload.
+Do not enable GCS versioning/soft deletion or blanket object expiry on this bucket.
+Mongo hot retention remains the existing workspace policy; there is no cold tier.
+
+## Pipeline status
+
+Use **Status** in the frontend sidebar, or authenticated `GET /api/v1/status`
+with `manage:devices`. The same implementation serves local development, Helm
+and GCP, without contacting Docker, Kubernetes or Cloud Run control planes.
+The page refreshes manually and is never cached.
+
+Checks run concurrently with three-second per-probe limits: bucket metadata,
+both Pub/Sub subscription metadata, operational Mongo receipts/heartbeats and
+the configured analysis read target. They do not upload synthetic data, pull/ACK
+messages, decrypt logs or fall back to primary analysis reads. A failed check
+reports unavailable, including when metadata permissions are missing.
+
+Workers publish per-instance health to the majority-backed `pipeline_workers`
+collection every ten seconds, including while long-polling or rate-limited.
+Reports include consumer-loop dependency errors; reporting failures are logged
+without blocking ingestion. Graceful shutdown reports unavailable. A crashed
+worker becomes stale after `max(60, SPOOL_PROCESSING_SECONDS + 60)` seconds
+(120 seconds by default). Expired instance documents are removed after 24 hours;
+a worker with no retained report is unknown, not healthy. Restart existing
+parser/loader processes after installing this feature.
+
+Outstanding receipt counts and oldest state-update times identify object/silver
+waits or raw cleanup older than one processing lease. Unresolved `parse_failed`
+and `load_failed` receipts degrade the corresponding worker until replayed.
+Counts are **not** native Pub/Sub backlog or DLQ depth; retain Cloud Monitoring
+alerts. Metadata reachability/heartbeats do not guarantee successful writes,
+KMS availability during future work, event delivery, or end-to-end correctness.
+The local notification bridge is covered indirectly by stalled object receipts,
+not by a separate privileged control-plane probe.
+
+GCP Terraform grants the backend `storage.buckets.get` on its raw bucket and
+`roles/pubsub.viewer` on the two source subscriptions, in addition to existing
+object permissions. It does not give the API permission to consume messages.
+For Helm/external IAM, grant equivalent scoped metadata permissions to the API
+identity. Apply those IAM changes and deploy updated workers before expecting
+all nodes to be healthy. No Auth0 scopes beyond existing `manage:devices` are needed.
+
+## Measuring ingestion latency
+
+Use a dedicated test device, synthetic current-timestamp gzip/JWE records,
+known worker capacity and a drained backlog. The benchmark measures only uploads.
+Provide a short-lived test-device token via `INGEST_BENCH_TOKEN`, not a CLI argument.
+
+```bash
+.venv/bin/python -m integration_tests.benchmark_ingestion \
+  --base-url http://localhost:8080 --wire-file /path/to/synthetic-batch.gz \
+  --requests 100 --concurrency 4
+# For an existing compact JWE file, also pass --jwe.
+```
+
+The tool reports p50/p95/p99 HTTP acknowledgement and acknowledged batches/second.
+Its default base URL is `http://localhost:8080`, exercising the public NGINX path.
+It also polls terminal status and reports
+`stored_observed` latency, including polling/scheduling delay. This is **not**
+an exact write timestamp. Compare
+`pipeline.e2e.latency_ms` logs to measure actual Mongo completion, and
+check replica visibility separately. Test 1/100/500 records, gzip versus JWE,
+large retained bodies, several concurrency levels, warmed/cold runs and recovery
+from Mongo stalls. Acknowledgement confirms only raw durability.
+No production speedup is asserted.
+
+Focused service validation after `make spool-dev-up`:
+
+```bash
+MINIO_TEST_ENDPOINT=http://localhost:29000 \
+MONGO_TEST_URI='mongodb://localhost:28017/?replicaSet=rs0' \
+PUBSUB_EMULATOR_HOST=localhost:28681 \
+  .venv/bin/python -m pytest -q tests/test_uploads.py
+```
+
+Use the MinIO/PubSub configuration above in `.env`. Tests create/drop only unique
+test Mongo databases/Pub/Sub resources and delete their raw uploads. They do not
+authenticate with live Auth0 or validate live GCS IAM/event latency.
 
 ## Local setup
 ```bash
@@ -30,9 +261,10 @@ the host virtual environment through `python -m app` with Uvicorn reload.
 Python code changes do not require a Docker build, Helm, or Kubernetes.
 
 Compose also starts OpenBao and bootstraps its Transit KEK, wrapped EC key set,
-and a least-privilege runtime credential. It also starts persistent Redis 7.4 on
-loopback port 28379. `make dev` waits for all three dependencies and starts the
-NGINX proxy, then starts Python. Backend and Compose share `.env`, preserving
+and a least-privilege runtime credential. It also starts MinIO, the Pub/Sub
+emulator and the private notification bridge, provisions bucket/event resources,
+and starts NGINX. `make dev` then runs the API plus parser and loader host processes.
+Backend and Compose share `.env`, preserving
 Auth0 settings. The backend listens on `127.0.0.1:9090`; the separately started
 frontend listens on `127.0.0.1:3000`. Open the public development origin
 `http://127.0.0.1:8080`: NGINX routes API/docs/health paths to the backend and
@@ -41,17 +273,20 @@ Configure frontend `APP_BASE_URL` and `BACKEND_API_URL` for that same origin in
 `frontend/.env.local`; keep frontend Auth0 Web application credentials there.
 
 Compose publishes proxy port 8080 by default and uses the Docker Desktop host
-gateway. No override is needed on Docker Desktop. On native Linux, use the
-host-network override to reach loopback-bound host applications:
+gateway. No selector is needed on Docker Desktop. On native Linux, select the
+host-network proxy to reach loopback-bound host applications:
 
 ```bash
-make dev DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml
-# Use the same override for subsequent Compose targets, including shutdown:
-make dev-down DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml
+make dev PROXY_SERVICE=proxy-host
+# Shutdown covers both proxy variants and all other profiles:
+make dev-down
 ```
 
-The override publishes `127.0.0.1:8080` and reaches the host applications through
-`host.docker.internal`; keep the host backend/frontend bound to loopback.
+The host-network service binds `127.0.0.1:8080` and reaches applications through
+`127.0.0.1`; keep the host backend/frontend bound to loopback.
+The default bridge service uses `host.docker.internal` instead.
+`make proxy-up PROXY_SERVICE=proxy-host` switches just the proxy, stopping the
+other variant first.
 
 To run the components independently:
 
@@ -59,7 +294,9 @@ To run the components independently:
 make dev-up
 make run
 # In a separate terminal:
-make worker
+make spool-parser
+# In another terminal:
+make spool-loader
 # In another terminal, after frontend setup:
 make frontend-dev
 ```
@@ -78,19 +315,28 @@ from its only member. This setting is allowed only with `APP_ENV=development`;
 enabling it in another environment fails startup. Deployments continue to read
 strictly from secondaries, without primary fallback.
 
-Run `make worker` in a separate terminal even when using `make dev`. Both Python
-processes load `.env`; the worker does not use Auth0/OpenBao. Restart it explicitly
-after code/config changes. Stop API and worker with Ctrl+C. `make dev-down` stops
-the proxy and all three dependencies and retains MongoDB/Redis volumes.
-Individual targets are `mongo-up/down`, `openbao-up/down`, `redis-up/down`, and
-`proxy-up/down`. Use the same
+All host processes load `.env`; parser needs OpenBao/EC access, loader does not.
+API auto-reload does not reload workers; restart workers after code/config changes.
+Stop host processes with Ctrl+C. `make dev-down` stops all development containers
+and retains MongoDB/MinIO volumes.
+Individual targets include `mongo-up/down`, `openbao-up/down`, and
+`proxy-up/down`. All use the single `docker/docker-compose.yml`.
+Profiles are `dev` (dependencies with the bridge proxy), `spool`
+(MinIO/emulator/bridge), `proxy`, `proxy-host`, and `tools`
+(spool dependencies plus the initializer). Do not enable both proxy variants.
+`make compose-config` validates all profiles, `make compose-ps` lists containers,
+and `make compose-logs` follows logs. `dev-down` covers all profiles without
+deleting volumes. Direct Compose commands must include `--project-directory .`
+from the repository root so bind mounts/build contexts resolve correctly.
+Use the same
 `COMPOSE_PROJECT` value for start/stop if overriding `amazing-http-logger-dev`.
 These non-TLS services are for local development only.
 
 OpenBao runs in **ephemeral dev mode**, not persistent production storage.
 Restarting/recreating it loses the KEK and EC key set; buffered encrypted uploads
 using the previous keys become undecryptable. Run `make openbao-up` to bootstrap
-again, then restart Python. Already stored MongoDB logs remain readable.
+again, then restart API and parser. Stored encrypted MongoDB fields dependent
+on the lost storage key are also unreadable; only unrelated/plaintext data survives.
 The runtime token lasts 24 hours; rerun `make openbao-up` before starting Python
 after expiry. Do not print tokens, commit `.secrets`, or use the root token as
 the application's runtime credential.
@@ -114,7 +360,8 @@ make dev MONGO_PORT=29017 APP_PORT=8101
 | --- | --- | --- |
 | Docker MongoDB, host and container | 28017 | `.env` `MONGO_PORT` |
 | Docker OpenBao, host and container | 28200 | `.env` `OPENBAO_PORT` |
-| Docker Redis, host (container 6379) | 28379 | `.env` `REDIS_PORT` |
+| MinIO API / console, loopback | 29000 / 29001 | local spool configuration |
+| Pub/Sub emulator, loopback | 28681 | `PUBSUB_EMULATOR_HOST` |
 | Public development NGINX proxy | 8080 | `.env` `PROXY_BIND_HOST` / `PROXY_PORT` |
 | Host Python backend | 9090 | `.env` `APP_HOST` / `APP_PORT` |
 | Host Next.js frontend | 3000 | Make `FRONTEND_PORT`; match Compose `.env` `FRONTEND_PORT` |
@@ -122,7 +369,6 @@ make dev MONGO_PORT=29017 APP_PORT=8101
 | Kubernetes frontend pod and Service | 3000 | Helm `frontend.port` / `frontend.service.port` |
 | Kubernetes MongoDB pods | 27017 | Helm `mongodb.port` |
 | Kubernetes OpenBao pod | 8200 | Helm `openbao.port` |
-| Kubernetes Redis pod (development) | 6379 | Helm `redis.port` |
 | Kubernetes API port-forward | 9090 | Make `KUBE_LOCAL_PORT` |
 
 Kubernetes uses ClusterIP Services, not host ports. Its API port-forward defaults
@@ -138,9 +384,8 @@ minikube start
 make image
 make frontend-image
 docker pull mongo:7
-docker pull redis:7.4
 docker pull ghcr.io/openbao/openbao:2.7.1
-minikube image load amazing-http-logger:dev amazing-http-logger-dashboard:dev mongo:7 redis:7.4 ghcr.io/openbao/openbao:2.7.1
+minikube image load amazing-http-logger:dev amazing-http-logger-dashboard:dev mongo:7 ghcr.io/openbao/openbao:2.7.1
 make helm-lint
 # Provision logger-frontend-auth0 first, as described below.
 make helm-up KUBE_CONTEXT=minikube
@@ -153,7 +398,13 @@ Check `kubectl config current-context` before deployment. Make targets accept
 `KUBE_CONTEXT`, `KUBE_NAMESPACE`, `HELM_RELEASE`, `HELM_VALUES`, `HELM_ARGS`,
 `IMAGE_REPOSITORY`, `IMAGE_TAG`, `KUBE_SERVICE`, and `KUBE_LOCAL_PORT`. Their defaults select the `logger`
 release/namespace and the **development** Helm profile; the chart's own default
-values select **external** MongoDB, authenticated TLS Redis and HTTPS OpenBao.
+values select **external** MongoDB and HTTPS OpenBao. Configure the required
+`spool` bucket, topics/subscriptions and workload identities before deployment;
+Helm does not provision GCS or Pub/Sub.
+`values-development.yaml` contains illustrative GCS/Pub/Sub names for linting,
+not bundled cloud emulators. Override those names and configure workload identity
+for real GCS/Pub/Sub. Docker provides MinIO/emulator services for host-based tests;
+this Helm profile is not a self-contained cloud ingestion stack.
 
 The development profile has placeholder Auth0 settings. Set a real tenant and
 audience with `HELM_ARGS='--set auth0.domain=your-tenant.auth0.com --set auth0.audience=https://your-api'`.
@@ -171,7 +422,7 @@ token mount, a read-only root filesystem and a writable bounded `emptyDir` cache
 Its public `/` landing page is the startup/readiness/liveness probe; no dedicated
 frontend health endpoint exists. It receives only public Auth0 domain/audience,
 frontend connection settings and its own Auth0 Secret, never backend MongoDB,
-Redis or OpenBao credentials.
+or OpenBao credentials.
 
 MongoDB starts as a three-member StatefulSet with one PVC per member, a headless
 Service, and stable in-cluster DNS names. An idempotent Job initializes `rs0` or
@@ -186,16 +437,14 @@ release's API, worker, MongoDB, and initializer pods; enforcement requires a CNI
 supports NetworkPolicy. The bundled database has no authentication or TLS and is
 for development only. Do not use it for production data.
 
-Redis runs as a single-node non-root StatefulSet with a persistent PVC, AOF
-(`appendonly yes`, `appendfsync always`), `maxmemory 192mb`, a 256 MiB memory cap,
-and `noeviction`. It is unauthenticated, cluster-internal, and development-only.
-Its ingress NetworkPolicy permits only this release's API/worker pods.
-The worker Deployment uses the same application image and
-`python -m app.worker`; it receives MongoDB/Redis configuration only, without
-Auth0 settings, OpenBao tokens, projected JWTs, or KMS CA mounts.
+Parser and loader always deploy with the application image and
+`python -m app.spool_worker parse/load`. Parser uses scoped raw-read, object-event
+subscribe, silver/parse-DLQ publish and KMS access. Loader gets Mongo, raw-delete,
+silver subscribe and load-DLQ publish permissions, without EC/KMS access.
 
 OpenBao runs as a non-root development Deployment with a ClusterIP Service and an
-ingress NetworkPolicy permitting only API/bootstrap pods. A generated development
+ingress NetworkPolicy permitting only API, spool-parse and bootstrap pods, not
+the loader. A generated development
 root Secret is shared only with that server and a revision-named bootstrap Job.
 The Job provisions Transit, KV v2, keys, policy, and Kubernetes authentication.
 OpenBao's ServiceAccount gets `system:auth-delegator` for TokenReview. API pods use
@@ -209,26 +458,15 @@ log fields encrypted under the lost storage key. Do not restart development
 OpenBao if encrypted test logs must remain readable. The chart
 does not implement persistent production OpenBao or automatic unsealing.
 
-## External MongoDB, Redis and OpenBao / production
+## External MongoDB and OpenBao / production
 
 Provision an authenticated, TLS-enabled MongoDB replica set independently. Configure
 the real URI in the git-ignored `.env`, or use your cluster's secret-management
 operator to provision the Secret. Never pass the URI in `--set` or a values file:
 Helm persists release values in the cluster.
 
-Provision authenticated TLS Redis **7.2+** independently with persistent AOF,
-`appendonly yes`, preferably `appendfsync always`, a finite `maxmemory` with `noeviction`,
-durable disk capacity, backups and tested recovery. Startup validates
-`INFO persistence` returns `aof_enabled=1`, `INFO memory` returns
-`maxmemory_policy=noeviction`, and `WAITAOF` is supported. External Redis ACLs must
-permit `INFO`, stream/group commands, `EVAL`, `WAITAOF`, and transactional ACK/delete
-(`MULTI`/`EXEC`), with access to the configured stream/group keys. Cache-only or
-non-AOF services are unsuitable.
-The confirmation is a local fsync, not a replication/failover-loss guarantee;
-external HA requires suitable persistence and failover policy.
-Provision a namespace-local existing Secret
-`logger-redis` containing `REDIS_URL=rediss://...` through your secret-management
-operator. Never place its URL/credentials in values or `--set`.
+Provision GCS, object-event and silver Pub/Sub subscriptions, both DLQs and
+scoped workload identities as described under [Upload ingestion](#upload-ingestion).
 
 Provision persistent, initialized/unsealed, TLS-enabled OpenBao and its audit,
 backup, and recovery processes separately. Initialize its wrapped key set and
@@ -254,7 +492,6 @@ docker push registry.example.com/team/amazing-http-logger-frontend:0.1.0
 helm upgrade --install logger helm/amazing-http-logger \
   --kube-context YOUR_CONTEXT --namespace logger \
   --set externalMongo.existingSecret=logger-mongodb \
-  --set externalRedis.existingSecret=logger-redis \
   --set openbao.address=https://bao.example.com \
   --set auth0.domain=your-tenant.auth0.com \
   --set auth0.audience=https://your-api \
@@ -269,8 +506,8 @@ helm upgrade --install logger helm/amazing-http-logger \
 
 The Secret must be in the release namespace and contain `MONGO_URI` (or the key
 selected by `externalMongo.uriKey`). Kubernetes environment variables do not reload
-when a Secret changes; restart both API and worker Deployments after MongoDB/Redis
-credential rotation. `externalRedis.urlKey` defaults to `REDIS_URL`. The MongoDB URI must specify
+when a Secret changes; restart API and both worker Deployments after MongoDB
+credential rotation. The MongoDB URI must specify
 `replicaSet=<name>`, plus authentication/TLS options, and every advertised member
 hostname must be resolvable and reachable from the pods. `directConnection=true`
 is rejected.
@@ -361,15 +598,18 @@ checksum and rolls the Deployment. Reapplying an unchanged development chart che
 existing replica membership without reinitializing or deleting data.
 OpenBao bootstrap also preserves an existing key set and the development root
 Secret on upgrade. EC key rotation/retirement changes cached runtime state only
-after an explicit API rollout; use the staged procedure in [ENCRYPTION.md](ENCRYPTION.md).
+after explicit API and parser rollouts; use the staged procedure in [ENCRYPTION.md](ENCRYPTION.md).
 
 Uninstall removes workloads, Services, Jobs, and the bundled dev root Secret, but
-**retains MongoDB and Redis PVCs**. Bundled OpenBao state is lost.
+**retains MongoDB PVCs**. Bundled OpenBao state is lost.
 Deleting the namespace or manually deleting those PVCs can destroy data. Use a stable
 release name and namespace for the development database.
 
 For externally managed dependencies, set their reachable addresses and runtime
-credential path in `.env` and use `make run` plus `make worker` instead of `make dev`. Kubernetes MongoDB DNS names remain
+credential path in `.env` and use `make run`, `make spool-parser` and `make spool-loader`
+instead of `make dev`. `make dev` deliberately supplies `SPOOL_DEV_ENV` local
+MinIO/emulator settings; the individual commands use the configured `.env`.
+Kubernetes MongoDB DNS names remain
 cluster-internal; forwarding a single member port does not preserve replica discovery.
 
 ## Device-only test database
@@ -479,9 +719,9 @@ kubectl --context=minikube -n logger exec deployment/logger-amazing-http-logger 
 
 This opt-in test uses only public HTTP endpoints: **no Auth0 dependency overrides,
 in-process app transport, direct database access, or private KMS credentials**.
-Run the backend with MongoDB, Redis, a worker and a provisioned OpenBao first
-(`make dev` plus `make worker` in another terminal locally, or deploy Helm).
-It exercises durable queued ingestion and
+Run the API, parser and loader with MongoDB, provisioned OpenBao and
+MinIO/emulator/bridge first (`make dev` locally), or deploy Helm with provisioned
+GCS/Pub/Sub/IAM. It exercises durable uploads and
 reads accepted records through analysis, waiting for replication/processing.
 Deployment analysis must have a readable secondary; the local single-node profile
 uses its existing explicit development-only primary-read setting.
@@ -518,8 +758,15 @@ chmod 600 .env.stack-test
 # Edit .env.stack-test locally: set the backend URL, Auth0 token URL/audience,
 # and the separate plaintext/encrypted client IDs and secrets.
 # Configure the devices' policies before running.
+# In another terminal, run make dev (API, both workers and dependencies).
 make test-stack
 ```
+
+`STACK_TEST_BASE_URL` defaults to **`http://localhost:8080`** and both local
+credential-profile files use that proxy origin, not the backend's internal port.
+Keep the API, parser and loader running throughout the test; `make dev-up` starts
+only dependencies and is not sufficient. Override the base URL explicitly only
+when intentionally testing another deployment.
 
 Configure `STACK_TEST_TOKEN_URL` as `https://YOUR_TENANT.auth0.com/oauth/token`;
 the audience must match the running backend's `AUTH0_AUDIENCE`. The example is
@@ -634,122 +881,53 @@ New records use `{_id, timestamp, metadata, ingestion, logdata, storage_encrypti
 upload peer and reception time are under `ingestion`; captured HTTP/network/process
 fields and body length/digest are under `logdata`. Do not move per-upload values
 into time-series metadata. See the [document example](../README.md#stored-document-layout).
-The HTTP upload/read contracts remain flat and unchanged; historical flat records
-are still readable and decryptable without migration or data deletion.
+HTTP upload events and analysis responses are flat; the storage layout is internal.
 
 Startup creates `ingestion_received_at` on `ingestion.received_at` and
 `ingestion_batch_record` on `(ingestion.batch_id, _id)`. Existing
 `device_timestamp`, `timestamp_id` and both retention indexes keep their paths.
-List projections exclude both `logdata.body` and historical root `body`, as well
-as ciphertext. Existing legacy `received_at`/`batch_record` indexes are not
-automatically dropped. Keep `batch_record` while old version-1 messages can still
-be retried; remove legacy indexes only after checking their usage and draining
-those batches, on the explicitly selected application database.
-
-Deploy the new workers **before** new collectors: workers accept old version-1
-flat BSON envelopes and new version-2 nested envelopes. Older workers cannot consume
-version 2 and leave such messages pending; do not downgrade workers until those
-batches have drained. Neither deployment nor startup migrates stored records,
-purges the stream or resets the database. Direct MongoDB consumers must support
-both layouts while historical records remain.
+List projections exclude bodies and ciphertext. Inspect index usage before
+changing indexes on the explicitly selected application database.
+Deployment/startup never resets the database.
 
 ## Operational semantics
 
-- Batch uploads require one gzip member and `application/json`. Limits are 500 records,
-  1 MiB compressed, and 8 MiB decompressed; size violations return `413`.
-- HTTP `200`, `status=queued` acknowledges Redis `XADD` plus same-connection
-  `WAITAOF 1 0 <timeout>` confirmation of local AOF fsync, **not** MongoDB processing.
-  There is no direct-write fallback or guarantee of instantaneous response:
-  policy/config reads and OpenBao field protection still complete before queuing,
-  but MongoDB, OpenBao and Redis network I/O is async. Resource providers are async;
-  collector CPU preparation uses `asyncio.to_thread` rather than FastAPI's shared
-  AnyIO thread limiter. MongoDB log writes run only in the separate worker.
-- Queue unavailability, capacity/memory exhaustion, or missing fsync confirmation
-  returns `503`. A timeout can leave an enqueued batch despite the error.
-  Delivery is at-least-once. Worker retry deduplication by stable `(batch_id, _id)` is best-effort:
-  time-series has no unique IDs, and partial/ambiguous writes may duplicate records.
-  Client resubmissions get new IDs; use bounded retry policies.
+- Uploads accept one gzip member with `application/json`, or compact JWE with
+  `application/jose`. Content limits are 500 records, 1 MiB gzip and 8 MiB expanded;
+  JWE wire is limited to 1,500,000 bytes. Wire limits fail synchronously; malformed
+  content/expanded limits fail asynchronously in the parser.
+- HTTP `202` acknowledges durable raw receipt only. Optional `X-Batch-Id` retries
+  return `200` for matching bytes/format and `409` for conflicting reuse.
+  Poll receipt state for `stored` and `raw_deleted`. There is no synchronous
+  traffic-log write fallback.
+- Mongo policy/receipt and raw-storage dependencies can affect acceptance latency.
+  Workers isolate content/KMS work from Mongo loading. Deterministic IDs and
+  lease checks are best-effort duplicate protection, not exactly-once time-series
+  persistence; partial/ambiguous writes can duplicate measurements.
 - Replica reads are eventually consistent. New records may briefly be missing; `404`
   does not prove that a just-accepted record was never written.
 - No secondary means analysis returns `503`, even while ingestion remains healthy.
   The explicit local-development primary-read profile does not require a secondary.
-- `/health` reports process liveness only; monitor Redis/AOF/worker and primary/secondary availability
+- `/health` reports process liveness only; monitor Pub/Sub backlog/DLQs, both workers, raw cleanup and primary/secondary availability
   and ingestion/read error rates separately, along with OpenBao seal/auth/error metrics.
 - Fresh startup requires OpenBao. EC keys stay cached in RAM for the process lifetime;
   a running backend may continue decrypting during a KMS outage. Revoking a KMS token
   does not remove cached keys. Restart all processes after EC rotation/retirement.
 
-## Redis queue and worker operations
+## Worker operations
 
-| Environment setting | Default | Helm value |
-| --- | --- | --- |
-| `REDIS_URL` | `redis://localhost:28379/0` (development) | `externalRedis.existingSecret` / `urlKey` (`REDIS_URL`) |
-| `REDIS_STREAM` | `traffic-log-batches` | `queue.stream` |
-| `REDIS_GROUP` | `mongo-writers` | `queue.group` |
-| `REDIS_MAX_BATCHES` | `10000` | `queue.maxBatches` |
-| `REDIS_SOCKET_TIMEOUT_SECONDS` | `3` | `queue.socketTimeoutSeconds` |
-| `REDIS_AOF_TIMEOUT_MS` | `2000` | `queue.aofTimeoutMs` |
-| `WORKER_RECLAIM_IDLE_MS` | `60000` | `worker.reclaimIdleMs` |
-| `WORKER_WRITE_TIMEOUT_SECONDS` | `30` | `worker.writeTimeoutSeconds` |
-| `WORKER_RETRY_SECONDS` | `1` | `worker.retrySeconds` |
-
-The socket timeout must leave room for AOF confirmation. Keep reclaim idle time
-above the maximum write duration plus network/ACK margin, or another worker can
-reclaim a still-active batch. Keep `worker.terminationGracePeriodSeconds` (default
-60) above `worker.writeTimeoutSeconds` (default 30) plus the Redis acknowledgement
-deadline (3-second socket timeout by default) and cleanup margin. SIGTERM stops new work
-and permits an in-flight write to finish; a forced kill leaves pending work for
-reclaim. Each worker reads **one producer batch of 1–500 events** at a time.
-Scale via `worker.replicaCount`; all replicas must share the stream/group.
-Increasing replicas does not guarantee ordering or exactly-once delivery.
-
-Bundled Redis AOF uses `always` to fsync each write without waiting for an
-every-second flush. The collector retains `WAITAOF` to confirm **local** fsync
-before acknowledging each batch. External AOF `everysec` can work with the
-2000 ms AOF timeout and 3-second socket timeout, but normally adds up to a second
-to collector latency; a 1000 ms AOF timeout can race the flush schedule.
-Disk/fsync delays can still cause timeouts with either policy.
-Preserve its data volume/PVC across restarts, monitor
-disk space/AOF rewrite headroom and fsync latency, and test AOF recovery/backups.
-Redis maxmemory must stay below its container limit with headroom for AOF buffers,
-rewrites and fragmentation; the development 192 MiB/256 MiB defaults are not
-production sizing. Capacity limits include unprocessed/pending entries.
-No `MAXLEN`/`XTRIM` or eviction may remove pending work. When the batch or memory
-bound is reached, uploads fail explicitly with `503` until capacity recovers.
-
-Monitor stream length, consumer-group lag and pending counts/oldest idle time,
-worker progress/retry logs, API `503` rates, Redis memory, AOF write status,
-fsync latency and disk saturation. For the unauthenticated local stack:
-
-```bash
-docker compose --project-directory . --env-file .env -f docker/docker-compose.yml exec redis redis-cli XLEN traffic-log-batches
-docker compose --project-directory . --env-file .env -f docker/docker-compose.yml exec redis redis-cli XINFO GROUPS traffic-log-batches
-docker compose --project-directory . --env-file .env -f docker/docker-compose.yml exec redis redis-cli XPENDING traffic-log-batches mongo-writers
-docker compose --project-directory . --env-file .env -f docker/docker-compose.yml exec redis redis-cli INFO persistence
-```
-
-These commands inspect metadata, not batch contents. Avoid printing Redis URLs,
-payloads, tokens or decrypted fields. Use secret-safe authenticated tooling in production.
-
-Workers ACK/delete **only after majority MongoDB bulk insertion**. If MongoDB is
-unavailable, fix connectivity/credentials, restore workers and let pending entries
-be retried/reclaimed; do not delete the queue or switch to direct API writes.
-Poison/version-invalid messages are logged and remain pending for operator
-investigation, without automatic discard/dead-lettering. Retain the original
-durable entry, diagnose without exposing payload data, deploy a compatible fix
-and retry. Any exceptional manual deletion requires explicit authorization and
-an audit/recovery plan; it forfeits delivery.
-
-After a worker crash or ambiguous MongoDB response, stable `(batch_id, _id)` pairs permit best-effort
-duplicate avoidance, but time-series unique indexes cannot enforce it. A record
-may be inserted twice even if the worker later ACKs successfully. After Redis
-failure, restore its original persistent AOF and consumer-group state; do not
-recreate an empty queue and assume acknowledged batches were processed. Analysis
-may lag both the queue and MongoDB replication; `queued` is not a read-after-write
-guarantee.
+Use the [retry, backpressure and recovery](#retry-backpressure-and-recovery)
+procedure for both Pub/Sub stages. Scale parser and loader independently;
+multiply the per-loader document rate by replica count when budgeting Mongo load.
+Keep `SPOOL_LEASE_SECONDS` / Helm `spool.leaseSeconds` above processing time plus
+network margins, and allow shutdown grace for in-flight operations.
+After a forced stop, delivery deadlines and receipt leases recover work.
+Never delete raw just because silver was published or drain a DLQ before recovery.
+`queued` is not a Mongo read-after-write guarantee; even `stored` can precede
+secondary visibility.
 
 ## Troubleshooting
-- For local MongoDB, inspect `docker compose -f docker/docker-compose.yml ps` and
+- For local MongoDB, inspect `make compose-ps` and
   its logs; its healthcheck initializes the replica set. Verify `MONGO_PORT` is
   free before starting it.
 - If the local API port is occupied, change `APP_PORT`; do not stop an

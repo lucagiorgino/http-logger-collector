@@ -49,7 +49,7 @@ else (including `/auth/*`) to **3000**, preserving paths. Set backend-stack
 behind the trusted HTTPS tunnel. Use the public origin as `APP_BASE_URL` and in
 Auth0's callback/logout configuration. The Compose proxy publishes port 8080
 and uses the Docker Desktop host gateway by default. On native Linux, run
-`make proxy-up DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml`
+`make proxy-up PROXY_SERVICE=proxy-host`
 to reach loopback-bound applications through host networking.
 
 If the UI reports **HTTP 502** while the local backend works, check
@@ -61,6 +61,23 @@ problem, not an OAuth rejection. Check its reported target against the API's
 actual listener, including HTTP versus HTTPS, host, port and IPv4/IPv6 resolution.
 Fix the proxy's upstream or use the reachable internal API address, then restart
 the frontend after changing environment settings.
+
+## Pipeline status
+
+Open **Status** in the sidebar (`/status`) to see the eight-stage ingestion
+diagram and per-node healthy/degraded/unavailable/unknown state. The page is
+server-rendered, works without browser JavaScript and refreshes on request.
+It requires `manage:devices`, calls `/api/v1/status` with the server-side token,
+and uses the same implementation for local MinIO/emulator and GCP GCS/Pub/Sub.
+Missing worker reports do not produce green nodes. Receipt counts are not native
+queue/DLQ depth. See the [runbook](../docs/RUNBOOK.md#pipeline-status).
+
+On GCP, Terraform supplies distinct Cloud Run HTTPS origins: `APP_BASE_URL` is
+the frontend `public_url`, while `BACKEND_API_URL` is `backend_url`, without an
+API path suffix. Register `<public_url>/auth/callback`, logout and web-origin URLs
+in Auth0; do not change the existing API audience to either generated URL.
+No browser-to-backend CORS or load balancer is needed for server-side API calls.
+See the [GCP deployment guide](../infra/gcp/README.md).
 
 ## Auth0 configuration
 
@@ -232,7 +249,8 @@ is required for both operations. **Storage and encryption** provides a choice
 for each of request bodies, authorization headers and cookies:
 **Do not retain**, **Retain encrypted** (default), or **Retain plaintext**.
 Retained encrypted fields use a dedicated OpenBao AES-256-GCM key, separate
-from agent upload JWE. Discarded fields never reach storage or Transit; discarded
+from agent upload JWE. Parser workers discard selected fields before silver/Mongo
+storage or Transit; discarded
 bodies keep their byte length/SHA-256 digest, and discarded header entries are removed.
 Plaintext retention is an explicit encryption opt-out. The form warns about
 discarded data and plaintext storage, and uses
@@ -243,6 +261,13 @@ reads omit bodies; authorization/cookie values stay redacted even in details.
 MongoDB's nested `ingestion`/`logdata` storage layout is internal to the backend:
 the traffic-log API still returns the same flat fields consumed by these pages.
 Both historical flat records and new nested records are supported without a UI migration.
+
+The backend `/api/v1/traffic-log-uploads` endpoint temporarily stores original
+bytes in GCS/MinIO **before** applying discard rules. Object-event Pub/Sub triggers
+the parser/protect worker using the acceptance-time policy snapshot; silver Pub/Sub
+feeds a rate-limited Mongo loader. This raw-retention boundary
+and asynchronous status API are documented in the root README. There
+is no new raw-upload or DLQ management screen in this frontend.
 
 **Retention policies:** a separate Workspace section controls ordinary logs
 (enabled, 7 days by default) and suspicious logs (enabled, 30 days by default).

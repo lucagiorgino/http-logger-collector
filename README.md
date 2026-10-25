@@ -23,9 +23,185 @@ The application is responsible for:
 - OpenBao Transit and KV v2 for key management
 - Next.js SSR management console in `frontend/` (JavaScript/JSX, shadcn/ui)
 - pytest
-- Redis Streams for durable queued ingestion, with a separate MongoDB writer worker
-- Docker Compose for development MongoDB/OpenBao/Redis/NGINX; Kubernetes and Helm for deployment
+- GCS raw upload spool and two Pub/Sub stages; real MinIO and Pub/Sub emulator locally
+- Separate parser/protect and rate-limited Mongo loader workers
+- Docker Compose for development dependencies; Terraform/Cloud Run on GCP, optional Kubernetes/Helm
 - ruff or flake8
+
+## GCP deployment
+
+The [GCP deployment guide](infra/gcp/README.md) provisions separate generated
+Cloud Run HTTPS URLs for the frontend and API, plus internal parser/loader workers.
+No custom domain or load balancer is required. Keep the existing Auth0 tenant
+and API audience; register the frontend URL's `/auth/callback` in Auth0.
+MongoDB Atlas is provisioned separately. The guide covers Terraform state,
+foundation resources, secrets, image publication and smoke tests.
+
+## Core ingestion flow
+
+All ingestion uses durable raw uploads, object events and two independent workers.
+Identity, device policies, workspace retention, analysis reads and the frontend
+use their existing APIs.
+
+```text
+POST /api/v1/traffic-log-uploads
+  -> authenticate / device policy / wire-size limit / policy snapshot
+  -> immutable raw object in GCS (MinIO in local development)
+  -> HTTP 202 {upload_id, status: "received", duplicate: false}
+              |
+       GCS OBJECT_FINALIZE -> Pub/Sub pull subscription
+       Local: MinIO ObjectCreated -> private webhook bridge -> Pub/Sub emulator
+              |
+  worker #1: JWE decrypt -> bounded gzip / JSON validation -> normalize
+             -> snapshot discard rules / existing field encryption
+              |                                \-> parse DLQ
+       separate Pub/Sub silver topic / pull subscription (protected documents)
+              |
+  worker #2: per-upload lease / replay checks -> rate-limited unordered Mongo writes
+              |                                \-> load DLQ
+       mark upload stored -> delete raw object -> Pub/Sub ACK
+```
+
+**The raw object is a temporary durable spool, not a historical datalake.** The
+collector does not decompress, decrypt, count records or call field-encryption
+Transit for this endpoint. It still reads the device/workspace policies, hashes
+the bounded wire bytes, reserves a small Mongo receipt and waits for a successful
+object write. This reduces request-path processing, not necessarily total work.
+GCS upload latency and receipt writes must be included in latency measurements.
+
+### Contract and policy boundaries
+
+The upload accepts gzip JSON (1 MiB compressed / 8 MiB expanded / 1-500 events), or compact
+JWE (1,500,000 wire bytes). Only format, wire size, authentication, trusted
+attribution and device transfer policy are checked before acknowledgement.
+Bad JWE, gzip, JSON or records fail **asynchronously**, without partially loading
+the batch. Therefore the POST receipt has **no `accepted_count`**.
+
+Poll `GET /api/v1/traffic-log-uploads/{upload_id}` for `status`, nullable
+`accepted_count`, sanitized `error_code`, and `raw_deleted`. States are
+`uploading -> received -> parsing -> queued -> loading -> stored`, with
+`parse_failed` / `load_failed` for dead-lettered uploads. A fast worker may
+advance the receipt before POST returns. `stored` confirms majority Mongo
+persistence; `raw_deleted=true` also confirms cleanup. Agents can inspect only
+their device's uploads; `manage:devices` permits fleet status reads. These are
+operational primary reads, not primary-backed analysis queries.
+
+**Raw-retention privacy boundary:** original upload bytes are
+temporarily stored, including fields configured to be discarded later. GCS uses
+encryption at rest, public-access prevention and scoped workload IAM. Gzip-only
+uploads are not application-encrypted. The local MinIO volume is development-only
+and does **not** promise production encryption at rest; use synthetic data.
+Worker #1 applies the workspace storage-policy **snapshot taken at acceptance**,
+so policy edits during a backlog do not change already accepted uploads.
+Authentication tokens are never saved with objects. Device identity/source IP
+come from the collector, never from uploaded log fields.
+
+### Medallion mapping and delivery guarantees
+
+| Stage | Tier | Responsibility |
+| --- | --- | --- |
+| Collector | Ingress | Authenticate, cheap validation, reserve receipt, persist raw bytes before acknowledging |
+| GCS / local MinIO | Temporary bronze | Immutable replay source until Mongo persistence |
+| Worker #1 (`app.spool_worker parse`) | Bronze to silver | Decrypt, decompress, validate, normalize, minimize and encrypt fields |
+| Separate Pub/Sub topic/subscription | Silver transport | Managed buffering, delivery leases, redelivery, explicit ACK and load DLQ |
+| Worker #2 (`app.spool_worker load`) | Silver to gold | Rate-limited Mongo loading and post-persistence cleanup |
+| MongoDB `traffic_logs` | Gold | Existing hot analysis store and workspace-controlled TTL |
+
+Workers are separately deployable/scalable: worker #1 contains CPU-heavy parsing
+and all ingestion cryptography/KMS access; worker #2 isolates Mongo I/O and needs
+no upload keys or field-encryption credential. No new enrichment/classification
+or query functionality is introduced.
+
+Optional `X-Batch-Id` (1-128 ASCII letters/digits/`._:-`) makes identical-byte
+retries idempotent per authenticated device. A duplicate returns HTTP **200**
+with `duplicate=true`; different bytes or format under the same ID return **409**.
+Without the header, each request is a new upload. Receipts are retained without
+TTL so completed keys do not silently become reusable.
+
+The raw object uses a conditional create (`if_generation_match=0`; MinIO
+`If-None-Match: *`) and a partitioned key:
+`raw/tenantId=<deployment-hash>/date=<YYYY-MM-DD>/agentId=<device-hash>/<upload_id>.upload`.
+`SPOOL_TENANT` is a deployment namespace, **not** a new authentication tenant.
+A versioned JSON header, newline and original wire bytes form one atomic object;
+the header contains the trusted context, policy, checksum and receipt ID.
+Operational state in `ingestion_uploads` enforces unique object keys, atomic
+per-stage claims, expiring leases, bounded attempts and terminal duplicate skips.
+Stable event identities are `<upload_id>:<index>` and derive deterministic Mongo
+record IDs. Partial/replayed writes reuse the existing majority-read missing-ID
+check and `insert_many(..., ordered=False)`.
+
+Delivery remains **at least once, not exactly once**: Mongo time-series cannot
+enforce unique measurement IDs or transact the receipt with measurement inserts.
+Leases prevent ordinary competing writes; a network-ambiguous in-flight insert
+can still duplicate records. The implementation does not claim otherwise.
+
+### Backpressure, cleanup and recovery
+
+The pipeline uses **Pub/Sub for both hops**, with separate object-event and
+silver subscriptions.
+Pub/Sub stores backlog outside worker memory; pull consumers fetch one message
+at a time, explicitly ACK completed work, and use delivery-deadline expiry to
+recover crashed consumers. Transient loader failures release the delivery for retry.
+The loader waits for rate capacity **before pulling**, avoiding expired leases
+while throttled. GCP subscriptions default to **14-day retention**, configurable
+with `spool_message_retention_seconds`; expiration requires replay from raw rather
+than silently deleting the upload. There is no in-memory MAXLEN trimming.
+
+Silver messages contain normalized, field-protected BSON with gzip **transport**
+compression; worker #2 never decrypts or reparses original uploads. Compression
+also accommodates encrypted-field expansion beneath Pub/Sub's 10 MB request
+limit. Encoding and bounded decoding enforce 9,500,000 wire bytes and 32 MiB
+expanded; exceptional oversized output is explicitly parse-dead-lettered with
+`silver_payload_too_large`, retaining the original raw object.
+
+Worker #2 permits `SPOOL_MONGO_DOCUMENTS_PER_SECOND` **per replica**, with an
+initial burst of at most one batch (500 documents). Multiply by loader replicas
+for deployment capacity. Both workers default to three application attempts,
+then publish a sanitized pointer to the corresponding Pub/Sub DLQ before ACK.
+Both GCP subscriptions also use native DLQ redrive after five delivery attempts,
+the platform minimum, and exponential retry backoff.
+DLQ publication failure leaves the work unacknowledged.
+Application dead letters contain sanitized pointers. Native Pub/Sub redrive
+forwards the original message, so the load DLQ can contain protected normalized
+documents (including fields intentionally retained as plaintext by policy).
+Restrict inspection access and never dump message bodies into logs or tickets.
+
+Raw deletion happens only **after** Mongo success and a majority `stored` receipt.
+Cleanup failures retry deletion without repeating Mongo writes. Objects recreated
+by an ambiguous late collector PUT also trigger cleanup-only work, without
+reloading Mongo. Pending/failed
+objects have **no automatic age TTL**: they remain until successful processing or
+an explicitly approved operator deletion. GCS versioning and soft deletion are
+disabled on this dedicated bucket so consumption does not retain hidden raw
+copies. Do not add lifecycle expiration, backups or replication that contradict
+this temporary-data policy without reviewing replay and privacy requirements.
+
+Recovery: fix the parser/KMS/Mongo issue, replay the specific receipt with
+`python -m app.spool_worker replay <upload_id>`, verify `stored` and
+`raw_deleted=true`, then acknowledge its inspected DLQ message. For a stored
+receipt whose cleanup entry was lost, use
+`python -m app.spool_worker cleanup <upload_id>`. Never replay an active lease or
+delete a raw object merely because worker #1 published it. See the
+[runbook](docs/RUNBOOK.md#upload-ingestion) for setup and operational details.
+
+Metrics are emitted as `metric=<name> value=<number>` log records:
+`ingest.batch.accepted`, `ingest.batch.duplicate`, `ingest.parse.success`,
+`ingest.parse.dlq`, `ingest.load.success`, `ingest.load.dlq`,
+`mongo.write.latency_ms`, `pipeline.e2e.latency_ms`.
+Pub/Sub's `subscription/num_undelivered_messages` and
+`subscription/oldest_unacked_message_age` supply managed backlog metrics.
+GCP Terraform provisions DLQ-depth and silver-backlog depth/age alerts using
+`notification_channels`; defaults warn above 500 messages or one hour of age.
+Helm operators must configure equivalent cloud alerts for their subscriptions.
+Do not treat local emulator metrics as production latency evidence.
+
+Expected end-to-end latency is driven by object-event delivery, Pub/Sub polling,
+parsing/KMS, Pub/Sub backlog and Mongo write capacity; **p50 2-10 seconds is a target,
+not a measured guarantee**. The object upload itself can make acknowledgement
+slower for small batches. Benchmark upload acknowledgement and observed persistence
+with the runbook tool. Monitor Pub/Sub quotas, backlog
+age, cost and Mongo drain capacity as volume grows. GCS remains the temporary
+replay source; this implementation intentionally adds **no cold historical tier**.
 
 ## Repository structure
 
@@ -74,6 +250,14 @@ Ordinary agent credentials do not need
 and read fleet data. Ordinary agents can access only their JWT-bound device.
 See the frontend guide for Auth0 setup, permissions and tests.
 
+The sidebar's **Status** page (`/status`) shows the collector, raw bucket,
+object-event Pub/Sub, parser/protection worker, silver Pub/Sub, Mongo loader,
+MongoDB and raw cleanup as a connected diagram. It uses the same authenticated
+`GET /api/v1/status` endpoint in local development and GCP; `manage:devices` is
+required. Refresh the snapshot to update it. Checks are read-only and missing
+worker heartbeats are never treated as healthy. See the
+[status runbook](docs/RUNBOOK.md#pipeline-status) for probe limits and GCP IAM.
+
 ### 1) Create a virtual environment
 
 ```bash
@@ -106,14 +290,16 @@ AUTH0_AUDIENCE=https://my-fastapi-api
 make dev
 ```
 
-This starts MongoDB as a single-node replica set, OpenBao, persistent Redis and NGINX,
-provisions the encryption keys, then runs the backend with the local
-virtual environment and Uvicorn auto-reload.
-Changes under `app/` restart Python automatically: **no backend image build is needed**.
+This starts MongoDB as a single-node replica set, OpenBao, NGINX, MinIO,
+the Pub/Sub emulator and a private object-event bridge, provisions encryption keys
+and event resources, then runs the API plus both parser/loader host processes.
+The API uses the local virtual environment and Uvicorn auto-reload.
+`make dev` supplies local MinIO/emulator settings through `SPOOL_DEV_ENV`;
+`make run`, `make spool-parser` and `make spool-loader` use the configured `.env`.
+API changes under `app/` reload automatically: **no backend image build is needed**.
 The API listens on `http://127.0.0.1:9090`; public API/docs access goes through
 `http://localhost:8080/api/v1/...` and `http://localhost:8080/docs`.
-In another terminal, run `make worker` to persist queued batches to MongoDB.
-The worker is a separate host Python process; API reload does not reload it.
+API reload does not reload the worker processes.
 
 The development database uses loopback port **28017**, with persistent storage and
 automatic replica-set initialization. There are no secondary containers or separate
@@ -138,14 +324,24 @@ make run
 ```
 
 `make run` (or `python -m app`) loads `.env` and starts Python only. Compose and Python
-read the same file, including interpolated dependency addresses. Run `make worker`
-in a separate terminal, and start Next.js with `make frontend-dev`. Stop host processes
-with Ctrl+C and all four containers
-with `make dev-down`; MongoDB and Redis volumes are retained.
-Individual targets are `mongo-up/down`, `openbao-up/down`, `redis-up/down` and `proxy-up/down`.
+read the same file, including interpolated dependency addresses. Run `make spool-parser`
+and `make spool-loader` in separate terminals when starting components independently,
+and start Next.js with `make frontend-dev`. Stop host processes with Ctrl+C and
+all development containers with `make dev-down`; MongoDB and MinIO volumes are retained.
+Individual targets include `mongo-up/down`, `openbao-up/down` and `proxy-up/down`.
 `make openbao-up` also refreshes the 24-hour runtime credential. Development services
-have no TLS; MongoDB and Redis have no authentication. Do not use this loopback-only
+have no TLS; MongoDB has no authentication. Do not use this loopback-only
 stack for production.
+
+All services use **`docker/docker-compose.yml`**, with no overlay files.
+Profiles select `dev` (all dependencies with the bridge proxy), `spool`
+(MinIO/emulator/bridge), `proxy`, `proxy-host`, or `tools`
+(spool dependencies plus the one-shot MinIO initializer).
+Use Make for startup: it also prepares credentials and provisions application resources.
+Do not enable both proxy profiles together.
+`make compose-config` validates all profiles; `make compose-ps` shows containers
+and `make compose-logs` follows their logs. `make dev-down` removes containers
+across all profiles without deleting data volumes.
 
 Helm is not required for this development workflow.
 
@@ -167,8 +363,12 @@ or host-networking setting is needed. On native Linux, use host networking to
 reach applications bound to loopback. For example:
 
 ```bash
-make proxy-up DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml
+make proxy-up PROXY_SERVICE=proxy-host
 ```
+
+Use `make dev PROXY_SERVICE=proxy-host` for the complete native-Linux workflow.
+`proxy-up` stops the other proxy variant when switching modes; `proxy-down`
+stops either variant. Shutdown does not require repeating the selector.
 
 The proxy defaults to loopback **8080**. Point a local domain or an HTTPS tunnel at
 that listener, not separately at the frontend/backend. To use a trusted HTTPS tunnel,
@@ -190,13 +390,13 @@ Existing `.env` files override new defaults: migrate `APP_PORT` to **9090**, kee
 | --- | --- | --- |
 | Docker MongoDB | 28017 (loopback) | `.env`: `MONGO_PORT` |
 | Docker OpenBao | 28200 (loopback) | `.env`: `OPENBAO_PORT` |
-| Docker Redis | 28379 (loopback) | `.env`: `REDIS_PORT` |
+| Local MinIO / console | 29000 / 29001 (loopback) | `.env` spool settings |
+| Local Pub/Sub emulator | 28681 (loopback) | `PUBSUB_EMULATOR_HOST` |
 | Development NGINX | 8080 (loopback) | `.env`: `PROXY_PORT`, `PROXY_BIND_HOST` |
 | Host/Kubernetes Python API | 9090 | `.env`: `APP_HOST`, `APP_PORT`; Helm: `app.port` |
 | Host/Kubernetes frontend | 3000 | `FRONTEND_PORT`; Helm: `frontend.port` |
 | Kubernetes MongoDB pods | 27017 (cluster-internal) | Helm: `mongodb.port` |
 | Kubernetes OpenBao pod | 8200 (cluster-internal) | Helm: `openbao.port` |
-| Kubernetes Redis pod (development only) | 6379 (cluster-internal) | Helm: `redis.port` |
 | Kubernetes API port-forward | 9090 (loopback) | `make helm-port-forward KUBE_LOCAL_PORT=...` |
 
 Backend/frontend defaults are aligned across development and production.
@@ -229,11 +429,13 @@ upstream warning remains visible. Application JWE encryption uses `joserfc`.
 | --- | --- | --- |
 | GET | `/api/v1/me` | Return JWT-derived `device_id` and optional OAuth `client_id` |
 | GET | `/api/v1/workspace/configuration` | Read application-wide storage encryption and retention settings; requires `manage:devices` |
+| GET | `/api/v1/status` | Inspect pipeline metadata probes, worker heartbeats and outstanding upload counts; requires `manage:devices` |
 | PATCH | `/api/v1/workspace/configuration` | Change storage encryption and retention policies with an expected version; requires `manage:devices` |
 | POST | `/api/v1/devices` | Register a device and initial policy atomically; requires `manage:devices`; returns `201` and `Location` |
 | GET | `/api/v1/devices` | List accessible stored devices with keyset pagination, including agent/policy-created records; management tokens see all |
 | GET | `/api/v1/devices/{id}` | Retrieve a stored device, policy and acknowledgement; `404` only if absent |
-| POST | `/api/v1/traffic-log-batches` | Accept gzip JSON or a JWE-encrypted batch; return `200` with a durable `queued` receipt |
+| POST | `/api/v1/traffic-log-uploads` | Durable raw upload; `202` before content validation, optional `X-Batch-Id` retry returns `200`, conflicting content `409` |
+| GET | `/api/v1/traffic-log-uploads/{upload_id}` | Device-authorized validation, Mongo persistence and cleanup status |
 | GET | `/api/v1/devices/{id}/configuration` | Read the caller's effective device policy and public encryption key |
 | PATCH | `/api/v1/devices/{id}/configuration` | Change policy with `manage:devices` permission and an expected version |
 | PUT | `/api/v1/devices/{id}/configuration-status` | Report applied version, encryption support, or a client error |
@@ -307,7 +509,7 @@ Send `Content-Type: application/json` and `Content-Encoding: gzip`. The decompre
 body is `{"logs": [...]}`, containing 1-500 traffic records.
 Attribution is server-owned: do not send `user_id`, `device_id`, `client_id`,
 `source_ip`, `metadata`, record/batch IDs or ingestion timestamps in a record.
-Such extra fields return `422`; older agents must update their payloads.
+Such extra fields fail asynchronous content validation.
 A batch is limited to 1 MiB
 compressed and 8 MiB decompressed; malformed/truncated gzip, trailing data, and
 concatenated gzip members are rejected.
@@ -356,8 +558,9 @@ deprecated `headers` alias and support historical documents without migration.
 #### Strict event validation
 
 Both gzip and decrypted JWE batches use the same closed schema. Any invalid
-record rejects the **entire batch before publishing** (`422`). Wire/expanded size
-violations return `413`. Errors do not echo captured values.
+record rejects the **entire batch asynchronously before silver publishing**.
+Wire-size violations return `413` synchronously; expanded-size violations fail
+asynchronously. Status errors do not echo captured values.
 
 | Fields | Validation |
 | --- | --- |
@@ -383,21 +586,20 @@ must preserve this separation and use output-context escaping/parameterized quer
 ```bash
 printf '%s' '{"logs":[{"timestamp":"2026-10-24T05:00:00Z","method":"GET","url":"https://example.com/","status_code":200}]}' |
   gzip -c |
-  curl -X POST http://localhost:8080/api/v1/traffic-log-batches \
+  curl -X POST http://localhost:8080/api/v1/traffic-log-uploads \
     -H "Authorization: Bearer $ACCESS_TOKEN" \
     -H "Content-Type: application/json" \
     -H "Content-Encoding: gzip" \
     --data-binary @-
 ```
 
-The receipt contains `batch_id`, `accepted_count`, and `status=queued`. HTTP `200`
-means Redis accepted the batch and confirmed local AOF fsync, not MongoDB processing.
-Validation and authorization complete
-before any publishing. A storage failure returns `503`, never an accepted receipt.
-Delivery is at-least-once, not exactly-once. The worker best-effort deduplicates
-stable `(batch_id, _id)` pairs on retries, but MongoDB time-series has no unique-ID enforcement:
-partial or ambiguously acknowledged writes can still duplicate records. Client
-resubmissions receive new IDs and are not idempotent.
+The HTTP `202` receipt contains `upload_id`, `status=received`, and `duplicate=false`,
+confirming durable raw storage, not validated records or Mongo log persistence.
+Poll the upload status endpoint for asynchronous errors, `stored` and `raw_deleted`.
+With optional device-scoped `X-Batch-Id`, identical bytes/format return `200`
+with `duplicate=true`; conflicting reuse returns `409`. Without it each request
+creates a new upload. Delivery remains at least once: partial or ambiguously
+acknowledged Mongo time-series writes can still duplicate records.
 
 #### Trusted ingestion attribution
 
@@ -445,8 +647,8 @@ the server-configured curve and algorithms (default: NIST `P-384`,
 OpenBao Transit wraps the private EC key set under a non-exportable KEK; KV v2
 stores only its ciphertext. The backend unwraps the set into RAM at startup,
 then performs JWE decryption locally: this is not remote ECDH or non-exportable EC keys.
-No plaintext EC key files or private EC key Secrets are used. Decryption and
-redaction happen before the existing publisher boundary. Management/enforcement
+No plaintext EC key files or private EC key Secrets are used. Parser workers decrypt,
+minimize and protect fields before silver publishing. Management/enforcement
 reads use primary to avoid stale policies; analysis remains secondary-only.
 
 See [encryption setup and client protocol](docs/ENCRYPTION.md) for KMS provisioning,
@@ -525,63 +727,28 @@ Event `timestamp` stays at the root because it is the time-series `timeField`;
 
 Query indexes cover `(metadata.device_id, timestamp, _id)`, `(timestamp, _id)`,
 `ingestion.received_at`, and `(ingestion.batch_id, _id)` for worker replay checks.
-No unused HTTP-field indexes are added. Existing flat documents remain readable,
-including encrypted bodies; they are not rewritten or deleted. New workers accept
-both old version-1 queued documents and version-2 nested documents. Upgrade workers
-before collectors; do not roll workers back while version-2 batches remain queued.
-Existing legacy indexes are left intact for historical data and pending retries.
-The [runbook](docs/RUNBOOK.md#storage-initialization) describes index cleanup.
+No unused HTTP-field indexes are added.
+The [runbook](docs/RUNBOOK.md#storage-initialization) describes storage initialization.
+Agent upload events and traffic-log read responses are flat; direct database
+consumers use the nested storage paths. The frontend consumes analysis responses,
+not raw or silver objects.
 
-This is a **storage-only layout change**: agent upload JSON, receipts and the flat
-traffic-log response contract are unchanged, so the frontend requires no data-shape
-changes. Direct database consumers must use the new nested paths for new records.
-
-Selected sensitive fields are encrypted before the `IngestionPublisher` boundary,
+Selected sensitive fields are encrypted before silver publishing,
 using a dedicated, non-exportable OpenBao storage key, not the upload key set or its
 wrapping key. With encryption enabled, neither the publisher nor MongoDB receives
 the selected plaintext. Discarded categories are removed before this boundary;
 explicitly disabling encryption for a retained category permits plaintext storage.
-`X-Api-Key` remains discarded/redacted. Redis Streams hands batches to
-`python -m app.worker`, which inserts them with majority acknowledgement.
+`X-Api-Key` remains discarded/redacted. Silver Pub/Sub hands batches to
+`python -m app.spool_worker load`, which inserts them with majority acknowledgement.
 See [the plan](docs/PLAN.md) for the producer/worker contract.
 
-#### Durable queued ingestion
+#### Durable ingestion
 
-The collector returns `200` and `status=queued` only after Redis `XADD` followed
-by `WAITAOF 1 0 <timeout>` on the **same connection** confirms local AOF fsync.
-Redis **7.2+** is required (development image: `redis:7.4`), with `appendonly yes`,
-`appendfsync always`, persistent storage and `maxmemory-policy noeviction`.
-Bundled Redis fsyncs each write to avoid the every-second flush wait; the collector
-still confirms durability with `WAITAOF` (default timeout 2000 ms, socket timeout 3 s).
-External AOF `everysec` can work with this timeout but normally adds up to a second
-of collector latency; a 1000 ms deadline can race the flush schedule.
-Startup validates `INFO persistence` reports `aof_enabled=1`, `INFO memory` reports
-`maxmemory_policy=noeviction`, and `WAITAOF` support. External Redis ACLs must
-permit these checks plus stream/group commands, `EVAL`, and transactional
-ACK/delete (`MULTI`/`EXEC`).
-This is local disk durability, not a replication/failover-loss guarantee.
-External HA requires suitable persistence and failover policy.
-There is no direct MongoDB log-write fallback.
-
-Collector network I/O is asynchronous: policy reads use PyMongo's async client,
-storage encryption uses a lifespan-managed async OpenBao connection pool, and
-publishing uses async Redis. FastAPI resource providers are async; JWE decryption,
-gzip/JSON validation, normalization, storage preparation and BSON serialization
-are offloaded with `asyncio.to_thread`, not FastAPI's shared AnyIO thread limiter.
-Slow MongoDB log writes run only in the separate worker process.
-
-Policy reads and encryption still finish before queuing to preserve fail-closed
-device/storage rules and avoid plaintext in Redis when encryption is required.
-MongoDB/OpenBao availability and Redis fsync can therefore still affect acceptance
-latency; this is not an instantaneous or fully database-independent collector.
-
-Workers share a consumer group, process one producer batch (1–500 events) at a time,
-reclaim stale pending entries, and ACK/delete only after majority MongoDB insertion.
-Poison entries stay pending and are logged, never automatically discarded.
-No pending entries are trimmed. `REDIS_MAX_BATCHES=10000` and Redis's bounded
-no-eviction memory make overload explicit as `503`, rather than dropped success.
-If fsync confirmation times out, the batch may already be queued despite `503`.
-See [queue operations](docs/RUNBOOK.md#redis-queue-and-worker-operations).
+The [core flow](#core-ingestion-flow) defines the sole upload pipeline.
+HTTP acknowledgement confirms raw durability; parser validation and protection
+precede silver publication, and only the rate-limited loader writes traffic logs.
+There is no synchronous Mongo log-write fallback. Monitor both subscriptions,
+both DLQs, receipt state and raw cleanup independently of analysis replica lag.
 
 #### Workspace storage and encryption
 
@@ -611,7 +778,9 @@ Bootstrap/`python -m app.kms initialize` provision it without replacing existing
 keys. `python -m app.kms rotate-storage` creates a new version while old versions
 remain available for old records. New keys auto-rotate every 30 days; operators
 must also rotate before per-version usage limits are reached. Missing keys or KMS
-failures return `503`, never a plaintext fallback or successful batch receipt.
+failures prevent encrypted operations: workspace/read failures return `503`,
+while parser KMS failures are asynchronous and retain raw for retry/recovery.
+There is never a plaintext fallback or fabricated stored status.
 See [storage standards and key retention](docs/ENCRYPTION.md#workspace-storage-encryption)
 before using persistent logs.
 
@@ -701,10 +870,13 @@ make helm-port-forward KUBE_CONTEXT=minikube
 ```
 
 Helm remains the deployment path. Its development profile includes a three-member
-MongoDB StatefulSet, persistent single-node Redis, a scalable worker Deployment,
+MongoDB StatefulSet, independently scalable parser and loader Deployments,
 ephemeral OpenBao with Kubernetes-auth bootstrap, frontend on **3000**, API on **9090**,
 and placeholder Auth0 settings. Set `frontend.appBaseUrl` to your public HTTPS origin
 and `frontend.auth0.existingSecret` to the existing frontend Auth0 Secret.
+Development spool resource names are illustrative linting values, not bundled
+cloud resources. Override them with real GCS/Pub/Sub resources and workload
+identity before deployment; Docker, not Helm, supplies local MinIO/emulators.
 The frontend calls the HTTPS public origin for SSR unless `frontend.backendApiUrl`
 provides another HTTPS endpoint. Both browsers and frontend pods must resolve and
 reach that endpoint.
@@ -717,9 +889,11 @@ not a redundant proxy Deployment or an Ingress controller. Configure Auth0 callb
 trust only actual ingress source IPs/CIDRs in `app.forwardedAllowIps`.
 Set `frontend.enabled=false` for backend-only deployments.
 
-Bundled Redis is unauthenticated and development-only. The chart defaults to external MongoDB through
-`externalMongo.existingSecret`, authenticated TLS Redis (`rediss://`) through
-`externalRedis.existingSecret` (key `REDIS_URL`), and external HTTPS OpenBao through `openbao.address`;
+The chart defaults to external MongoDB through `externalMongo.existingSecret`
+and external HTTPS OpenBao through `openbao.address`.
+Provision GCS/Pub/Sub/IAM externally and set `spool.bucket`, `spool.eventTopic`,
+`spool.subscription`, `spool.silverTopic`, `spool.silverSubscription`,
+`spool.parseDlqTopic`, `spool.loadDlqTopic` and `spool.leaseSeconds`;
 supply a published application image and real Auth0 values. See the runbook for deployment, Secret management, and
 `make helm-down`. Image builds are needed for deployments, not local Python edits.
 

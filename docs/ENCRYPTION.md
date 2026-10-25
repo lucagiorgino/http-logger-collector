@@ -19,9 +19,34 @@ Application encryption supplements HTTPS; it does not replace authentication.
 The backend decrypts logs for validation, redaction, and analysis. This is not
 end-to-end secrecy against the backend. Upload encryption and the separate
 workspace-controlled field encryption at rest have independent keys and policies.
-The MVP publisher receives normalized documents with selected sensitive fields
-encrypted for storage, not the original JWE envelope. A future broker requiring
-opaque whole-batch encryption needs a different worker boundary.
+The parser publishes normalized documents with selected sensitive fields encrypted
+for storage, not the original JWE envelope. Original bytes reside temporarily in
+the raw spool described below.
+
+### Durable upload boundary
+
+`POST /api/v1/traffic-log-uploads` is the sole ingestion endpoint.
+It persists the original gzip/JWE wire bytes before content
+decryption/validation and returns a raw-receipt acknowledgement. Consequently raw
+objects temporarily retain even fields later discarded by workspace rules.
+GCS encryption at rest/public-access prevention is mandatory; gzip alone is not
+application encryption. The local MinIO volume is for synthetic development data
+and does not promise production encryption at rest.
+
+Worker #1 loads the same retained EC key set into RAM, decrypts JWE locally, uses
+the same bounded decompression/schema rules, and applies a collector-time snapshot
+of discard/field-encryption settings. Only protected normalized documents reach
+the dedicated Pub/Sub silver topic. Worker #2 has no EC keys or KMS credential.
+Retain old EC keys and decrypt capability until **all pending/failed raw uploads
+using them** are processed or explicitly abandoned; restart parser workers as well
+as API processes after key-set changes. The existing ephemeral OpenBao development
+warning applies to this backlog too.
+
+Successful Mongo persistence is recorded before raw deletion; failed cleanup retries.
+The dedicated GCS bucket has neither object versioning nor soft deletion, so raw
+deletion is not merely a hidden retained version. Pending/failed raw objects do not
+expire automatically. Existing Mongo TTL and field-decryption behavior are unchanged.
+See the README core ingestion flow and the runbook before accepting real traffic.
 
 Both encrypted and plaintext batches carry the same
 [typed HTTP event schema](../README.md#strict-event-validation). Captured endpoints,
@@ -30,7 +55,8 @@ authorization/cookie values are retained under the default-on storage policy.
 Credential header values remain redacted in API responses; only authorized
 single-record reads decrypt retained bodies. Collection reads omit bodies.
 Unknown/duplicate fields, unsafe header keys, invalid types and per-field or
-batch size violations reject the whole batch before publishing. Captured source IP
+batch size violations fail the whole batch asynchronously before silver publishing.
+Captured source IP
 is an agent observation (`captured_source_ip`), never the trusted upload `source_ip`.
 
 ## Configured cryptographic suite
@@ -135,11 +161,11 @@ returns `409` for stale/concurrent edits. Optional strict Boolean `retain_*` fie
 default to true and preserve their saved values when omitted. `retain_*=false`
 takes precedence over the corresponding encryption switch.
 Enabling encryption for any retained category validates KMS
-availability before saving. Ingestion reads a primary-backed policy snapshot,
-validates the whole batch, then encrypts selected sensitive values **before**
-handing documents to the replaceable publisher. A failed settings read or KMS
-operation prevents publishing and returns sanitized `503`; there is no plaintext
-fallback, local key file, or success-shaped receipt.
+availability before saving. Upload acceptance captures a primary-backed policy
+snapshot; the parser validates the whole batch and encrypts selected sensitive
+values **before silver publishing**. An unavailable policy read prevents acceptance
+with sanitized `503`. A parser KMS failure is asynchronous and retains raw for
+retry/recovery; there is no plaintext fallback or fabricated stored status.
 
 - **Body:** the original validated UTF-8 body is stored only if retention is enabled.
   Byte length and SHA-256 digest are kept even when the body is discarded
@@ -325,8 +351,9 @@ development; HTTP redirects and environment proxy settings are not followed.
 The Helm development profile instead bundles ephemeral OpenBao, a generated
 development root Secret, TokenReview RBAC, and a revision-named bootstrap Job.
 Only OpenBao and that Job mount the root Secret; API pods use Kubernetes login.
-The Service is ClusterIP and ingress is restricted to API/bootstrap pods when
-NetworkPolicy is enforced. Helm preserves the dev root Secret across upgrades.
+The Service is ClusterIP and ingress is restricted to API, spool-parse and
+bootstrap pods when NetworkPolicy is enforced; the loader remains isolated.
+Helm preserves the dev root Secret across upgrades.
 After an OpenBao pod restart, rerun `make helm-up`, then restart the API Deployment
 to load the newly bootstrapped key set. The same buffered-envelope loss warning
 as local dev mode applies.
@@ -447,7 +474,7 @@ required. Buffer or surface delivery errors; do not silently drop logs.
    verified JWT and trusted connection for both gzip and JWE uploads.
 2. Gzip once.
 3. Encrypt the gzip bytes as compact JWE using the advertised suite and public EC key.
-4. POST the JWE string to `/api/v1/traffic-log-batches` with an Auth0 bearer token
+4. POST the JWE string to `/api/v1/traffic-log-uploads` with an Auth0 bearer token
    and `Content-Type: application/jose`. Do **not** send `Content-Encoding: gzip`.
 
 The protected JWE header must contain the advertised `alg` and `enc`, `kid`,
@@ -482,7 +509,7 @@ envelope = jwe.encrypt_compact(
     registry=registry,
 )
 response = httpx.post(
-    f"{base_url}/api/v1/traffic-log-batches",
+    f"{base_url}/api/v1/traffic-log-uploads",
     content=envelope,
     headers={
         "Authorization": f"Bearer {token}",
@@ -494,22 +521,22 @@ response.raise_for_status()
 ```
 
 Limits: 1,500,000 bytes encrypted wire size, 1 MiB decrypted gzip, 8 MiB expanded.
-Authentication, envelope integrity, decompression bounds, trusted attribution, and
-the JWT-bound device's effective encryption policy are checked before publishing any log.
-Malformed/tampered/unknown-key envelopes return generic `400`; wrong media encoding
-returns `415`; size overflow returns `413`; policy violations return `403`; storage
-or policy/key-management unavailability returns `503`. Successful receipts return `200` with
-`status=queued` after Redis confirms local AOF durability. Storage protection/discard
-happens before enqueueing; the worker does not need OpenBao keys or credentials.
-MongoDB persistence is asynchronous. Queue outages or capacity limits return `503`,
-never a success-shaped fallback to synchronous writes.
+Authentication, trusted attribution, media/wire limits and device transfer policy
+are checked synchronously. Wrong media encoding returns `415`, wire overflow `413`,
+policy violations `403`, and unavailable raw storage/policy services `503`.
+HTTP `202` acknowledges durable raw receipt, not valid content or Mongo log writes.
+Optional device-scoped `X-Batch-Id` gives identical-byte/format retries `200` and
+conflicting reuse `409`. Poll `GET /api/v1/traffic-log-uploads/{upload_id}`.
+Malformed/tampered/unknown-key envelopes, decompression/schema errors and KMS
+failures are asynchronous parser failures. The parser requires EC and
+field-encryption access; the Mongo loader does not.
 
 Control-plane policy reads use primary with majority read concern, never a stale
 analysis replica. Analysis retains its existing secondary-only deployment routing.
 Policy is checked during each request; changes do not retroactively cancel a
-request already being accepted. Envelopes do not provide replay deduplication:
-client retries and ambiguous partial MongoDB writes may still create duplicates.
-The worker reuses record IDs and checks already-persisted records on replay, but
+request already being accepted. The acceptance-time workspace policy snapshot
+governs parsing. JWE itself does not provide replay deduplication; use `X-Batch-Id`
+for request retries. Workers reuse deterministic IDs and check persisted records on replay, but
 time-series collections cannot enforce unique IDs, so delivery is at-least-once.
 
 ## Key rotation
@@ -518,7 +545,7 @@ All commands use the configured OpenBao address, mounts and suite. Specify an
 operator credential file with `--admin-token-file`; development defaults to the
 ignored development root credential. No command outputs EC private keys.
 
-For a single stopped backend, generate and activate a new key before restarting:
+For a stopped API/parser pair, generate and activate a new key before restarting:
 
 ```bash
 .venv/bin/python -m app.kms rotate --key-id ingestion-2 \
@@ -531,23 +558,24 @@ instance has not loaded:
 ```bash
 .venv/bin/python -m app.kms stage --key-id ingestion-2 \
   --admin-token-file /secure/operator-token
-# Restart/roll out every backend instance; wait until all have both keys.
+# Restart/roll out every API and parser instance; wait until all have both keys.
 .venv/bin/python -m app.kms activate --key-id ingestion-2 \
   --admin-token-file /secure/operator-token
-# Restart/roll out every backend instance again to advertise the new active key.
+# Restart/roll out API and parser instances again with the active key.
 ```
 
 Each update wraps the complete key set and uses KV compare-and-swap. A conflict
 fails explicitly; inspect current state before retrying. Old private keys remain
 available for buffered envelopes. Keep them for at least the maximum supported
-offline/retry period, then retire one:
+offline/retry period **and until all dependent pending/failed raw uploads have
+been processed or explicitly abandoned**, then retire one:
 
 ```bash
 .venv/bin/python -m app.kms retire --key-id ingestion-1 \
   --admin-token-file /secure/operator-token
 ```
 
-The active key cannot be retired. Restart **all** backend processes after retirement;
+The active key cannot be retired. Restart **all API and parser** processes after retirement;
 otherwise old cached keys remain usable. Retirement removes the key from the current
 key set, not historical KV versions, backups, or existing process memory. Removed or
 unknown IDs are rejected; clients must surface the error, not downgrade encryption.

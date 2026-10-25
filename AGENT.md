@@ -7,7 +7,9 @@ This repository implements the backend service for collecting HTTP traffic gener
 
 The success criterion is a working backend that authenticates users and agents, accepts traffic logs securely, and stores them in MongoDB without leaking sensitive data.
 
-The core architectural invariant is that all inbound traffic is validated, authenticated, and logged with explicit security checks before it reaches persistence.
+Authenticate and bound uploads before durable raw receipt; validate, minimize and
+protect their content in the parser before silver/Mongo log persistence. Never
+log raw payloads or credentials.
 
 ## The docs
 Read the relevant file before starting a task and update it when the design changes.
@@ -44,6 +46,12 @@ make helm-test
 - `app/services/` contains business logic for authorization, ingestion, and log handling.
 - `app/db/` persists data to MongoDB.
 - `app/core/` contains config, security helpers, and structured logging.
+- `app/api/uploads.py` accepts durable raw uploads to GCS (local MinIO).
+  Object-event Pub/Sub triggers `app.spool_worker parse`; protected normalized
+  documents cross silver Pub/Sub to `app.spool_worker load` for rate-limited
+  majority Mongo writes and raw cleanup. This is the sole ingestion pipeline.
+  POST acknowledges raw receipt; content validation fails asynchronously.
+  See README's core ingestion flow and the runbook.
 - `frontend/` is the JavaScript/JSX Next.js SSR management console with shadcn/ui.
   Read its README before changing it. API tokens stay server-side; no browser
   token endpoint or cross-owner bypass is permitted. Use `make frontend-test`,
