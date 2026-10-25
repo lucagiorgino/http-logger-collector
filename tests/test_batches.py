@@ -1,20 +1,19 @@
 import gzip
 import json
-from unittest.mock import AsyncMock
+from functools import partial
 
 import pytest
 from fastapi.testclient import TestClient
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from app.api import batches
+from app.api import uploads
 from app.core.auth import require_bearer_token
 from app.db.mongo import PersistenceError
-from app.deps import get_ingestion_publisher
 from app.main import app
-from app.schemas.traffic import BatchReceipt
+from app.services import batch_codec, upload_pipeline
 from app.services.traffic_service import DEVICE_ID_CLAIM
 
-URL = "/api/v1/traffic-log-batches"
+URL = "/api/v1/traffic-log-uploads"
 HEADERS = {"Content-Encoding": "gzip", "Content-Type": "application/json"}
 
 
@@ -22,19 +21,21 @@ def batch_body(*logs):
     return gzip.compress(json.dumps({"logs": logs}).encode())
 
 
-def test_compressed_batch_is_normalized_before_durable_acceptance(
-    authorized_client, repository, traffic_payload
+def test_compressed_batch_is_normalized_after_raw_durable_acceptance(
+    authorized_client, repository, traffic_payload, drain_uploads
 ):
     traffic_payload["headers"]["User-Agent"] = "TestAgent"
     response = authorized_client.post(
         URL, content=batch_body(traffic_payload, traffic_payload), headers=HEADERS
     )
-    assert response.status_code == 200
-    receipt = response.json()
+    assert response.status_code == 202
+    repository.insert_queued_traffic_logs.assert_not_awaited()
+    drain_uploads()
+    receipt = authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()
     assert receipt["accepted_count"] == 2
     assert receipt["status"] == "stored"
-    repository.insert_traffic_logs.assert_awaited_once()
-    documents = repository.insert_traffic_logs.call_args.args[0]
+    repository.insert_queued_traffic_logs.assert_awaited_once()
+    documents = repository.insert_queued_traffic_logs.call_args.args[0]
     assert len({document["_id"] for document in documents}) == 2
     for document in documents:
         assert set(document) == {
@@ -45,7 +46,7 @@ def test_compressed_batch_is_normalized_before_durable_acceptance(
             "logdata",
             "storage_encryption",
         }
-        assert document["ingestion"]["batch_id"] == receipt["batch_id"]
+        assert document["ingestion"]["batch_id"] == receipt["upload_id"]
         assert document["metadata"] == {"device_id": "device-456", "suspicious": False}
         assert document["ingestion"]["client_id"] == "oauth-client-123"
         assert document["ingestion"]["source_ip"] == "203.0.113.10"
@@ -63,13 +64,14 @@ def test_compressed_batch_is_normalized_before_durable_acceptance(
 
 
 def test_complete_http_event_is_stored_and_read_back(
-    authorized_client, repository, rich_traffic_payload
+    authorized_client, repository, rich_traffic_payload, drain_uploads
 ):
     response = authorized_client.post(
         URL, content=batch_body(rich_traffic_payload), headers=HEADERS
     )
-    assert response.status_code == 200
-    document = repository.insert_traffic_logs.call_args.args[0][0]
+    assert response.status_code == 202
+    drain_uploads()
+    document = repository.insert_queued_traffic_logs.call_args.args[0][0]
     repository.get_traffic_log.return_value = document
     repository.list_traffic_logs.return_value = [document]
     for record in (
@@ -160,17 +162,21 @@ def test_complete_http_event_is_stored_and_read_back(
         ("response_headers", {f"X-{i}": "x" * 8192 for i in range(4)}),
     ],
 )
-def test_strict_event_schema_rejects_whole_batch_before_publishing(
-    authorized_client, repository, traffic_payload, field, value
+def test_strict_event_schema_rejects_whole_batch_before_silver_publishing(
+    authorized_client, repository, traffic_payload, field, value, drain_uploads, upload_harness
 ):
     invalid = {key: item for key, item in traffic_payload.items() if key != "headers"}
     invalid[field] = value
     response = authorized_client.post(
         URL, content=batch_body(traffic_payload, invalid), headers=HEADERS
     )
-    assert response.status_code == 422
-    repository.get_device_configuration.assert_not_awaited()
-    repository.insert_traffic_logs.assert_not_awaited()
+    assert response.status_code == 202
+    drain_uploads()
+    state = authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()
+    assert state["status"] == "parse_failed"
+    assert state["error_code"] == "invalid_content"
+    upload_harness.queue.publish.assert_not_awaited()
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -183,24 +189,38 @@ def test_strict_event_schema_rejects_whole_batch_before_publishing(
         '{"logs":[' + "[" * 1100 + "0" + "]" * 1100 + "]}",
     ],
 )
-def test_ambiguous_or_unexpected_json_is_rejected(authorized_client, repository, body):
+def test_ambiguous_or_unexpected_json_is_rejected(
+    authorized_client, repository, body, drain_uploads
+):
     response = authorized_client.post(URL, content=gzip.compress(body.encode()), headers=HEADERS)
-    assert response.status_code == 422
-    repository.insert_traffic_logs.assert_not_awaited()
+    assert response.status_code == 202
+    drain_uploads()
+    assert (
+        authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()["error_code"]
+        == "invalid_content"
+    )
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
-def test_header_aliases_cannot_be_supplied_together(authorized_client, repository, traffic_payload):
+def test_header_aliases_cannot_be_supplied_together(
+    authorized_client, repository, traffic_payload, drain_uploads
+):
     response = authorized_client.post(
         URL,
         content=batch_body(traffic_payload | {"request_headers": {"X": "ambiguous"}}),
         headers=HEADERS,
     )
-    assert response.status_code == 422
-    repository.insert_traffic_logs.assert_not_awaited()
+    assert response.status_code == 202
+    drain_uploads()
+    assert (
+        authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()["status"]
+        == "parse_failed"
+    )
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
 def test_large_valid_url_and_zero_metrics_are_not_silently_dropped(
-    authorized_client, repository, traffic_payload
+    authorized_client, repository, traffic_payload, drain_uploads
 ):
     payload = traffic_payload | {
         "url": "https://example.com/" + "a" * 3000,
@@ -210,8 +230,9 @@ def test_large_valid_url_and_zero_metrics_are_not_silently_dropped(
         "process_id": 0,
     }
     response = authorized_client.post(URL, content=batch_body(payload), headers=HEADERS)
-    assert response.status_code == 200
-    document = repository.insert_traffic_logs.call_args.args[0][0]
+    assert response.status_code == 202
+    drain_uploads()
+    document = repository.insert_queued_traffic_logs.call_args.args[0][0]
     for field in ("url", "request_size_bytes", "response_size_bytes", "duration_ms", "process_id"):
         assert document["logdata"][field] == payload[field]
 
@@ -232,19 +253,23 @@ def test_large_valid_url_and_zero_metrics_are_not_silently_dropped(
     ],
 )
 def test_client_attribution_is_rejected_before_any_write(
-    authorized_client, repository, traffic_payload, field
+    authorized_client, repository, traffic_payload, field, drain_uploads
 ):
     forged = {**traffic_payload, field: "forged-metadata"}
     response = authorized_client.post(
         URL, content=batch_body(traffic_payload, forged), headers=HEADERS
     )
-    assert response.status_code == 422
-    repository.get_device_configuration.assert_not_awaited()
-    repository.insert_traffic_logs.assert_not_awaited()
+    assert response.status_code == 202
+    drain_uploads()
+    assert (
+        authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()["error_code"]
+        == "invalid_content"
+    )
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
 def test_missing_device_claim_uses_subject_and_ignores_untrusted_forwarding_headers(
-    authorized_client, repository, traffic_payload
+    authorized_client, repository, traffic_payload, drain_uploads
 ):
     app.dependency_overrides[require_bearer_token] = lambda: {"sub": "oauth-client@clients"}
     response = authorized_client.post(
@@ -259,8 +284,9 @@ def test_missing_device_claim_uses_subject_and_ignores_untrusted_forwarding_head
             "X-Client-ID": "forged-client",
         },
     )
-    assert response.status_code == 200
-    document = repository.insert_traffic_logs.call_args.args[0][0]
+    assert response.status_code == 202
+    drain_uploads()
+    document = repository.insert_queued_traffic_logs.call_args.args[0][0]
     assert document["metadata"] == {
         "device_id": "oauth-client@clients",
         "suspicious": False,
@@ -275,7 +301,7 @@ def test_missing_device_claim_uses_subject_and_ignores_untrusted_forwarding_head
     [("10.0.0.10", "198.51.100.9"), ("203.0.113.10", "203.0.113.10")],
 )
 def test_forwarded_ip_requires_a_trusted_proxy(
-    authorized_client, repository, traffic_payload, peer, expected_ip
+    authorized_client, repository, traffic_payload, peer, expected_ip, drain_uploads
 ):
     proxied = TestClient(
         ProxyHeadersMiddleware(app, trusted_hosts=["10.0.0.0/24"]),
@@ -286,23 +312,28 @@ def test_forwarded_ip_requires_a_trusted_proxy(
         content=batch_body(traffic_payload),
         headers={**HEADERS, "X-Forwarded-For": "198.51.100.9, 10.0.0.20"},
     )
-    assert response.status_code == 200
-    document = repository.insert_traffic_logs.call_args.args[0][0]
+    assert response.status_code == 202
+    drain_uploads()
+    document = repository.insert_queued_traffic_logs.call_args.args[0][0]
     assert document["ingestion"]["source_ip"] == expected_ip
 
 
 @pytest.mark.parametrize("peer", ["2001:db8::123", None, "invalid-network-address"])
 def test_network_addresses_are_validated_without_inventing_an_ip(
-    authorized_client, repository, traffic_payload, peer
+    authorized_client, repository, traffic_payload, peer, drain_uploads
 ):
     network_client = TestClient(app, client=(peer, 50000) if peer is not None else None)
     response = network_client.post(URL, content=batch_body(traffic_payload), headers=HEADERS)
     if peer == "invalid-network-address":
         assert response.status_code == 400
-        repository.insert_traffic_logs.assert_not_awaited()
+        repository.insert_queued_traffic_logs.assert_not_awaited()
     else:
-        assert response.status_code == 200
-        assert repository.insert_traffic_logs.call_args.args[0][0]["ingestion"]["source_ip"] == peer
+        assert response.status_code == 202
+        drain_uploads()
+        assert (
+            repository.insert_queued_traffic_logs.call_args.args[0][0]["ingestion"]["source_ip"]
+            == peer
+        )
 
 
 @pytest.mark.parametrize("device_id", ["", " ", None, 123, ["forged"], "x" * 256])
@@ -317,21 +348,34 @@ def test_invalid_signed_device_identity_is_not_replaced_by_subject(
     assert response.status_code == 401
     assert response.headers["WWW-Authenticate"] == "Bearer"
     repository.get_device_configuration.assert_not_awaited()
-    repository.insert_traffic_logs.assert_not_awaited()
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
 @pytest.mark.parametrize("content", [b"not gzip", gzip.compress(b"{}")[:-1], b""])
-def test_invalid_gzip_is_rejected(authorized_client, repository, content):
+def test_invalid_gzip_is_rejected(authorized_client, repository, content, drain_uploads):
     response = authorized_client.post(URL, content=content, headers=HEADERS)
-    assert response.status_code == 400
-    repository.insert_traffic_logs.assert_not_awaited()
+    assert response.status_code == (202 if content else 400)
+    if content:
+        drain_uploads()
+        assert (
+            authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()["error_code"]
+            == "invalid_content"
+        )
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
-def test_gzip_trailing_data_and_multiple_members_are_rejected(authorized_client, traffic_payload):
+def test_gzip_trailing_data_and_multiple_members_are_rejected(
+    authorized_client, traffic_payload, drain_uploads
+):
     body = batch_body(traffic_payload)
     for suffix in (b"trailing", gzip.compress(b"{}")):
         response = authorized_client.post(URL, content=body + suffix, headers=HEADERS)
-        assert response.status_code == 400
+        assert response.status_code == 202
+        drain_uploads()
+        assert (
+            authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()["error_code"]
+            == "invalid_content"
+        )
 
 
 @pytest.mark.parametrize(
@@ -349,62 +393,71 @@ def test_batch_requires_supported_media_type(authorized_client, traffic_payload,
 
 @pytest.mark.parametrize("limit", ["MAX_COMPRESSED_BYTES", "MAX_DECOMPRESSED_BYTES"])
 def test_compressed_and_expanded_limits_are_enforced(
-    authorized_client, repository, traffic_payload, monkeypatch, limit
+    authorized_client, repository, traffic_payload, monkeypatch, limit, drain_uploads
 ):
-    monkeypatch.setattr(batches, limit, 32)
+    if limit == "MAX_COMPRESSED_BYTES":
+        monkeypatch.setattr(uploads, limit, 32)
+    else:
+        monkeypatch.setattr(
+            upload_pipeline,
+            "parse_compressed_batch",
+            partial(batch_codec.parse_compressed_batch, max_decompressed_bytes=32),
+        )
     response = authorized_client.post(URL, content=batch_body(traffic_payload), headers=HEADERS)
-    assert response.status_code == 413
-    repository.insert_traffic_logs.assert_not_awaited()
+    assert response.status_code == (413 if limit == "MAX_COMPRESSED_BYTES" else 202)
+    if response.status_code == 202:
+        drain_uploads()
+        assert (
+            authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()["error_code"]
+            == "invalid_content"
+        )
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
 @pytest.mark.parametrize("count", [0, 501])
-def test_batch_size_is_bounded(authorized_client, repository, traffic_payload, count):
+def test_batch_size_is_bounded(
+    authorized_client, repository, traffic_payload, count, drain_uploads
+):
     response = authorized_client.post(
         URL, content=batch_body(*([traffic_payload] * count)), headers=HEADERS
     )
-    assert response.status_code == 422
-    repository.insert_traffic_logs.assert_not_awaited()
+    assert response.status_code == 202
+    drain_uploads()
+    assert (
+        authorized_client.get(f"{URL}/{response.json()['upload_id']}").json()["error_code"]
+        == "invalid_content"
+    )
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
 def test_invalid_record_rejects_entire_batch_without_echoing_secrets(
-    authorized_client, repository, traffic_payload
+    authorized_client, repository, traffic_payload, drain_uploads
 ):
     invalid = {**traffic_payload, "body": {"password": "private-value"}, "timestamp": "2026-01-15"}
     response = authorized_client.post(
         URL, content=batch_body(traffic_payload, invalid), headers=HEADERS
     )
-    assert response.status_code == 422
+    assert response.status_code == 202
+    drain_uploads()
+    state = authorized_client.get(f"{URL}/{response.json()['upload_id']}")
+    assert state.json()["error_code"] == "invalid_content"
     assert "private-value" not in response.text
-    repository.insert_traffic_logs.assert_not_awaited()
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
-def test_ingestion_failure_is_not_acknowledged(authorized_client, repository, traffic_payload):
-    repository.insert_traffic_logs.side_effect = PersistenceError("sensitive driver details")
-    response = authorized_client.post(URL, content=batch_body(traffic_payload), headers=HEADERS)
-    assert response.status_code == 503
-    assert "sensitive driver details" not in response.text
-
-
-def test_publisher_can_be_replaced_without_changing_api(
-    authorized_client, repository, traffic_payload
+def test_loader_failure_preserves_raw_upload(
+    authorized_client, repository, traffic_payload, drain_uploads, upload_harness
 ):
-    publisher = AsyncMock()
-    publisher.publish.side_effect = lambda batch_id, documents: BatchReceipt(
-        batch_id=batch_id, accepted_count=len(documents), status="queued"
-    )
-    app.dependency_overrides[get_ingestion_publisher] = lambda: publisher
+    repository.insert_queued_traffic_logs.side_effect = PersistenceError("sensitive driver details")
     response = authorized_client.post(URL, content=batch_body(traffic_payload), headers=HEADERS)
-    assert response.status_code == 200
-    assert response.json()["status"] == "queued"
-    publisher.publish.assert_awaited_once()
-    assert (
-        publisher.publish.call_args.args[1][0]["logdata"]["request_headers"]["Authorization"]
-        == "[ENCRYPTED]"
-    )
-    queued = publisher.publish.call_args.args[1][0]
-    assert queued["storage_encryption"]["ciphertext"].startswith("vault:v1:")
-    assert traffic_payload["body"] not in repr(queued)
-    repository.insert_traffic_logs.assert_not_awaited()
+    assert response.status_code == 202
+    drain_uploads()
+    state = authorized_client.get(f"{URL}/{response.json()['upload_id']}")
+    assert state.json()["status"] == "queued"
+    assert state.json()["raw_deleted"] is False
+    assert upload_harness.objects
+    upload_harness.queue.acknowledge.assert_not_awaited()
+    assert "sensitive driver details" not in response.text
 
 
 def test_batch_rejects_unauthenticated_requests(traffic_payload):
@@ -417,7 +470,7 @@ def test_streaming_gzip_chunks_are_supported(authorized_client, traffic_payload)
     response = authorized_client.post(
         URL, content=(body[index : index + 7] for index in range(0, len(body), 7)), headers=HEADERS
     )
-    assert response.status_code == 200
+    assert response.status_code == 202
 
 
 def test_openapi_references_resolve_without_other_upload_routes():

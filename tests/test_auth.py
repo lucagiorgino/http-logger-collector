@@ -12,9 +12,8 @@ from joserfc.jwk import OctKey, RSAKey
 from app.core import auth
 from app.core.encryption import EncryptionKeys
 from app.core.storage_encryption import get_storage_encryption
-from app.deps import get_ingestion_publisher, get_mongo_repository, get_request_encryption_keys
+from app.deps import get_mongo_repository, get_request_encryption_keys
 from app.main import app
-from app.services.ingestion import MongoIngestionPublisher
 from app.services.traffic_service import DEVICE_ID_CLAIM
 
 client = TestClient(app)
@@ -47,11 +46,13 @@ def test_api_exposes_only_current_resources() -> None:
     assert set(schema["paths"]) == {
         "/health",
         "/api/v1/me",
+        "/api/v1/status",
         "/api/v1/devices",
         "/api/v1/devices/{device_id}",
         "/api/v1/devices/{device_id}/configuration",
         "/api/v1/devices/{device_id}/configuration-status",
-        "/api/v1/traffic-log-batches",
+        "/api/v1/traffic-log-uploads",
+        "/api/v1/traffic-log-uploads/{upload_id}",
         "/api/v1/traffic-logs",
         "/api/v1/traffic-logs/{record_id}",
         "/api/v1/workspace/configuration",
@@ -118,7 +119,14 @@ def test_auth0_sdk_verifies_signed_tokens_and_caches_discovery_and_keys(signed_t
 
 @pytest.mark.parametrize("client_claim", ["azp", "client_id"])
 def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
-    signed_tokens, repository, traffic_payload, monkeypatch, client_claim, storage_encryption
+    signed_tokens,
+    repository,
+    traffic_payload,
+    monkeypatch,
+    client_claim,
+    storage_encryption,
+    upload_harness,
+    drain_uploads,
 ):
     mint, state = signed_tokens
     token = mint(
@@ -127,11 +135,6 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
     )
     monkeypatch.setitem(app.dependency_overrides, get_mongo_repository, lambda: repository)
     monkeypatch.setitem(
-        app.dependency_overrides,
-        get_ingestion_publisher,
-        lambda: MongoIngestionPublisher(repository),
-    )
-    monkeypatch.setitem(
         app.dependency_overrides, get_request_encryption_keys, lambda: EncryptionKeys({})
     )
     monkeypatch.setitem(
@@ -139,7 +142,7 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
     )
     signed_client = TestClient(app, base_url="https://testserver", client=("2001:db8::1", 50000))
     response = signed_client.post(
-        "/api/v1/traffic-log-batches",
+        "/api/v1/traffic-log-uploads",
         content=gzip.compress(json.dumps({"logs": [traffic_payload]}).encode()),
         headers={
             "Authorization": f"Bearer {token}",
@@ -148,8 +151,12 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
             "X-Forwarded-For": "198.51.100.1",
         },
     )
-    assert response.status_code == 200
-    stored = repository.insert_traffic_logs.call_args.args[0][0]
+    assert response.status_code == 202
+    repository.insert_queued_traffic_logs.assert_not_awaited()
+    descriptor = upload_harness.store.records[response.json()["upload_id"]]["descriptor"]
+    assert descriptor["device_id"] == "issuer-bound-device"
+    drain_uploads()
+    stored = repository.insert_queued_traffic_logs.call_args.args[0][0]
     assert stored["metadata"] == {
         "device_id": "issuer-bound-device",
         "suspicious": False,

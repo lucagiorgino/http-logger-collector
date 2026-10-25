@@ -71,6 +71,80 @@ class MongoRepository:
                 write_concern=WriteConcern("majority"),
             )
         )
+        self.pipeline_workers: AsyncCollection[dict[str, Any]] = self.database.get_collection(
+            "pipeline_workers",
+            read_preference=ReadPreference.PRIMARY,
+            read_concern=ReadConcern("majority"),
+            write_concern=WriteConcern("majority"),
+        )
+        self.pipeline_uploads: AsyncCollection[dict[str, Any]] = self.database.get_collection(
+            "ingestion_uploads",
+            read_preference=ReadPreference.PRIMARY,
+            read_concern=ReadConcern("majority"),
+        )
+
+    async def initialize_pipeline_status(self) -> None:
+        try:
+            await self.pipeline_workers.create_index("seen_at", expireAfterSeconds=86400)
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to initialize worker heartbeats") from exc
+
+    async def report_pipeline_worker(self, role: str, instance: str, status: str) -> None:
+        try:
+            await self.pipeline_workers.update_one(
+                {"_id": instance},
+                {"$set": {"role": role, "status": status, "seen_at": datetime.now(UTC)}},
+                upsert=True,
+            )
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to report worker heartbeat") from exc
+
+    async def pipeline_snapshot(self) -> dict[str, Any]:
+        try:
+            workers = await self.pipeline_workers.find(
+                {}, {"_id": 0, "role": 1, "status": 1, "seen_at": 1}
+            ).to_list(length=None)
+            cursor = await self.pipeline_uploads.aggregate(
+                [
+                    {
+                        "$match": {
+                            "$or": [
+                                {
+                                    "status": {
+                                        "$in": [
+                                            "uploading",
+                                            "received",
+                                            "parsing",
+                                            "queued",
+                                            "loading",
+                                            "parse_failed",
+                                            "load_failed",
+                                        ]
+                                    }
+                                },
+                                {"status": "stored", "raw_deleted": False},
+                            ]
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$status",
+                            "count": {"$sum": 1},
+                            "oldest": {"$min": "$updated_at"},
+                        }
+                    },
+                ]
+            )
+            uploads = await cursor.to_list(length=None)
+            return {"workers": workers, "uploads": uploads}
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to read pipeline status") from exc
+
+    async def check_analysis_connection(self) -> None:
+        try:
+            await self.analysis_logs.find_one({}, {"_id": 1})
+        except PyMongoError as exc:
+            raise PersistenceError("Analysis read target is unavailable") from exc
 
     async def get_workspace_configuration(self) -> dict[str, Any]:
         try:
@@ -225,11 +299,10 @@ class MongoRepository:
             raise PersistenceError("Failed to persist traffic log batch") from exc
 
     async def insert_queued_traffic_logs(self, documents: list[dict[str, Any]]) -> None:
-        batch_field = "ingestion.batch_id" if "ingestion" in documents[0] else "batch_id"
         try:
             cursor = self.traffic_logs.with_options(read_concern=ReadConcern("majority")).find(
                 {
-                    batch_field: documents[0].get("ingestion", documents[0])["batch_id"],
+                    "ingestion.batch_id": documents[0]["ingestion"]["batch_id"],
                     "_id": {"$in": [document["_id"] for document in documents]},
                 },
                 {"_id": 1},

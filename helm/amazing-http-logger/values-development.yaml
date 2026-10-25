@@ -27,8 +27,15 @@ frontend:
 mongodb:
   enabled: true
 
-redis:
-  enabled: true
+spool:
+  # Illustrative resources: provision GCS/Pub/Sub and workload identity before deployment.
+  bucket: logger-development-uploads
+  eventTopic: projects/logger-development/topics/uploads
+  subscription: projects/logger-development/subscriptions/uploads
+  silverTopic: projects/logger-development/topics/uploads-silver
+  silverSubscription: projects/logger-development/subscriptions/uploads-silver
+  parseDlqTopic: projects/logger-development/topics/parse-dlq
+  loadDlqTopic: projects/logger-development/topics/load-dlq
 
 openbao:
   enabled: true

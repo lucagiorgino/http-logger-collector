@@ -31,6 +31,9 @@ test("welcome is server-rendered and private pages require a session", async ({
   request,
 }) => {
   const response = await request.get("/");
+  expect(response.headers()["strict-transport-security"]).toBe(
+    "max-age=31536000",
+  );
   const html = await response.text();
   expect(html).toContain("Management console");
   expect(html).not.toContain("A clearer signal.");

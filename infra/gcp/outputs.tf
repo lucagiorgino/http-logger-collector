@@ -1,15 +1,15 @@
 output "public_url" {
-  description = "Shared frontend and API HTTPS origin."
-  value       = local.origin
+  description = "Frontend Cloud Run HTTPS origin; available before services are deployed."
+  value       = local.frontend_url
 }
 
-output "load_balancer_ip" {
-  description = "Create a DNS A record for domain pointing here; remove conflicting AAAA records."
-  value       = google_compute_global_address.edge.address
+output "backend_url" {
+  description = "API Cloud Run HTTPS origin for agents, API docs and frontend server-side requests."
+  value       = local.backend_url
 }
 
 output "egress_ip" {
-  description = "Allowlist this /32 in Atlas and the external Redis provider."
+  description = "Allowlist this /32 in Atlas."
   value       = module.network.egress_ip
 }
 
@@ -36,10 +36,7 @@ output "cloud_run_services" {
   value = { for key, service in module.service : key => service.name }
 }
 
-output "memorystore_cache" {
-  description = "Optional cache endpoint, not wired into ingestion. Fetch AUTH/CA outside Terraform."
-  value = var.enable_memorystore_cache ? {
-    host = google_redis_instance.cache[0].host
-    port = google_redis_instance.cache[0].port
-  } : null
+output "spool_environment" {
+  description = "GCS/PubSub ingestion connection settings; no credentials."
+  value       = local.spool_environment
 }

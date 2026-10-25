@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["image", "auth0", "externalMongo", "mongodb", "openbao", "externalRedis", "redis", "queue", "worker", "frontend", "ingress"],
+  "required": ["image", "auth0", "externalMongo", "mongodb", "openbao", "spool", "frontend", "ingress"],
   "properties": {
     "replicaCount": {"type": "integer", "minimum": 1},
     "image": {
@@ -91,52 +91,28 @@
         "uriKey": {"type": "string", "minLength": 1}
       }
     },
-    "externalRedis": {
+    "spool": {
       "type": "object",
-      "required": ["existingSecret", "urlKey"],
+      "required": ["bucket", "eventTopic", "subscription", "silverTopic", "silverSubscription", "parseDlqTopic", "loadDlqTopic"],
       "properties": {
-        "existingSecret": {"type": "string"},
-        "urlKey": {"type": "string", "minLength": 1}
-      }
-    },
-    "queue": {
-      "type": "object",
-      "required": ["stream", "group", "maxBatches", "socketTimeoutSeconds", "aofTimeoutMs"],
-      "properties": {
-        "stream": {"type": "string", "minLength": 1},
-        "group": {"type": "string", "minLength": 1},
-        "maxBatches": {"type": "integer", "minimum": 1},
-        "socketTimeoutSeconds": {"type": "number", "exclusiveMinimum": 0},
-        "aofTimeoutMs": {"type": "integer", "minimum": 1}
-      }
-    },
-    "worker": {
-      "type": "object",
-      "required": ["replicaCount", "reclaimIdleMs", "writeTimeoutSeconds", "retrySeconds", "terminationGracePeriodSeconds", "resources"],
-      "properties": {
-        "replicaCount": {"type": "integer", "minimum": 1},
-        "reclaimIdleMs": {"type": "integer", "minimum": 1},
-        "writeTimeoutSeconds": {"type": "number", "exclusiveMinimum": 0},
-        "retrySeconds": {"type": "number", "exclusiveMinimum": 0},
-        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1}
-      }
-    },
-    "redis": {
-      "type": "object",
-      "required": ["enabled", "image", "port", "maxmemory", "persistence", "resources"],
-      "properties": {
-        "enabled": {"type": "boolean"},
-        "image": {"type": "string", "minLength": 1},
-        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "maxmemory": {"type": "string", "minLength": 1},
-        "persistence": {
-          "type": "object",
-          "required": ["size", "storageClass"],
-          "properties": {
-            "size": {"type": "string", "minLength": 1},
-            "storageClass": {"type": "string"}
-          }
-        }
+        "bucket": {"type": "string", "minLength": 1},
+        "eventTopic": {"type": "string", "minLength": 1},
+        "silverTopic": {"type": "string", "minLength": 1},
+        "silverSubscription": {"type": "string", "minLength": 1},
+        "subscription": {"type": "string", "minLength": 1},
+        "parseDlqTopic": {"type": "string", "minLength": 1},
+        "loadDlqTopic": {"type": "string", "minLength": 1},
+        "tenant": {"type": "string", "minLength": 1},
+        "leaseSeconds": {"type": "integer", "minimum": 32, "maximum": 570},
+        "processingSeconds": {"type": "integer", "minimum": 1},
+        "maxAttempts": {"type": "integer", "minimum": 1},
+        "mongoDocumentsPerSecond": {"type": "integer", "minimum": 1},
+        "parserReplicas": {"type": "integer", "minimum": 1},
+        "loaderReplicas": {"type": "integer", "minimum": 1},
+        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+        "apiServiceAccountAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "loaderServiceAccountAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "resources": {"type": "object"}
       }
     },
     "app": {
@@ -249,22 +225,6 @@
       "then": {
         "properties": {
           "ingress": {"properties": {"host": {"minLength": 1}}}
-        }
-      }
-    },
-    {
-      "if": {"properties": {"redis": {"properties": {"enabled": {"const": false}}}}},
-      "then": {
-        "properties": {
-          "externalRedis": {"properties": {"existingSecret": {"minLength": 1}}}
-        }
-      }
-    },
-    {
-      "if": {"properties": {"redis": {"properties": {"enabled": {"const": true}}}}},
-      "then": {
-        "properties": {
-          "app": {"properties": {"environment": {"const": "development"}}}
         }
       }
     },

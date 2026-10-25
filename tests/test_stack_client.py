@@ -12,6 +12,7 @@ from joserfc.jwk import ECKey
 from pydantic import ValidationError
 
 from integration_tests.stack_client import (
+    LOGS_PER_DEVICE,
     StackSettings,
     StackTestFailure,
     load_settings,
@@ -29,7 +30,6 @@ def isolated_stack_environment(monkeypatch):
 @pytest.fixture
 def stack_settings():
     return StackSettings(
-        base_url="http://127.0.0.1:8080",
         token_url="https://auth.example.test/oauth/token",
         audience="https://test-api",
         plaintext={
@@ -44,7 +44,7 @@ def stack_settings():
             "device_id": "configured-encrypted",
             "encrypted": True,
         },
-        visibility_timeout=0.02,
+        visibility_timeout=0.5,
     )
 
 
@@ -92,6 +92,7 @@ def fake_stack(
         "reads": {},
         "configuration_methods": set(),
         "paged_reads": 0,
+        "status_reads": {},
     }
     lock = Lock()
 
@@ -112,6 +113,9 @@ def fake_stack(
                 if failure == "token":
                     return httpx.Response(401, json={"error": "sensitive-response"})
                 return httpx.Response(200, json={"access_token": identity, "token_type": "Bearer"})
+            assert request.url.scheme == "http"
+            assert request.url.host == "localhost"
+            assert request.url.port == 8080
             client_id = request.headers["Authorization"].removeprefix("Bearer ")
             path = request.url.path
             if path == "/api/v1/me":
@@ -137,7 +141,20 @@ def fake_stack(
                     assert report["supports_encryption"] is (client_id == "jwe-client")
                     assert report["key_id"] == ("server-key" if client_id == "jwe-client" else None)
                 return httpx.Response(200, json=configuration)
-            if path == "/api/v1/traffic-log-batches":
+            if path.startswith("/api/v1/traffic-log-uploads/"):
+                attempt = state["status_reads"].get(path, 0)
+                state["status_reads"][path] = attempt + 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": failure
+                        if failure in {"parse_failed", "load_failed"}
+                        else ("received" if failure == "pending" or not attempt else "stored"),
+                        "accepted_count": LOGS_PER_DEVICE,
+                        "error_code": "sensitive-response",
+                    },
+                )
+            if path == "/api/v1/traffic-log-uploads":
                 encrypted = request.headers["Content-Type"] == "application/jose"
                 if client_id == "jwe-client" and encrypted_mode == "required" and not encrypted:
                     state["rejections"] += 1
@@ -177,8 +194,8 @@ def fake_stack(
                 state["uploads"].add((client_id, encrypted))
                 state["upload_count"] += 1
                 return httpx.Response(
-                    200,
-                    json={"batch_id": batch_id, "accepted_count": len(logs), "status": "queued"},
+                    202,
+                    json={"upload_id": batch_id, "duplicate": False, "status": "received"},
                 )
             if path == "/api/v1/traffic-logs":
                 device = request.url.params["device_id"]
@@ -227,6 +244,7 @@ def test_two_threaded_clients_use_real_gzip_and_advertised_jwe(
     assert state["uploads"] == {("plain-client", False), ("jwe-client", True)}
     assert state["rejections"] == 1
     assert state["configuration_methods"] == {"GET", "PUT"}
+    assert sorted(state["status_reads"].values()) == [2, 2]
 
 
 def test_optional_policy_is_respected_without_changing_it(stack_settings):
@@ -280,13 +298,17 @@ def test_configured_device_cannot_override_the_authenticated_identity(stack_sett
     assert state["configuration_methods"] == set()
 
 
-@pytest.mark.parametrize("failure", ["token", "storage", "visibility"])
+@pytest.mark.parametrize(
+    "failure", ["token", "storage", "visibility", "pending", "parse_failed", "load_failed"]
+)
 def test_stack_errors_fail_without_echoing_credentials(stack_settings, failure):
     transport, _ = fake_stack(stack_settings, failure=failure)
     with pytest.raises(StackTestFailure) as error:
         run_stack(stack_settings, transport=transport)
     for secret in ("plain-secret", "jwe-secret", "sensitive-response"):
         assert secret not in str(error.value)
+    if failure == "pending":
+        assert "parser and loader workers are running" in str(error.value)
 
 
 @pytest.mark.parametrize("failure", ["redaction", "isolation"])
@@ -299,13 +321,17 @@ def test_successful_receipts_do_not_hide_persisted_data_failures(stack_settings,
 def test_profile_requires_distinct_clients_and_hides_secrets(tmp_path, monkeypatch):
     profile = tmp_path / "stack.env"
     profile.write_text(
-        "STACK_TEST_ENABLED=true\nSTACK_TEST_BASE_URL=http://127.0.0.1:8080\n"
+        "STACK_TEST_ENABLED=true\n"
         "STACK_TEST_TOKEN_URL=https://auth.example.test/oauth/token\nSTACK_TEST_AUDIENCE=api\n"
         "STACK_TEST_PLAINTEXT_CLIENT_ID=first\nSTACK_TEST_PLAINTEXT_CLIENT_SECRET=private-one\n"
         "STACK_TEST_ENCRYPTED_CLIENT_ID=second\nSTACK_TEST_ENCRYPTED_CLIENT_SECRET=private-two\n"
     )
     monkeypatch.setenv("STACK_TEST_ENV_FILE", str(profile))
     loaded = load_settings()
+    assert loaded.base_url == "http://localhost:8080"
+    monkeypatch.setenv("STACK_TEST_BASE_URL", "https://staging.example.test")
+    assert load_settings().base_url == "https://staging.example.test"
+    monkeypatch.delenv("STACK_TEST_BASE_URL")
     assert "private-one" not in repr(loaded)
     assert "private-two" not in repr(loaded)
     assert loaded.plaintext.device_id is None

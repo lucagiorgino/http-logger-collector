@@ -1,17 +1,16 @@
-"""Accept attribution only from headers overwritten by the managed load balancer."""
+"""Handle HTTPS and client attribution at the direct Cloud Run ingress."""
 
-import os
 from ipaddress import ip_address
 
 from starlette.responses import JSONResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.main import app as application
 
 from .configuration import validate_cloud_connections
 
 
-class EdgeHeaders:
+class CloudRunHeaders:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
@@ -19,21 +18,29 @@ class EdgeHeaders:
         if scope["type"] == "lifespan":
             validate_cloud_connections()
         if scope["type"] == "http" and scope["path"].startswith("/api/v1/"):
-            headers = dict(scope["headers"])
+            protocols = [value for key, value in scope["headers"] if key == b"x-forwarded-proto"]
+            forwarded = [value for key, value in scope["headers"] if key == b"x-forwarded-for"]
             try:
-                address = str(ip_address(headers[b"x-ermes-client-ip"].decode("ascii")))
-                if (
-                    headers[b"x-ermes-edge-ip"].decode("ascii") != os.environ["GCP_EDGE_IP"]
-                    or headers[b"x-forwarded-proto"] != b"https"
-                ):
+                if protocols != [b"https"] or len(forwarded) != 1:
                     raise ValueError()
-            except (KeyError, UnicodeError, ValueError):
+                # Cloud Run appends the connecting address; earlier entries can be caller supplied.
+                address = str(ip_address(forwarded[0].decode("ascii").rsplit(",", 1)[-1].strip()))
+            except (UnicodeError, ValueError):
                 await JSONResponse(
-                    status_code=400, content={"detail": "Trusted HTTPS ingress is required"}
+                    status_code=400, content={"detail": "Cloud Run HTTPS ingress is required"}
                 )(scope, receive, send)
                 return
             scope = {**scope, "scheme": "https", "client": (address, 0)}
-        await self.app(scope, receive, send)
+
+        async def secured_send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                message["headers"] = [
+                    *message.get("headers", []),
+                    (b"strict-transport-security", b"max-age=31536000"),
+                ]
+            await send(message)
+
+        await self.app(scope, receive, secured_send)
 
 
-app = EdgeHeaders(application)
+app = CloudRunHeaders(application)

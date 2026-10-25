@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "logger.fullname" . }}-spool-load
+  {{- with .Values.spool.loaderServiceAccountAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+{{- range $stage := list "parse" "load" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "logger.fullname" $ }}-spool-{{ $stage }}
+  labels:
+    {{- include "logger.labels" $ | nindent 4 }}
+spec:
+  replicas: {{ if eq $stage "parse" }}{{ $.Values.spool.parserReplicas }}{{ else }}{{ $.Values.spool.loaderReplicas }}{{ end }}
+  selector:
+    matchLabels:
+      {{- include "logger.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: spool-{{ $stage }}
+  template:
+    metadata:
+      labels:
+        {{- include "logger.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/component: spool-{{ $stage }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        checksum/spool: {{ toJson (dict "spool" $.Values.spool "mongo" $.Values.externalMongo) | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "logger.fullname" $ }}-{{ if eq $stage "parse" }}api{{ else }}spool-load{{ end }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ $.Values.spool.terminationGracePeriodSeconds }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: spool-{{ $stage }}
+          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag }}"
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: ["python", "-m", "app.spool_worker", {{ $stage | quote }}]
+          envFrom:
+            - configMapRef:
+                name: {{ include "logger.fullname" $ }}
+          env:
+            {{- include "logger.mongoEnv" $ | nindent 12 }}
+            {{- include "logger.spoolEnv" $ | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $.Values.spool.resources | nindent 12 }}
+          {{- if eq $stage "parse" }}
+          volumeMounts:
+            {{- include "logger.openbaoMounts" $ | nindent 12 }}
+          {{- end }}
+      {{- if eq $stage "parse" }}
+      volumes:
+        - name: openbao-auth
+          {{- if $.Values.openbao.auth.existingSecret }}
+          secret:
+            secretName: {{ $.Values.openbao.auth.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: {{ $.Values.openbao.auth.tokenKey | quote }}
+                path: token
+          {{- else }}
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  audience: {{ $.Values.openbao.auth.audience | quote }}
+                  expirationSeconds: 3600
+                  path: token
+          {{- end }}
+        {{- if $.Values.openbao.ca.existingSecret }}
+        - name: openbao-ca
+          secret:
+            secretName: {{ $.Values.openbao.ca.existingSecret | quote }}
+            items:
+              - key: {{ $.Values.openbao.ca.key | quote }}
+                path: ca.crt
+        {{- end }}
+      {{- end }}
+{{- end }}

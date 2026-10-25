@@ -33,17 +33,27 @@ def test_suspicious_classification_is_returned_in_details_and_lists(
     )
 
 
-def test_agents_cannot_assign_suspicious_classification(authorized_client, traffic_payload):
+def test_agents_cannot_assign_suspicious_classification(
+    authorized_client, traffic_payload, repository, drain_uploads
+):
     import gzip
     import json
 
     traffic_payload["suspicious"] = True
     response = authorized_client.post(
-        "/api/v1/traffic-log-batches",
+        "/api/v1/traffic-log-uploads",
         content=gzip.compress(json.dumps({"logs": [traffic_payload]}).encode()),
         headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
     )
-    assert response.status_code == 422
+    assert response.status_code == 202
+    drain_uploads()
+    assert (
+        authorized_client.get(f"/api/v1/traffic-log-uploads/{response.json()['upload_id']}").json()[
+            "error_code"
+        ]
+        == "invalid_content"
+    )
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
 def test_paginated_analysis_returns_an_opaque_cursor(

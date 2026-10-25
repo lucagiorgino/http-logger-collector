@@ -20,10 +20,10 @@ resource "google_monitoring_uptime_check_config" "api" {
     type = "uptime_url"
     labels = {
       project_id = var.project_id
-      host       = var.domain
+      host       = trimprefix(local.backend_url, "https://")
     }
   }
-  depends_on = [module.edge]
+  depends_on = [module.service]
 }
 
 resource "google_monitoring_alert_policy" "availability" {
@@ -50,7 +50,7 @@ resource "google_monitoring_alert_policy" "availability" {
     }
   }
   documentation {
-    content   = "Check certificate/DNS, Cloud Run startup/liveness, Atlas, external Redis and KMS. /health is process liveness, not a queue-drain or dependency check."
+    content   = "Check Cloud Run ingress/startup/liveness, Atlas, Pub/Sub, GCS and KMS. /health is process liveness, not a queue-drain or dependency check."
     mime_type = "text/markdown"
   }
 }

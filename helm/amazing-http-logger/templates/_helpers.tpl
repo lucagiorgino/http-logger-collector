@@ -61,24 +61,25 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   {{- end }}
 {{- end -}}
 
-{{- define "logger.redisEnv" -}}
-- name: REDIS_URL
-  {{- if .Values.redis.enabled }}
-  value: {{ printf "redis://%s-redis:%d/0" (include "logger.fullname" .) (int .Values.redis.port) | quote }}
-  {{- else }}
-  valueFrom:
-    secretKeyRef:
-      name: {{ required "externalRedis.existingSecret is required" .Values.externalRedis.existingSecret }}
-      key: {{ .Values.externalRedis.urlKey }}
-  {{- end }}
-- name: REDIS_STREAM
-  value: {{ .Values.queue.stream | quote }}
-- name: REDIS_GROUP
-  value: {{ .Values.queue.group | quote }}
-- name: REDIS_MAX_BATCHES
-  value: {{ .Values.queue.maxBatches | quote }}
-- name: REDIS_SOCKET_TIMEOUT_SECONDS
-  value: {{ .Values.queue.socketTimeoutSeconds | quote }}
-- name: REDIS_AOF_TIMEOUT_MS
-  value: {{ .Values.queue.aofTimeoutMs | quote }}
+{{- define "logger.spoolEnv" -}}
+- name: SPOOL_STORAGE_BACKEND
+  value: gcs
+- name: SPOOL_BUCKET
+  value: {{ required "spool.bucket is required" .Values.spool.bucket | quote }}
+- name: SPOOL_SUBSCRIPTION
+  value: {{ required "spool.subscription is required" .Values.spool.subscription | quote }}
+- name: SPOOL_EVENT_TOPIC
+  value: {{ required "spool.eventTopic is required" .Values.spool.eventTopic | quote }}
+- name: SPOOL_SILVER_TOPIC
+  value: {{ required "spool.silverTopic is required" .Values.spool.silverTopic | quote }}
+- name: SPOOL_SILVER_SUBSCRIPTION
+  value: {{ required "spool.silverSubscription is required" .Values.spool.silverSubscription | quote }}
+- name: SPOOL_PARSE_DLQ_TOPIC
+  value: {{ required "spool.parseDlqTopic is required" .Values.spool.parseDlqTopic | quote }}
+- name: SPOOL_LOAD_DLQ_TOPIC
+  value: {{ required "spool.loadDlqTopic is required" .Values.spool.loadDlqTopic | quote }}
+{{- range $key, $value := dict "TENANT" .Values.spool.tenant "LEASE_SECONDS" .Values.spool.leaseSeconds "PROCESSING_SECONDS" .Values.spool.processingSeconds "MAX_ATTEMPTS" .Values.spool.maxAttempts "MONGO_DOCUMENTS_PER_SECOND" .Values.spool.mongoDocumentsPerSecond }}
+- name: SPOOL_{{ $key }}
+  value: {{ $value | quote }}
+{{- end }}
 {{- end -}}

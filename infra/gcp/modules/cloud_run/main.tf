@@ -22,7 +22,7 @@ resource "google_cloud_run_v2_service" "main" {
   name                = var.name
   location            = var.region
   deletion_protection = var.deletion_protection
-  ingress             = var.worker ? "INGRESS_TRAFFIC_INTERNAL_ONLY" : "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+  ingress             = var.worker ? "INGRESS_TRAFFIC_INTERNAL_ONLY" : "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account                  = var.service_account
@@ -96,9 +96,8 @@ resource "google_cloud_run_v2_service" "main" {
   }
 }
 
-# The ALB has no end-user Google identity; Auth0 protects the application API.
-# Ingress above blocks external clients from bypassing the ALB via run.app.
-resource "google_cloud_run_v2_service_iam_member" "edge" {
+# Browsers and agents use Auth0, not Google IAM tokens.
+resource "google_cloud_run_v2_service_iam_member" "public" {
   count    = var.worker ? 0 : 1
   location = var.region
   name     = google_cloud_run_v2_service.main.name
@@ -115,6 +114,6 @@ output "runtime_policy" {
     cpu_idle        = google_cloud_run_v2_service.main.template[0].containers[0].resources[0].cpu_idle
     minimum         = google_cloud_run_v2_service.main.template[0].scaling[0].min_instance_count
     maximum         = google_cloud_run_v2_service.main.template[0].scaling[0].max_instance_count
-    public_invokers = google_cloud_run_v2_service_iam_member.edge[*].member
+    public_invokers = google_cloud_run_v2_service_iam_member.public[*].member
   }
 }

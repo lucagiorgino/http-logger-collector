@@ -99,13 +99,9 @@ def test_startup_creates_and_validates_time_series_collection(mongo, creation_er
 
 
 @pytest.mark.parametrize("already_stored", [1, 2])
-@pytest.mark.parametrize("legacy", [False, True])
-def test_queued_batch_retry_skips_records_already_majority_persisted(mongo, already_stored, legacy):
+def test_queued_batch_retry_skips_records_already_majority_persisted(mongo, already_stored):
     attribution = {"batch_id": "batch-123"}
-    documents = [
-        {"_id": ObjectId(), **(attribution if legacy else {"ingestion": attribution})}
-        for _ in range(2)
-    ]
+    documents = [{"_id": ObjectId(), "ingestion": attribution} for _ in range(2)]
     mongo.traffic_logs = Mock()
     cursor = Mock()
     cursor.to_list = AsyncMock(return_value=documents[:already_stored])
@@ -114,7 +110,7 @@ def test_queued_batch_retry_skips_records_already_majority_persisted(mongo, alre
     mongo.insert_traffic_logs = AsyncMock()
     asyncio.run(mongo.insert_queued_traffic_logs(documents))
     assert collection.find.call_args.args[0] == {
-        ("batch_id" if legacy else "ingestion.batch_id"): "batch-123",
+        "ingestion.batch_id": "batch-123",
         "_id": {"$in": [document["_id"] for document in documents]},
     }
     if already_stored == 1:

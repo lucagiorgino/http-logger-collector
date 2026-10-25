@@ -56,23 +56,26 @@ externalMongo:
   existingSecret: ""
   uriKey: MONGO_URI
 
-externalRedis:
-  existingSecret: ""
-  urlKey: REDIS_URL
-
-queue:
-  stream: traffic-log-batches
-  group: mongo-writers
-  maxBatches: 10000
-  socketTimeoutSeconds: 3
-  aofTimeoutMs: 2000
-
-worker:
-  replicaCount: 1
-  reclaimIdleMs: 60000
-  writeTimeoutSeconds: 30
-  retrySeconds: 1
-  terminationGracePeriodSeconds: 60
+spool:
+  bucket: ""
+  subscription: ""
+  eventTopic: ""
+  silverTopic: ""
+  silverSubscription: ""
+  parseDlqTopic: ""
+  loadDlqTopic: ""
+  tenant: deployment
+  leaseSeconds: 180
+  processingSeconds: 60
+  maxAttempts: 3
+  mongoDocumentsPerSecond: 500
+  parserReplicas: 1
+  loaderReplicas: 1
+  terminationGracePeriodSeconds: 120
+  # GKE Workload Identity annotations, e.g. iam.gke.io/gcp-service-account.
+  # API and parser share the existing API SA; loader has a separate SA and no OpenBao token.
+  apiServiceAccountAnnotations: {}
+  loaderServiceAccountAnnotations: {}
   resources:
     requests:
       cpu: 100m
@@ -80,23 +83,6 @@ worker:
     limits:
       cpu: "1"
       memory: 512Mi
-
-redis:
-  # Development only: unauthenticated, no TLS. Production uses externalRedis.
-  enabled: false
-  image: redis:7.4
-  port: 6379
-  maxmemory: 192mb
-  persistence:
-    size: 2Gi
-    storageClass: ""
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 256Mi
 
 service:
   port: 9090

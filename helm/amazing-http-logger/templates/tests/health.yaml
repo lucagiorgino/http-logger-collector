@@ -35,7 +35,8 @@ spec:
               assert json.load(response) == {"status": "ok"}
           with urllib.request.urlopen(base + "/openapi.json", timeout=10) as response:
               paths = json.load(response)["paths"]
-          assert "/api/v1/traffic-log-batches" in paths
+          assert "/api/v1/traffic-log-uploads" in paths
+          assert "/api/v1/traffic-log-uploads/{upload_id}" in paths
           assert "/api/v1/traffic-logs" in paths
           assert "/api/v1/devices/{device_id}/configuration" in paths
           assert "/api/v1/devices/{device_id}/configuration-status" in paths

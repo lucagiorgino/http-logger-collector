@@ -18,7 +18,7 @@ from starlette.responses import JSONResponse
 from app.core.storage_encryption import StorageEncryption
 from app.schemas.traffic import TrafficLogRequest
 from app.schemas.workspace import StoragePolicy
-from infra.gcp.runtime import configuration, openbao, provision_keyset, worker
+from infra.gcp.runtime import configuration, openbao, provision_keyset, spool
 
 
 class FakeKMS:
@@ -168,34 +168,15 @@ def test_cloud_rpc_errors_are_sanitized(cloud_storage):
 
 
 @pytest.mark.parametrize(
-    "redis_url,mongo_uri,valid",
+    "mongo_uri,valid",
     [
-        (
-            "rediss://host:6379/0?ssl_check_hostname=true",
-            "mongodb://localhost/?tls=true",
-            True,
-        ),
-        ("redis://host:6379/0", "mongodb://localhost/?tls=true", False),
-        ("rediss://host:6379/0", "mongodb://localhost/?tls=true", False),
-        (
-            "rediss://host:6379/0?ssl_check_hostname=true&ssl_cert_reqs=none",
-            "mongodb://localhost/?tls=true",
-            False,
-        ),
-        (
-            "rediss://host:6379/0?ssl_check_hostname=true",
-            "mongodb://localhost/?tls=true&tlsInsecure=true",
-            False,
-        ),
-        (
-            "rediss://host:6379/0?ssl_check_hostname=true",
-            "mongodb://localhost/",
-            False,
-        ),
+        ("mongodb://localhost/?tls=true", True),
+        ("mongodb://localhost/?tls=true&tlsInsecure=true", False),
+        ("mongodb://localhost/?tls=true&tlsAllowInvalidHostnames=true", False),
+        ("mongodb://localhost/", False),
     ],
 )
-def test_cloud_connections_require_verified_tls(monkeypatch, redis_url, mongo_uri, valid):
-    monkeypatch.setattr(configuration.settings, "redis_url", redis_url)
+def test_cloud_connections_require_verified_tls(monkeypatch, mongo_uri, valid):
     monkeypatch.setattr(configuration.settings, "mongo_uri", mongo_uri)
     if valid:
         configuration.validate_cloud_connections()
@@ -204,13 +185,28 @@ def test_cloud_connections_require_verified_tls(monkeypatch, redis_url, mongo_ur
             configuration.validate_cloud_connections()
 
 
-@pytest.mark.parametrize("trusted", [True, False])
-def test_cloud_edge_ignores_spoofed_forwarding_headers(monkeypatch, trusted):
+@pytest.mark.parametrize(
+    "forwarded,protocols,address",
+    [
+        ([b"203.0.113.42"], [b"https"], "203.0.113.42"),
+        ([b"spoofed, 203.0.113.42"], [b"https"], "203.0.113.42"),
+        ([b"198.51.100.1, 2001:db8::42"], [b"https"], "2001:db8::42"),
+        ([], [b"https"], None),
+        ([b"not-an-ip"], [b"https"], None),
+        ([b"203.0.113.42, "], [b"https"], None),
+        ([b"203.0.113.42", b"198.51.100.1"], [b"https"], None),
+        ([b"203.0.113.42"], [b"http"], None),
+        ([b"203.0.113.42"], [], None),
+        ([b"203.0.113.42"], [b"https", b"http"], None),
+    ],
+)
+def test_cloud_run_headers_reject_spoofing_and_insecure_transport(
+    monkeypatch, forwarded, protocols, address
+):
     monkeypatch.setattr(configuration.settings, "auth0_domain", "tenant.example.com")
     monkeypatch.setattr(configuration.settings, "auth0_audience", "https://logs.example.com/api")
     from infra.gcp.runtime import api
 
-    monkeypatch.setenv("GCP_EDGE_IP", "198.51.100.1")
     observed = {}
     messages = []
 
@@ -218,20 +214,19 @@ def test_cloud_edge_ignores_spoofed_forwarding_headers(monkeypatch, trusted):
         observed.update(scope)
         await JSONResponse({"ok": True})(scope, receive, send)
 
-    headers = [(b"x-forwarded-for", b"spoofed"), (b"x-forwarded-proto", b"https")]
-    if trusted:
-        headers.extend(
-            [
-                (b"x-ermes-client-ip", b"203.0.113.42"),
-                (b"x-ermes-edge-ip", b"198.51.100.1"),
-            ]
-        )
+    headers = [
+        (b"forwarded", b"for=198.51.100.99;proto=https"),
+        (b"x-ermes-client-ip", b"198.51.100.99"),
+        (b"x-ermes-edge-ip", b"198.51.100.1"),
+    ]
+    headers.extend((b"x-forwarded-for", value) for value in forwarded)
+    headers.extend((b"x-forwarded-proto", value) for value in protocols)
 
     async def run():
         async def send(message):
             messages.append(message)
 
-        await api.EdgeHeaders(application)(
+        await api.CloudRunHeaders(application)(
             {
                 "type": "http",
                 "path": "/api/v1/me",
@@ -244,57 +239,90 @@ def test_cloud_edge_ignores_spoofed_forwarding_headers(monkeypatch, trusted):
         )
 
     asyncio.run(run())
-    assert messages[0]["status"] == (200 if trusted else 400)
-    if trusted:
-        assert observed["client"] == ("203.0.113.42", 0)
+    assert messages[0]["status"] == (200 if address else 400)
+    if address:
+        assert observed["client"] == (address, 0)
         assert observed["scheme"] == "https"
+        assert (b"strict-transport-security", b"max-age=31536000") in messages[0]["headers"]
     else:
         assert not observed
+
+
+def test_cloud_run_liveness_does_not_require_forwarding_headers():
+    from infra.gcp.runtime import api
+
+    messages = []
+
+    async def application(scope, receive, send):
+        await JSONResponse({"status": "ok"})(scope, receive, send)
+
+    async def run():
+        async def send(message):
+            messages.append(message)
+
+        await api.CloudRunHeaders(application)(
+            {"type": "http", "path": "/health", "headers": []}, None, send
+        )
+
+    asyncio.run(run())
+    assert messages[0]["status"] == 200
+
+
+def test_cloud_run_https_keeps_api_authentication(monkeypatch):
+    monkeypatch.setattr(configuration.settings, "auth0_domain", "tenant.example.com")
+    monkeypatch.setattr(configuration.settings, "auth0_audience", "https://logs.example.com/api")
+    from httpx import ASGITransport, AsyncClient
+
+    from infra.gcp.runtime import api
+
+    async def run():
+        async with AsyncClient(
+            transport=ASGITransport(app=api.app), base_url="https://api.example.com"
+        ) as client:
+            response = await client.get(
+                "/api/v1/me",
+                headers={"X-Forwarded-Proto": "https", "X-Forwarded-For": "203.0.113.42"},
+            )
+            assert response.status_code == 401
+            assert response.headers["strict-transport-security"] == "max-age=31536000"
+
+    asyncio.run(run())
 
 
 def test_worker_liveness_detects_dead_consumer():
     async def run():
         task = asyncio.create_task(asyncio.sleep(0))
         await task
-        worker.app.state.consumer = task
+        spool.app.state.consumer = task
         with pytest.raises(HTTPException) as error:
-            await worker.health()
+            await spool.health()
         assert error.value.status_code == 503
 
     asyncio.run(run())
 
 
-def test_worker_supervisor_starts_consuming_and_closes_resources(monkeypatch):
+@pytest.mark.parametrize("stage", ["parse", "load"])
+def test_worker_supervisor_starts_consuming_and_cancels_on_shutdown(monkeypatch, stage):
     calls = []
-
-    class Resource:
-        async def ensure_indexes(self):
-            calls.append("indexes")
-
-        async def initialize(self):
-            calls.append("queue")
-
-        async def close(self):
-            calls.append("closed")
 
     async def run():
         started = asyncio.Event()
 
-        async def consume(queue, repository):
+        async def operate(action, upload_id, *, manage_signals):
+            assert action == stage and upload_id is None and manage_signals is False
             started.set()
             try:
                 await asyncio.Event().wait()
             finally:
                 calls.append("cancelled")
 
-        monkeypatch.setattr(worker, "validate_cloud_connections", lambda: None)
-        monkeypatch.setattr(worker, "RedisStreamQueue", Resource)
-        monkeypatch.setattr(worker, "MongoRepository", Resource)
-        monkeypatch.setattr(worker, "consume", consume)
-        async with worker.lifespan(worker.app):
+        monkeypatch.setenv("SPOOL_WORKER_STAGE", stage)
+        monkeypatch.setattr(spool, "validate_cloud_connections", lambda: None)
+        monkeypatch.setattr(spool, "operate", operate)
+        async with spool.lifespan(spool.app):
             await asyncio.wait_for(started.wait(), timeout=1)
-            assert await worker.health() == {"status": "ok"}
-        assert calls == ["indexes", "queue", "cancelled", "closed", "closed"]
+            assert await spool.health() == {"status": "ok"}
+        assert calls == ["cancelled"]
 
     asyncio.run(run())
 

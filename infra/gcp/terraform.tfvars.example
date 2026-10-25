@@ -1,9 +1,13 @@
-project_id      = "your-gcp-project"
-region          = "europe-west1"
-environment     = "production"
-domain          = "logs.example.com"
-auth0_domain    = "your-tenant.eu.auth0.com"
-auth0_audience  = "https://logs.example.com/api"
+project_id  = "your-gcp-project"
+region      = "europe-west1"
+environment = "production"
+
+# Cloud Run generates frontend/API HTTPS URLs; no application domain is needed.
+# Auth0 tenant hostname, not the frontend/backend run.app hostname.
+auth0_domain = "your-tenant.us.auth0.com"
+# Exact Auth0 Dashboard > APIs > Identifier. Need not resolve or match run.app URLs.
+# Reuse your existing identifier when moving the application to GCP.
+auth0_audience  = "https://api.example.com/http-logger"
 auth0_client_id = "your-regular-web-application-client-id"
 
 # First apply false. Publish images and populate secrets before setting true.
@@ -14,13 +18,17 @@ mongo_db_name      = "http_logger_production"
 
 secret_versions = {
   mongo_uri           = "1"
-  redis_url           = "1"
   ec_keyset           = "1"
   auth0_client_secret = "1"
   auth0_session       = "1"
 }
 
-worker_instances         = 2
-max_instances            = 10
-deletion_protection      = true
-enable_memorystore_cache = false # Not a compatible ingestion queue; see README.
+worker_instances                   = 2
+max_instances                      = 10
+deletion_protection                = true
+spool_mongo_documents_per_second   = 500     # Per spool loader instance, not a deployment-wide cap.
+spool_message_retention_seconds    = 1209600 # 14 days; raw uploads survive notification expiry.
+spool_backlog_alert_batches        = 500
+spool_oldest_unacked_alert_seconds = 3600
+# Existing Cloud Monitoring channel resource names for DLQ/backlog alerts:
+notification_channels = []

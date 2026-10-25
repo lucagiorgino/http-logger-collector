@@ -1,19 +1,14 @@
-import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from ipaddress import ip_address
 from typing import Any
-from uuid import uuid4
 
 from bson import ObjectId
 from fastapi import HTTPException, Request
 
 from app.core.security import redact_sensitive_headers
-from app.core.storage_encryption import StorageEncryption
-from app.schemas.traffic import BatchReceipt, TrafficLogRequest
-from app.schemas.workspace import StoragePolicy
-from app.services.ingestion import IngestionPublisher
+from app.schemas.traffic import TrafficLogRequest
 
 DEVICE_ID_CLAIM = "https://amazing-http-logger/device_id"
 
@@ -83,19 +78,6 @@ def ingestion_context(claims: dict[str, Any], request: Request) -> IngestionCont
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid client network address") from None
     return IngestionContext(identity=identity, source_ip=source_ip)
-
-
-async def ingest_traffic_logs(
-    payloads: list[TrafficLogRequest],
-    context: IngestionContext,
-    publisher: IngestionPublisher,
-    policy: StoragePolicy,
-    storage: StorageEncryption,
-) -> BatchReceipt:
-    batch_id = str(uuid4())
-    documents = await asyncio.to_thread(normalize_batch, payloads, batch_id, context)
-    await storage.protect(documents, payloads, policy)
-    return await publisher.publish(batch_id, documents)
 
 
 def normalize_batch(

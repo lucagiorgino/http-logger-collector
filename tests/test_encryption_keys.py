@@ -84,12 +84,15 @@ def test_configured_suite_drives_keys_client_configuration_and_ingestion(
     curve,
     algorithm,
     encryption,
+    upload_harness,
+    drain_uploads,
 ):
     monkeypatch.setattr(settings, "encryption_curve", curve)
     monkeypatch.setattr(settings, "encryption_key_algorithm", algorithm)
     monkeypatch.setattr(settings, "encryption_content_algorithm", encryption)
     key_document["keys"] = [generate_key("current")]
     keys = get_encryption_keys()
+    upload_harness.parser.keys = keys
     app.dependency_overrides[get_request_encryption_keys] = lambda: keys
     repository.get_device_configuration.return_value = {"version": 1, "encryption_mode": "required"}
     response = encrypted_client.get("/api/v1/devices/device-456/configuration")
@@ -105,12 +108,13 @@ def test_configured_suite_drives_keys_client_configuration_and_ingestion(
         registry=keys.registry,
     )
     response = encrypted_client.post(
-        "/api/v1/traffic-log-batches",
+        "/api/v1/traffic-log-uploads",
         content=body,
         headers={"Content-Type": "application/jose"},
     )
-    assert response.status_code == 200
-    repository.insert_traffic_logs.assert_awaited_once()
+    assert response.status_code == 202
+    drain_uploads()
+    repository.insert_queued_traffic_logs.assert_awaited_once()
     wrong_encryption = "A256GCM" if encryption != "A256GCM" else "A128GCM"
     wrong = jwe.JWERegistry(algorithms=[algorithm, wrong_encryption])
     unsupported = jwe.encrypt_compact(

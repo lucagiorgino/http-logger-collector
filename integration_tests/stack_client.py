@@ -20,6 +20,7 @@ from joserfc.jwk import ECKey
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationInfo, field_validator
 
 LOGS_PER_DEVICE = 3
+DEFAULT_BASE_URL = "http://localhost:8080"
 
 
 class StackTestFailure(AssertionError):
@@ -38,7 +39,7 @@ class DeviceCredentials(BaseModel):
 class StackSettings(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
-    base_url: str
+    base_url: str = DEFAULT_BASE_URL
     token_url: str
     audience: str = Field(min_length=1)
     plaintext: DeviceCredentials
@@ -109,7 +110,7 @@ def load_settings() -> StackSettings | None:
         )
 
     settings = StackSettings(
-        base_url=required("BASE_URL"),
+        base_url=values.get("STACK_TEST_BASE_URL", DEFAULT_BASE_URL),
         token_url=required("TOKEN_URL"),
         audience=required("AUDIENCE"),
         plaintext=credentials("PLAINTEXT", False),
@@ -251,7 +252,7 @@ def run_device(
                 call(
                     client,
                     "POST",
-                    "api/v1/traffic-log-batches",
+                    "api/v1/traffic-log-uploads",
                     expected=403,
                     content=compressed,
                     headers=headers,
@@ -273,14 +274,27 @@ def run_device(
         receipt = call(
             client,
             "POST",
-            "api/v1/traffic-log-batches",
-            expected=200,
+            "api/v1/traffic-log-uploads",
+            expected=202,
             content=body,
             headers=headers,
         )
-        if receipt["accepted_count"] != len(logs) or receipt["status"] != "queued":
-            raise StackTestFailure("Ingestion did not acknowledge the complete batch")
+        upload_id = receipt["upload_id"]
         deadline = monotonic() + settings.visibility_timeout
+        while True:
+            status = call(client, "GET", f"api/v1/traffic-log-uploads/{upload_id}")
+            if status["status"] in {"parse_failed", "load_failed"}:
+                raise StackTestFailure(f"Upload ended in {status['status']}; inspect receipt/DLQ")
+            if status["status"] == "stored":
+                if status["accepted_count"] != len(logs):
+                    raise StackTestFailure("Stored upload has an unexpected accepted count")
+                break
+            if monotonic() >= deadline:
+                raise StackTestFailure(
+                    "Upload did not reach stored before timeout; ensure the parser and loader "
+                    "workers are running and inspect the receipt/DLQs"
+                )
+            sleep(0.1)
         while True:
             records = []
             params = {
@@ -291,7 +305,7 @@ def run_device(
             while True:
                 page = call(client, "GET", "api/v1/traffic-logs", params=params)
                 records.extend(
-                    record for record in page["items"] if record["batch_id"] == receipt["batch_id"]
+                    record for record in page["items"] if record["batch_id"] == upload_id
                 )
                 cursor = page.get("next_cursor")
                 if not cursor or len(records) >= len(logs) or monotonic() >= deadline:
@@ -310,7 +324,7 @@ def run_device(
             original = expected[record["url"]]
             assert record["device_id"] == device_id
             assert "user_id" not in record
-            assert record["batch_id"] == receipt["batch_id"]
+            assert record["batch_id"] == upload_id
             assert record["method"] == "GET"
             for field in (
                 "destination_ip",

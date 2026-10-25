@@ -1,45 +1,44 @@
 name: ${COMPOSE_PROJECT:-amazing-http-logger-dev}
 
+x-proxy: &proxy
+  image: nginxinc/nginx-unprivileged:1.28-alpine
+  restart: unless-stopped
+  mem_limit: 128m
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  environment: &proxy-environment
+    PROXY_BIND_HOST: 0.0.0.0
+    PROXY_PORT: ${PROXY_PORT:-8080}
+    PROXY_EXTERNAL_SCHEME: ${PROXY_EXTERNAL_SCHEME:-http}
+    APP_PORT: ${APP_PORT:-9090}
+    FRONTEND_PORT: ${FRONTEND_PORT:-3000}
+    PROXY_UPSTREAM_HOST: host.docker.internal
+    NGINX_ENVSUBST_FILTER: "^(PROXY_BIND_HOST|PROXY_PORT|PROXY_EXTERNAL_SCHEME|PROXY_UPSTREAM_HOST|APP_PORT|FRONTEND_PORT)$$"
+  volumes:
+    - ./docker/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O /dev/null http://$${PROXY_BIND_HOST}:$${PROXY_PORT}/proxy-health"]
+    interval: 2s
+    timeout: 5s
+    retries: 15
+
 services:
   proxy:
-    image: nginxinc/nginx-unprivileged:1.28-alpine
+    <<: *proxy
+    profiles: [dev, proxy]
     network_mode: bridge
     ports:
       - "${PROXY_BIND_HOST:-127.0.0.1}:${PROXY_PORT:-8080}:${PROXY_PORT:-8080}"
-    restart: unless-stopped
-    mem_limit: 128m
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+  proxy-host:
+    <<: *proxy
+    profiles: [proxy-host]
+    network_mode: host
     environment:
-      PROXY_BIND_HOST: 0.0.0.0
-      PROXY_PORT: ${PROXY_PORT:-8080}
-      PROXY_EXTERNAL_SCHEME: ${PROXY_EXTERNAL_SCHEME:-http}
-      APP_PORT: ${APP_PORT:-9090}
-      FRONTEND_PORT: ${FRONTEND_PORT:-3000}
-      PROXY_UPSTREAM_HOST: host.docker.internal
-      NGINX_ENVSUBST_FILTER: "^(PROXY_BIND_HOST|PROXY_PORT|PROXY_EXTERNAL_SCHEME|PROXY_UPSTREAM_HOST|APP_PORT|FRONTEND_PORT)$$"
-    volumes:
-      - ./docker/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://$${PROXY_BIND_HOST}:$${PROXY_PORT}/proxy-health"]
-      interval: 2s
-      timeout: 5s
-      retries: 15
-  redis:
-    image: redis:7.4
-    command: ["redis-server", "--bind", "0.0.0.0", "--protected-mode", "no", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory", "192mb", "--maxmemory-policy", "noeviction"]
-    restart: unless-stopped
-    mem_limit: 256m
-    ports:
-      - "127.0.0.1:${REDIS_PORT:-28379}:6379"
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
+      <<: *proxy-environment
+      PROXY_BIND_HOST: ${PROXY_BIND_HOST:-127.0.0.1}
+      PROXY_UPSTREAM_HOST: 127.0.0.1
   openbao:
+    profiles: [dev]
     image: ${OPENBAO_IMAGE:-ghcr.io/openbao/openbao:2.7.1}
     user: "${OPENBAO_UID:-1000}:${OPENBAO_GID:-1000}"
     entrypoint: ["/bin/sh", "-ec"]
@@ -63,6 +62,7 @@ services:
       timeout: 5s
       retries: 30
   mongo:
+    profiles: [dev]
     image: ${MONGO_IMAGE:-mongo:7}
     command: ["mongod", "--replSet", "${MONGO_REPLICA_SET:-rs0}", "--bind_ip_all", "--port", "${MONGO_PORT:-28017}"]
     restart: unless-stopped
@@ -95,11 +95,94 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+  pubsub:
+    profiles: [dev, spool, tools]
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8681", "--project=logger-local"]
+    ports:
+      - "127.0.0.1:28681:8681"
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8681"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+  spool-bridge:
+    profiles: [dev, spool, tools]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: amazing-http-logger-spool-dev
+    command: ["python", "-m", "app.spool_dev", "bridge"]
+    environment:
+      APP_ENV: development
+      PUBSUB_EMULATOR_HOST: pubsub:8681
+      SPOOL_EVENT_TOPIC: projects/logger-local/topics/uploads
+    depends_on:
+      pubsub:
+        condition: service_healthy
+    # No published port: only MinIO can send notifications on the Compose network.
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9091/health')"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  minio:
+    profiles: [dev, spool, tools]
+    build:
+      context: .
+      dockerfile: docker/minio.Dockerfile
+      target: minio
+    image: amazing-http-logger-minio-dev
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio-access-key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio-secret-key
+      MINIO_NOTIFY_WEBHOOK_ENABLE_spool: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_spool: http://spool-bridge:9091/events
+      MINIO_NOTIFY_WEBHOOK_QUEUE_DIR_spool: /data/notifications
+    secrets: [minio-access-key, minio-secret-key]
+    depends_on:
+      spool-bridge:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:29000:9000"
+      - "127.0.0.1:29001:9001"
+    volumes:
+      - minio-spool:/data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  minio-init:
+    profiles: [tools]
+    build:
+      context: .
+      dockerfile: docker/minio.Dockerfile
+      target: mc
+    image: amazing-http-logger-mc-dev
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$$(cat /run/secrets/minio-access-key)" "$$(cat /run/secrets/minio-secret-key)" >/dev/null
+        mc mb --ignore-existing local/traffic-uploads
+        mc event add local/traffic-uploads arn:minio:sqs::spool:webhook --event put --prefix raw/ --suffix .upload --ignore-existing
+    secrets: [minio-access-key, minio-secret-key]
+    depends_on:
+      minio:
+        condition: service_healthy
 
 volumes:
   mongo-data:
-  redis-data:
+  minio-spool:
 
 secrets:
   openbao-dev-root-token:
     file: ${OPENBAO_DEV_ROOT_TOKEN_FILE:-.secrets/openbao-dev-root-token}
+  minio-access-key:
+    file: ${SPOOL_MINIO_ACCESS_KEY_FILE:-.secrets/minio-access-key}
+  minio-secret-key:
+    file: ${SPOOL_MINIO_SECRET_KEY_FILE:-.secrets/minio-secret-key}

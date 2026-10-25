@@ -7,9 +7,10 @@ from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import RequestResponseEndpoint
 
 from app.api.auth import router as auth_router
-from app.api.batches import router as batches_router
 from app.api.devices import router as devices_router
+from app.api.status import router as status_router
 from app.api.traffic_logs import router as traffic_logs_router
+from app.api.uploads import router as uploads_router
 from app.api.workspace import router as workspace_router
 from app.core.auth import AuthenticationUnavailable
 from app.core.config import settings
@@ -17,18 +18,19 @@ from app.core.encryption import get_encryption_keys
 from app.core.openbao import AsyncOpenBaoClient, KMSUnavailable
 from app.core.storage_encryption import StorageEncryption
 from app.db.mongo import MongoRepository, PersistenceError
-from app.services.redis_queue import RedisStreamQueue
+from app.services.upload_cloud import UploadCloud
+from app.services.upload_state import UploadStateStore
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings.validate_spool()
     app.state.encryption_keys = get_encryption_keys()
-    queue = RedisStreamQueue()
     repository = MongoRepository()
     app.state.mongo_repository = repository
-    app.state.ingestion_queue = queue
+    cloud = None
     try:
         async with AsyncOpenBaoClient() as kms:
             storage = StorageEncryption(kms)
@@ -36,11 +38,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await kms.authenticate()
             app.state.storage_encryption = storage
             await repository.ensure_indexes()
-            await queue.initialize()
+            cloud = UploadCloud()
+            store = UploadStateStore(repository.database)
+            await store.initialize()
+            app.state.upload_cloud = cloud
+            app.state.upload_store = store
             yield
     finally:
         try:
-            await queue.close()
+            if cloud is not None:
+                await cloud.close()
         finally:
             await repository.close()
 
@@ -60,10 +67,11 @@ app = FastAPI(
 )
 
 app.include_router(auth_router)
-app.include_router(batches_router)
 app.include_router(traffic_logs_router)
 app.include_router(devices_router)
 app.include_router(workspace_router)
+app.include_router(uploads_router)
+app.include_router(status_router)
 
 
 @app.middleware("http")
@@ -78,7 +86,13 @@ async def require_secure_transport(
         return JSONResponse(status_code=400, content={"detail": "HTTPS is required"})
     response = await call_next(request)
     if request.url.path.startswith(
-        ("/api/v1/devices", "/api/v1/workspace/", "/api/v1/traffic-logs")
+        (
+            "/api/v1/devices",
+            "/api/v1/workspace/",
+            "/api/v1/traffic-logs",
+            "/api/v1/traffic-log-uploads",
+            "/api/v1/status",
+        )
     ):
         response.headers["Cache-Control"] = "no-store"
     return response

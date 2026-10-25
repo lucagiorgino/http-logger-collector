@@ -17,15 +17,13 @@ from app.core.auth import require_bearer_token
 from app.core.config import settings
 from app.core.encryption import get_encryption_keys
 from app.db.mongo import MongoRepository, PersistenceError
-from app.deps import get_ingestion_publisher, get_mongo_repository, get_request_encryption_keys
+from app.deps import get_mongo_repository, get_request_encryption_keys
 from app.main import app
 from app.schemas.traffic import TrafficLogRequest
-from app.services.ingestion import MongoIngestionPublisher
 from app.services.traffic_service import (
     DEVICE_ID_CLAIM,
     ClientIdentity,
     IngestionContext,
-    ingest_traffic_logs,
 )
 
 
@@ -51,7 +49,7 @@ class RoutingListener(CommandListener):
     not os.getenv("MONGO_TEST_URI"), reason="Set MONGO_TEST_URI for device registration"
 )
 def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
-    monkeypatch, encryption_keys, traffic_payload, storage_encryption
+    monkeypatch, encryption_keys, traffic_payload, storage_encryption, upload_harness
 ):
     from app.core.storage_encryption import get_storage_encryption
 
@@ -70,9 +68,8 @@ def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
         original_overrides = app.dependency_overrides.copy()
         app.dependency_overrides[require_bearer_token] = lambda: claims.copy()
         app.dependency_overrides[get_mongo_repository] = lambda: repository
-        app.dependency_overrides[get_ingestion_publisher] = lambda: MongoIngestionPublisher(
-            repository
-        )
+        upload_harness.loader.repository = repository
+        upload_harness.parser.keys = encryption_keys
         app.dependency_overrides[get_request_encryption_keys] = lambda: encryption_keys
         app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
         try:
@@ -108,7 +105,7 @@ def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
                 upload_headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
                 assert (
                     await client.post(
-                        "/api/v1/traffic-log-batches", content=gzip_batch, headers=upload_headers
+                        "/api/v1/traffic-log-uploads", content=gzip_batch, headers=upload_headers
                     )
                 ).status_code == 403
                 claims["permissions"] = ["manage:devices"]
@@ -120,9 +117,10 @@ def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
                 assert response.json()["name"] == payload["name"]
                 assert (
                     await client.post(
-                        "/api/v1/traffic-log-batches", content=gzip_batch, headers=upload_headers
+                        "/api/v1/traffic-log-uploads", content=gzip_batch, headers=upload_headers
                     )
-                ).status_code == 200
+                ).status_code == 202
+                await upload_harness.drain()
                 assert (
                     await client.post(
                         url, json={"device_id": "device-789", "name": "Second device"}
@@ -235,7 +233,7 @@ def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
     ],
 )
 def test_time_series_ingestion_and_analysis_routing(
-    monkeypatch, allow_primary, uri, storage_encryption
+    monkeypatch, allow_primary, uri, storage_encryption, upload_harness
 ):
     from app.schemas.workspace import StoragePolicy
 
@@ -296,14 +294,14 @@ def test_time_series_ingestion_and_analysis_routing(
                 body="private body",
             )
             context = IngestionContext(ClientIdentity("device", "oauth-client"), "127.0.0.1")
-            receipt = await ingest_traffic_logs(
+            upload_harness.loader.repository = repository
+            upload_id = await upload_harness.enqueue(
                 [payload, payload],
                 context,
-                MongoIngestionPublisher(repository),
                 StoragePolicy(),
-                storage_encryption,
             )
-            assert receipt.status == "stored"
+            await upload_harness.drain()
+            assert upload_harness.store.records[upload_id]["status"] == "stored"
             deadline = monotonic() + 15
             while True:
                 documents = await repository.list_traffic_logs(
@@ -319,9 +317,7 @@ def test_time_series_ingestion_and_analysis_routing(
                     pytest.fail("Acknowledged logs did not reach the configured analysis node")
                 await asyncio.sleep(0.1)
             assert len({document["_id"] for document in documents}) == 2
-            assert all(
-                document["ingestion"]["batch_id"] == receipt.batch_id for document in documents
-            )
+            assert all(document["ingestion"]["batch_id"] == upload_id for document in documents)
             assert documents[0]["metadata"] == {"device_id": "device", "suspicious": False}
             assert documents[0]["ingestion"]["client_id"] == "oauth-client"
             assert documents[0]["ingestion"]["source_ip"] == "127.0.0.1"
@@ -332,7 +328,7 @@ def test_time_series_ingestion_and_analysis_routing(
             assert documents[0]["logdata"]["request_headers"]["Authorization"] == "[ENCRYPTED]"
             assert "body" not in documents[0]["logdata"]
             batch_records = (
-                await repository.traffic_logs.find({"ingestion.batch_id": receipt.batch_id})
+                await repository.traffic_logs.find({"ingestion.batch_id": upload_id})
                 .hint("ingestion_batch_record")
                 .to_list(length=None)
             )
@@ -373,13 +369,13 @@ def test_time_series_ingestion_and_analysis_routing(
             )
             with pytest.raises(PersistenceError, match="replica"):
                 await repository.get_traffic_log(documents[0]["_id"], device_id="device")
-            await ingest_traffic_logs(
+            upload_id = await upload_harness.enqueue(
                 [payload],
                 context,
-                MongoIngestionPublisher(repository),
                 StoragePolicy(),
-                storage_encryption,
             )
+            await upload_harness.drain()
+            assert upload_harness.store.records[upload_id]["status"] == "stored"
         finally:
             await repository.client.drop_database(database_name)
             await repository.close()
@@ -402,7 +398,7 @@ def test_time_series_ingestion_and_analysis_routing(
     ],
 )
 def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
-    monkeypatch, encryption_keys, traffic_payload, key_source, storage_encryption
+    monkeypatch, encryption_keys, traffic_payload, key_source, storage_encryption, upload_harness
 ):
     from joserfc import jwe
     from joserfc.jwk import ECKey
@@ -432,13 +428,13 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
         }
         app.dependency_overrides[require_bearer_token] = lambda: claims
         app.dependency_overrides[get_mongo_repository] = lambda: repository
-        app.dependency_overrides[get_ingestion_publisher] = lambda: MongoIngestionPublisher(
-            repository
-        )
+        upload_harness.loader.repository = repository
+        upload_harness.parser.keys = encryption_keys
+        upload_harness.parser.storage = storage_encryption
         app.dependency_overrides[get_request_encryption_keys] = lambda: encryption_keys
         app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
         config_url = "/api/v1/devices/device-456/configuration"
-        upload_url = "/api/v1/traffic-log-batches"
+        upload_url = "/api/v1/traffic-log-uploads"
         try:
             await repository.ensure_indexes()
             async with AsyncClient(
@@ -469,7 +465,8 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
                     content=body,
                     headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
                 )
-                assert response.status_code == 200
+                assert response.status_code == 202
+                await upload_harness.drain()
                 results = await asyncio.gather(
                     *(
                         client.patch(
@@ -516,7 +513,8 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
                 response = await client.post(
                     upload_url, content=envelope, headers={"Content-Type": "application/jose"}
                 )
-                assert response.status_code == 200
+                assert response.status_code == 202
+                await upload_harness.drain()
                 creations = await asyncio.gather(
                     *(
                         client.patch(
@@ -563,6 +561,7 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
     monkeypatch,
     storage_encryption,
     traffic_payload,
+    upload_harness,
 ):
     from app.core.encryption import EncryptionKeys
     from app.core.storage_encryption import get_storage_encryption
@@ -580,9 +579,7 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
             "permissions": ["manage:devices"],
         }
         app.dependency_overrides[get_mongo_repository] = lambda: repository
-        app.dependency_overrides[get_ingestion_publisher] = lambda: MongoIngestionPublisher(
-            repository
-        )
+        upload_harness.loader.repository = repository
         app.dependency_overrides[get_request_encryption_keys] = lambda: EncryptionKeys({})
         app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
         url = "/api/v1/workspace/configuration"
@@ -596,8 +593,9 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
             ) as client:
                 assert (await client.get(url)).json()["version"] == 0
                 assert (
-                    await client.post("/api/v1/traffic-log-batches", content=wire, headers=headers)
-                ).status_code == 200
+                    await client.post("/api/v1/traffic-log-uploads", content=wire, headers=headers)
+                ).status_code == 202
+                await upload_harness.drain()
                 encrypted = await repository.traffic_logs.find_one({})
                 assert traffic_payload["body"] not in repr(encrypted)
                 assert encrypted["logdata"]["request_headers"]["Authorization"] == "[ENCRYPTED]"
@@ -612,8 +610,9 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 assert sorted(response.status_code for response in changes) == [200, 409]
                 assert (await client.get(url)).json()["version"] == 1
                 assert (
-                    await client.post("/api/v1/traffic-log-batches", content=wire, headers=headers)
-                ).status_code == 200
+                    await client.post("/api/v1/traffic-log-uploads", content=wire, headers=headers)
+                ).status_code == 202
+                await upload_harness.drain()
                 plain = await repository.traffic_logs.find_one(
                     {"storage_encryption": {"$exists": False}}
                 )
@@ -650,11 +649,12 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 assert saved.status_code == 200
                 assert all(saved.json()[field] is False for field in discard)
                 uploaded = await client.post(
-                    "/api/v1/traffic-log-batches", content=wire, headers=headers
+                    "/api/v1/traffic-log-uploads", content=wire, headers=headers
                 )
-                assert uploaded.status_code == 200
+                assert uploaded.status_code == 202
+                await upload_harness.drain()
                 discarded = await repository.traffic_logs.find_one(
-                    {"ingestion.batch_id": uploaded.json()["batch_id"]}
+                    {"ingestion.batch_id": uploaded.json()["upload_id"]}
                 )
                 assert "body" not in discarded["logdata"]
                 assert "storage_encryption" not in discarded

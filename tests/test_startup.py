@@ -1,12 +1,15 @@
+import asyncio
 import json
 import os
 import subprocess
 import sys
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fastapi import FastAPI
 
 from app import __main__ as startup
+from app import main as api
 from app.core.config import _env_bool, settings
 
 
@@ -102,16 +105,81 @@ def test_explicit_missing_environment_file_fails(tmp_path):
     assert "ENV_FILE does not exist" in result.stderr
 
 
+@pytest.fixture
+def valid_spool_settings(monkeypatch):
+    for name in (
+        "bucket",
+        "subscription",
+        "parse_dlq_topic",
+        "load_dlq_topic",
+        "event_topic",
+        "silver_topic",
+        "silver_subscription",
+        "tenant",
+    ):
+        monkeypatch.setattr(settings, f"spool_{name}", f"test-{name}")
+    monkeypatch.setattr(settings, "spool_storage_backend", "gcs")
+    monkeypatch.setattr(settings, "spool_endpoint_url", None)
+    monkeypatch.setattr(settings, "spool_lease_seconds", 180)
+    monkeypatch.setattr(settings, "spool_processing_seconds", 60)
+    monkeypatch.setattr(settings, "spool_max_attempts", 3)
+    monkeypatch.setattr(settings, "spool_mongo_documents_per_second", 1000)
+    monkeypatch.setattr(settings, "worker_retry_seconds", 1)
+    monkeypatch.delenv("PUBSUB_EMULATOR_HOST", raising=False)
+    settings.validate_spool()
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("redis_max_batches", 0),
-        ("redis_socket_timeout_seconds", float("nan")),
-        ("redis_aof_timeout_ms", 3000),
-        ("worker_reclaim_idle_ms", 30000),
+        ("spool_max_attempts", 0),
+        ("spool_mongo_documents_per_second", 0),
+        ("spool_processing_seconds", 0),
+        ("worker_retry_seconds", float("nan")),
     ],
 )
-def test_invalid_ingestion_limits_fail_before_accepting_batches(monkeypatch, name, value):
+def test_invalid_spool_limits_fail_before_accepting_uploads(
+    monkeypatch, valid_spool_settings, name, value
+):
     monkeypatch.setattr(settings, name, value)
-    with pytest.raises(ValueError):
-        settings.validate_ingestion()
+    with pytest.raises(ValueError, match=name.upper()):
+        settings.validate_spool()
+
+
+@pytest.mark.parametrize(
+    "name", ["event_topic", "silver_topic", "parse_dlq_topic", "load_dlq_topic"]
+)
+def test_all_pipeline_topics_are_required(monkeypatch, valid_spool_settings, name):
+    monkeypatch.setattr(settings, f"spool_{name}", "")
+    with pytest.raises(ValueError, match=f"SPOOL_{name.upper()} is required"):
+        settings.validate_spool()
+
+
+def test_collector_startup_initializes_raw_receipts_and_cloud_only(
+    monkeypatch, valid_spool_settings
+):
+    repository, cloud, store, kms = (AsyncMock() for _ in range(4))
+    kms.__aenter__.return_value = kms
+    storage = Mock()
+    monkeypatch.setattr(api, "MongoRepository", Mock(return_value=repository))
+    monkeypatch.setattr(api, "UploadCloud", Mock(return_value=cloud))
+    store_factory = Mock(return_value=store)
+    monkeypatch.setattr(api, "UploadStateStore", store_factory)
+    monkeypatch.setattr(api, "AsyncOpenBaoClient", Mock(return_value=kms))
+    monkeypatch.setattr(api, "StorageEncryption", Mock(return_value=storage))
+    monkeypatch.setattr(api, "get_encryption_keys", Mock())
+    application = FastAPI()
+
+    async def scenario():
+        async with api.lifespan(application):
+            assert application.state.mongo_repository is repository
+            assert application.state.upload_store is store
+            assert application.state.upload_cloud is cloud
+            repository.ensure_indexes.assert_awaited_once()
+            store.initialize.assert_awaited_once()
+            cloud.close.assert_not_awaited()
+        cloud.close.assert_awaited_once()
+        repository.close.assert_awaited_once()
+
+    asyncio.run(scenario())
+    store_factory.assert_called_once_with(repository.database)

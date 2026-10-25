@@ -8,6 +8,7 @@ from uuid import uuid4
 from fake_storage import FakeStorageEncryption
 from fastapi import Header, HTTPException
 from joserfc.jwk import ECKey
+from upload_harness import UploadHarness
 
 from app.core.auth import require_bearer_token
 from app.core.config import settings
@@ -16,7 +17,6 @@ from app.core.storage_encryption import get_storage_encryption
 from app.db.mongo import MongoRepository
 from app.deps import get_request_encryption_keys
 from app.main import app
-from app.services.ingestion import MongoIngestionPublisher
 
 mongo_uri = os.environ["MONGO_TEST_URI"]
 database_name = "dashboard_registration_test_" + uuid4().hex
@@ -41,7 +41,9 @@ def test_identity(authorization: str | None = Header(default=None)):
 async def lifespan(application):
     repository = MongoRepository(uri=mongo_uri, db_name=database_name)
     application.state.mongo_repository = repository
-    application.state.ingestion_queue = MongoIngestionPublisher(repository)
+    uploads = UploadHarness(repository, storage, keys)
+    application.state.upload_store = uploads.store
+    application.state.upload_cloud = uploads.cloud
     try:
         await repository.ensure_indexes()
         for device_id in ("agent-discovered@clients", "literal%40device@clients"):

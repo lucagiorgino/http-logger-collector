@@ -92,9 +92,6 @@ def test_nginx_routes_preserves_uploads_and_replaces_untrusted_forwarding_header
     desktop = "Docker Desktop" in subprocess.check_output(
         ["docker", "info", "--format", "{{.OperatingSystem}}"], text=True
     )
-    compose_files = ["-f", str(root / "docker/docker-compose.yml")]
-    if not desktop:
-        compose_files += ["-f", str(root / "docker/docker-compose.host.yml")]
     name = "logger-proxy-test-" + uuid4().hex
     environment = {
         **os.environ,
@@ -113,14 +110,15 @@ def test_nginx_routes_preserves_uploads_and_replaces_untrusted_forwarding_header
             str(root),
             "--env-file",
             str(root / ".env.example"),
-            *compose_files,
+            "-f",
+            str(root / "docker/docker-compose.yml"),
             "run",
             "--rm",
             "--no-deps",
             "--service-ports",
             "--name",
             name,
-            "proxy",
+            "proxy" if desktop else "proxy-host",
         ],
         env=environment,
         stdout=log,
@@ -179,7 +177,7 @@ def test_nginx_routes_preserves_uploads_and_replaces_untrusted_forwarding_header
                 assert data["forwarded"] is None
             body = gzip.compress(b'{"logs":[{"body":"preserved"}]}')
             data = client.post(
-                "/api/v1/traffic-log-batches",
+                "/api/v1/traffic-log-uploads",
                 content=body,
                 headers={
                     "Content-Type": "application/json",
@@ -190,7 +188,7 @@ def test_nginx_routes_preserves_uploads_and_replaces_untrusted_forwarding_header
             assert data["body_sha256"] == sha256(body).hexdigest()
             envelope = b"protected..iv.ciphertext.tag"
             data = client.post(
-                "/api/v1/traffic-log-batches",
+                "/api/v1/traffic-log-uploads",
                 content=envelope,
                 headers={
                     "Content-Type": "application/jose",
@@ -198,7 +196,7 @@ def test_nginx_routes_preserves_uploads_and_replaces_untrusted_forwarding_header
             ).json()
             assert data["body_sha256"] == sha256(envelope).hexdigest()
             assert (
-                client.post("/api/v1/traffic-log-batches", content=b"x" * 1_500_001).status_code
+                client.post("/api/v1/traffic-log-uploads", content=b"x" * 1_500_001).status_code
                 == 413
             )
             response = client.get(

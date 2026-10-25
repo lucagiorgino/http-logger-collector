@@ -159,6 +159,10 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "logger.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: spool-parse
+        - podSelector:
+            matchLabels:
+              {{- include "logger.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: openbao-bootstrap
       ports:
         - protocol: TCP

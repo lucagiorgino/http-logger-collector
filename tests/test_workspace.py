@@ -144,7 +144,7 @@ def test_workspace_updates_are_versioned_strict_and_fail_closed(
 
 
 def test_discarded_categories_do_not_require_encryption_and_omitted_choices_are_preserved(
-    authorized_client, repository, storage_encryption, monkeypatch, traffic_payload
+    authorized_client, repository, storage_encryption, monkeypatch, traffic_payload, drain_uploads
 ):
     app.dependency_overrides[require_bearer_token] = operator
     configuration = WorkspaceConfiguration(**dict.fromkeys(RETAIN_FLAGS, False)).model_dump()
@@ -165,12 +165,13 @@ def test_discarded_categories_do_not_require_encryption_and_omitted_choices_are_
         0, dict.fromkeys(FLAGS, True)
     )
     response = authorized_client.post(
-        "/api/v1/traffic-log-batches",
+        "/api/v1/traffic-log-uploads",
         content=gzip.compress(json.dumps({"logs": [traffic_payload]}).encode()),
         headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
     )
-    assert response.status_code == 200
-    document = repository.insert_traffic_logs.call_args.args[0][0]
+    assert response.status_code == 202
+    drain_uploads()
+    document = repository.insert_queued_traffic_logs.call_args.args[0][0]
     assert "body" not in document["logdata"]
     assert "storage_encryption" not in document
     body = traffic_payload["body"].encode("utf-8")
@@ -315,6 +316,7 @@ def test_ingestion_fails_without_accepting_plaintext_when_configuration_or_kms_f
     traffic_payload,
     storage_encryption,
     monkeypatch,
+    drain_uploads,
 ):
     wire = gzip.compress(json.dumps({"logs": [traffic_payload]}).encode())
     headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
@@ -323,20 +325,23 @@ def test_ingestion_fails_without_accepting_plaintext_when_configuration_or_kms_f
         raise KMSUnavailable("private storage details")
 
     monkeypatch.setattr(storage_encryption, "encrypt", unavailable)
-    response = authorized_client.post("/api/v1/traffic-log-batches", content=wire, headers=headers)
-    assert response.status_code == 503
+    response = authorized_client.post("/api/v1/traffic-log-uploads", content=wire, headers=headers)
+    assert response.status_code == 202
+    drain_uploads()
+    state = authorized_client.get(f"/api/v1/traffic-log-uploads/{response.json()['upload_id']}")
+    assert state.json()["error_code"] == "parse_dependency_unavailable"
     assert "private storage" not in response.text
-    repository.insert_traffic_logs.assert_not_awaited()
+    repository.insert_queued_traffic_logs.assert_not_awaited()
     repository.get_workspace_configuration.side_effect = PersistenceError(
         "private configuration details"
     )
     assert (
         authorized_client.post(
-            "/api/v1/traffic-log-batches", content=wire, headers=headers
+            "/api/v1/traffic-log-uploads", content=wire, headers=headers
         ).status_code
         == 503
     )
-    repository.insert_traffic_logs.assert_not_awaited()
+    repository.insert_queued_traffic_logs.assert_not_awaited()
 
 
 def test_encrypted_body_is_only_decrypted_for_authorized_details(
@@ -376,6 +381,7 @@ def test_partial_transit_success_rejects_the_entire_batch(
     traffic_payload,
     storage_encryption,
     monkeypatch,
+    drain_uploads,
 ):
     original = storage_encryption.respond
 
@@ -390,10 +396,13 @@ def test_partial_transit_success_rejects_the_entire_batch(
     monkeypatch.setattr(storage_encryption, "respond", respond)
     wire = gzip.compress(json.dumps({"logs": [traffic_payload, traffic_payload]}).encode())
     response = authorized_client.post(
-        "/api/v1/traffic-log-batches",
+        "/api/v1/traffic-log-uploads",
         content=wire,
         headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
     )
-    assert response.status_code == 503
+    assert response.status_code == 202
+    drain_uploads()
+    state = authorized_client.get(f"/api/v1/traffic-log-uploads/{response.json()['upload_id']}")
+    assert state.json()["error_code"] == "parse_dependency_unavailable"
     assert "private encryption" not in response.text
-    repository.insert_traffic_logs.assert_not_awaited()
+    repository.insert_queued_traffic_logs.assert_not_awaited()

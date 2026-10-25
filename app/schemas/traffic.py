@@ -200,24 +200,6 @@ class TrafficLogBatch(BaseModel):
     logs: list[TrafficLogRequest] = Field(min_length=1, max_length=500)
 
 
-class BatchReceipt(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "examples": [
-                {
-                    "batch_id": "2cc6199a-08e5-4aae-8ab3-60c7c96d1141",
-                    "accepted_count": 1,
-                    "status": "queued",
-                },
-            ]
-        }
-    )
-
-    batch_id: str
-    accepted_count: int
-    status: Literal["stored", "queued"]
-
-
 class StoredTrafficLog(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={"examples": [{**STORED_TRAFFIC_LOG_EXAMPLE, "body": "hello"}]}

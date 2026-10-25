@@ -7,8 +7,9 @@ STACK_TEST_ENV_FILE ?= .env.stack-test
 OPENBAO_UID ?= $(shell id -u)
 OPENBAO_GID ?= $(shell id -g)
 export OPENBAO_UID OPENBAO_GID
-DEV_COMPOSE_OVERRIDE ?=
-DEV_COMPOSE = docker compose --project-directory . --env-file "$(ENV_FILE)" -f docker/docker-compose.yml $(if $(DEV_COMPOSE_OVERRIDE),-f "$(DEV_COMPOSE_OVERRIDE)",)
+COMPOSE = docker compose --project-directory . --env-file "$(ENV_FILE)" -f docker/docker-compose.yml
+PROXY_SERVICE ?= proxy
+SPOOL_DEV_ENV = APP_ENV=development SPOOL_STORAGE_BACKEND=minio SPOOL_ENDPOINT_URL=http://localhost:29000 PUBSUB_EMULATOR_HOST=localhost:28681 SPOOL_BUCKET=traffic-uploads SPOOL_EVENT_TOPIC=projects/logger-local/topics/uploads SPOOL_SUBSCRIPTION=projects/logger-local/subscriptions/uploads SPOOL_SILVER_TOPIC=projects/logger-local/topics/uploads-silver SPOOL_SILVER_SUBSCRIPTION=projects/logger-local/subscriptions/uploads-silver SPOOL_PARSE_DLQ_TOPIC=projects/logger-local/topics/parse-dlq SPOOL_LOAD_DLQ_TOPIC=projects/logger-local/topics/load-dlq
 IMAGE_REPOSITORY ?= amazing-http-logger
 FRONTEND_IMAGE_REPOSITORY ?= amazing-http-logger-dashboard
 IMAGE_TAG ?= dev
@@ -64,42 +65,65 @@ frontend-test-browser:
 run:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app
 
-worker:
-	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.worker
+spool-parser:
+	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_worker parse
+
+spool-loader:
+	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_worker load
+
+spool-dev-up:
+	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_dev prepare
+	$(COMPOSE) up -d --build --wait pubsub spool-bridge minio
+	$(SPOOL_DEV_ENV) ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_dev init
+	$(COMPOSE) --profile spool run --no-deps --build --rm minio-init
+
+spool-dev-down:
+	$(COMPOSE) stop minio spool-bridge pubsub
 
 proxy-up:
-	$(DEV_COMPOSE) up -d --wait proxy
+	@case "$(PROXY_SERVICE)" in proxy|proxy-host) ;; *) echo "PROXY_SERVICE must be proxy or proxy-host" >&2; exit 1;; esac
+	$(COMPOSE) stop $(if $(filter proxy-host,$(PROXY_SERVICE)),proxy,proxy-host)
+	$(COMPOSE) up -d --wait "$(PROXY_SERVICE)"
 
 proxy-down:
-	$(DEV_COMPOSE) stop proxy
-
-redis-up:
-	$(DEV_COMPOSE) up -d --wait redis
-
-redis-down:
-	$(DEV_COMPOSE) stop redis
+	$(COMPOSE) stop proxy proxy-host
 
 mongo-up:
-	$(DEV_COMPOSE) up -d --wait mongo
+	$(COMPOSE) up -d --wait mongo
 
 mongo-down:
-	$(DEV_COMPOSE) stop mongo
+	$(COMPOSE) stop mongo
 
 openbao-up:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.kms prepare-dev
-	$(DEV_COMPOSE) up -d --wait openbao
+	$(COMPOSE) up -d --wait openbao
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.kms bootstrap-dev
 
 openbao-down:
-	$(DEV_COMPOSE) stop openbao
+	$(COMPOSE) stop openbao
 
-dev-up: mongo-up openbao-up redis-up proxy-up
+dev-up: mongo-up openbao-up proxy-up spool-dev-up
 
 dev-down:
-	$(DEV_COMPOSE) down
+	$(COMPOSE) --profile "*" down
+
+compose-config:
+	$(COMPOSE) --profile "*" config --quiet
+
+compose-ps:
+	$(COMPOSE) --profile "*" ps
+
+compose-logs:
+	$(COMPOSE) --profile "*" logs --follow --tail 100
 
 dev: dev-up
-	$(MAKE) run
+	$(SPOOL_DEV_ENV) ENV_FILE="$(ENV_FILE)" bash -ec '\
+	  "$(PYTHON_VENV)" -m app.spool_worker parse & parse_pid=$$!; \
+	  "$(PYTHON_VENV)" -m app.spool_worker load & load_pid=$$!; \
+	  "$(PYTHON_VENV)" -m app & api_pid=$$!; \
+	  trap '\''kill "$$parse_pid" "$$load_pid" "$$api_pid" 2>/dev/null || true; wait'\'' EXIT; \
+	  trap '\''exit 130'\'' INT TERM; \
+	  wait -n "$$parse_pid" "$$load_pid" "$$api_pid"'
 
 image:
 	docker build -f docker/Dockerfile -t "$(IMAGE_REPOSITORY):$(IMAGE_TAG)" .
@@ -125,4 +149,4 @@ helm-down:
 helm-port-forward:
 	kubectl $(KUBECTL_CONTEXT) --namespace "$(KUBE_NAMESPACE)" port-forward "service/$(KUBE_SERVICE)" "$(KUBE_LOCAL_PORT):http"
 
-.PHONY: install test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run worker proxy-up proxy-down redis-up redis-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image frontend-image helm-lint helm-template helm-up helm-test helm-down helm-port-forward
+.PHONY: install test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run spool-parser spool-loader spool-dev-up spool-dev-down proxy-up proxy-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev compose-config compose-ps compose-logs image frontend-image helm-lint helm-template helm-up helm-test helm-down helm-port-forward

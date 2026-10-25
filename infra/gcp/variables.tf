@@ -19,15 +19,6 @@ variable "environment" {
   }
 }
 
-variable "domain" {
-  description = "Public hostname without scheme/path; DNS is managed separately."
-  type        = string
-  validation {
-    condition     = can(regex("^[a-z0-9][a-z0-9.-]*\\.[a-z]{2,}$", var.domain))
-    error_message = "Supply a DNS hostname, for example logs.example.com."
-  }
-}
-
 variable "auth0_domain" {
   description = "Auth0 tenant/custom domain, without https:// or trailing slash."
   type        = string
@@ -73,14 +64,12 @@ variable "secret_versions" {
   description = "Pinned numeric Secret Manager versions; values never enter Terraform."
   type = object({
     mongo_uri           = string
-    redis_url           = string
     ec_keyset           = string
     auth0_client_secret = string
     auth0_session       = string
   })
   default = {
     mongo_uri           = "1"
-    redis_url           = "1"
     ec_keyset           = "1"
     auth0_client_secret = "1"
     auth0_session       = "1"
@@ -133,25 +122,49 @@ variable "deletion_protection" {
   default     = true
 }
 
-variable "enable_memorystore_cache" {
-  description = "Optional HA cache ONLY. Memorystore is NOT compatible with this application's durable ingestion queue."
-  type        = bool
-  default     = false
-}
-
-variable "memorystore_size_gb" {
-  description = "Memory per node of the optional Standard HA cache."
-  type        = number
-  default     = 5
-  validation {
-    condition     = var.memorystore_size_gb >= 5 && floor(var.memorystore_size_gb) == var.memorystore_size_gb
-    error_message = "Use a whole number of GiB, at least 5."
-  }
-
-}
-
 variable "notification_channels" {
   description = "Existing Cloud Monitoring notification channel resource names for availability alerts."
   type        = list(string)
   default     = []
+}
+
+variable "spool_mongo_documents_per_second" {
+  description = "Per loader instance; total configured rate is this times worker_instances."
+  type        = number
+  default     = 500
+  validation {
+    condition     = var.spool_mongo_documents_per_second > 0 && floor(var.spool_mongo_documents_per_second) == var.spool_mongo_documents_per_second
+    error_message = "Use a positive whole number."
+  }
+
+}
+
+variable "spool_message_retention_seconds" {
+  description = "Object, silver and DLQ subscription retention; expired work is replayed from raw."
+  type        = number
+  default     = 1209600
+  validation {
+    condition     = var.spool_message_retention_seconds >= 600 && var.spool_message_retention_seconds <= 2678400 && floor(var.spool_message_retention_seconds) == var.spool_message_retention_seconds
+    error_message = "Pub/Sub retention must be a whole number from 600 seconds to 31 days."
+  }
+}
+
+variable "spool_backlog_alert_batches" {
+  description = "Alert when the silver subscription exceeds this many undelivered messages."
+  type        = number
+  default     = 500
+  validation {
+    condition     = var.spool_backlog_alert_batches > 0 && floor(var.spool_backlog_alert_batches) == var.spool_backlog_alert_batches
+    error_message = "Use a positive whole number."
+  }
+}
+
+variable "spool_oldest_unacked_alert_seconds" {
+  description = "Alert on silver message age before subscription retention expires."
+  type        = number
+  default     = 3600
+  validation {
+    condition     = var.spool_oldest_unacked_alert_seconds > 0 && var.spool_oldest_unacked_alert_seconds < var.spool_message_retention_seconds
+    error_message = "The age warning must be positive and below subscription retention."
+  }
 }

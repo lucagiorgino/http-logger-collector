@@ -1,18 +1,20 @@
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 from fake_storage import FakeStorageEncryption
 from fastapi.testclient import TestClient
 from joserfc.jwk import ECKey
+from upload_harness import UploadHarness
 
+from app.api.uploads import get_upload_cloud, get_upload_store
 from app.core.auth import require_bearer_token
 from app.core.config import settings
 from app.core.encryption import EncryptionKeys
 from app.core.storage_encryption import get_storage_encryption
-from app.deps import get_ingestion_publisher, get_mongo_repository, get_request_encryption_keys
+from app.deps import get_mongo_repository, get_request_encryption_keys
 from app.main import app
 from app.schemas.workspace import WorkspaceConfiguration
-from app.services.ingestion import MongoIngestionPublisher
 from app.services.traffic_service import DEVICE_ID_CLAIM, ClientIdentity, IngestionContext
 
 
@@ -34,14 +36,31 @@ def repository():
 
 
 @pytest.fixture
-def authorized_client(repository, storage_encryption):
+def upload_harness(repository, storage_encryption, monkeypatch):
+    if not settings.spool_bucket:
+        monkeypatch.setattr(settings, "spool_bucket", "test-raw")
+    monkeypatch.setattr(settings, "spool_storage_backend", "minio")
+    harness = UploadHarness(repository, storage_encryption)
+    app.dependency_overrides[get_upload_cloud] = lambda: harness.cloud
+    app.dependency_overrides[get_upload_store] = lambda: harness.store
+    yield harness
+    app.dependency_overrides.pop(get_upload_cloud, None)
+    app.dependency_overrides.pop(get_upload_store, None)
+
+
+@pytest.fixture
+def drain_uploads(upload_harness):
+    return lambda: asyncio.run(upload_harness.drain())
+
+
+@pytest.fixture
+def authorized_client(repository, storage_encryption, upload_harness):
     app.dependency_overrides[require_bearer_token] = lambda: {
         "sub": "user-123",
         DEVICE_ID_CLAIM: "device-456",
         "azp": "oauth-client-123",
     }
     app.dependency_overrides[get_mongo_repository] = lambda: repository
-    app.dependency_overrides[get_ingestion_publisher] = lambda: MongoIngestionPublisher(repository)
     app.dependency_overrides[get_request_encryption_keys] = lambda: EncryptionKeys({})
     app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
     try:
@@ -107,6 +126,7 @@ def encryption_keys():
 
 
 @pytest.fixture
-def encrypted_client(authorized_client, encryption_keys):
+def encrypted_client(authorized_client, encryption_keys, upload_harness):
     app.dependency_overrides[get_request_encryption_keys] = lambda: encryption_keys
+    upload_harness.parser.keys = encryption_keys
     return authorized_client
