@@ -3,8 +3,8 @@ export class ApiError extends Error {
     const messages = {
       400: "The API could not accept this request.",
       401: "Your API session has expired or is not authorized. Sign in again.",
-      403: "This operation is not permitted. Policy changes require manage:devices.",
-      404: "The record was not found within your authenticated owner.",
+      403: "This operation is not permitted. Device registration and policy changes require manage:devices.",
+      404: "The record was not found for an accessible device.",
       409: "The device configuration changed. Reload it before saving again.",
       422: "Check the filters, device ID, or configuration values.",
       502: "The backend gateway failed or returned an invalid API response. Check BACKEND_API_URL and reverse-proxy upstream routing.",
@@ -101,24 +101,70 @@ export function logQuery(input = {}) {
   return params;
 }
 
-export function policyUpdate(form) {
-  const deviceId = form.get("device_id");
-  const version = form.get("expected_version");
-  const mode = form.get("encryption_mode");
+export function devicePath(deviceId) {
   if (
     typeof deviceId !== "string" ||
     !deviceId.trim() ||
+    !deviceId.isWellFormed() ||
     deviceId.length > 255 ||
+    /[/\\]/.test(deviceId) ||
+    [".", ".."].includes(deviceId.trim()) ||
+    [...deviceId].some((character) => {
+      const code = character.codePointAt(0);
+      return code < 32 || (code >= 127 && code <= 159);
+    })
+  ) {
+    throw new ApiError(422);
+  }
+  return `/devices/${encodeURIComponent(deviceId.trim())}`;
+}
+
+function devicePolicy(form) {
+  const deviceId = form.get("device_id");
+  devicePath(deviceId);
+  const mode = form.get("encryption_mode");
+  if (!["tls_only", "optional", "required"].includes(mode))
+    throw new ApiError(422);
+  return { deviceId: deviceId.trim(), mode };
+}
+
+export function policyUpdate(form) {
+  const { deviceId, mode } = devicePolicy(form);
+  return {
+    path: `/api/v1${devicePath(deviceId)}/configuration`,
+    body: { expected_version: expectedVersion(form), encryption_mode: mode },
+    deviceId,
+  };
+}
+
+function expectedVersion(form) {
+  const version = form.get("expected_version");
+  if (
     typeof version !== "string" ||
     !/^\d+$/.test(version) ||
-    !Number.isSafeInteger(Number(version)) ||
-    !["tls_only", "optional", "required"].includes(mode)
+    !Number.isSafeInteger(Number(version))
+  )
+    throw new ApiError(422);
+  return Number(version);
+}
+
+export function deviceRegistration(form) {
+  const { mode, deviceId } = devicePolicy(form);
+  const name = form.get("name");
+  if (
+    typeof name !== "string" ||
+    !name.trim() ||
+    !name.isWellFormed() ||
+    name.trim().length > 128 ||
+    [...name].some((character) => {
+      const code = character.codePointAt(0);
+      return code < 32 || (code >= 127 && code <= 159);
+    })
   ) {
     throw new ApiError(422);
   }
   return {
-    path: `/api/v1/devices/${encodeURIComponent(deviceId.trim())}/configuration`,
-    body: { expected_version: Number(version), encryption_mode: mode },
-    deviceId: deviceId.trim(),
+    deviceId,
+    body: { device_id: deviceId, name: name.trim(), encryption_mode: mode },
   };
 }

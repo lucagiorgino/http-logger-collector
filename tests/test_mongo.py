@@ -83,6 +83,7 @@ def test_startup_creates_and_validates_time_series_collection(mongo, creation_er
         timeseries={"timeField": "timestamp", "metaField": "metadata", "granularity": "seconds"},
     )
     mongo.traffic_logs.create_indexes.assert_awaited_once()
+    mongo.device_configurations.create_index.assert_awaited_once()
 
 
 def test_startup_rejects_existing_non_time_series_collection(mongo):

@@ -27,16 +27,15 @@ export default async function Workspace() {
             className="mb-4 size-6 text-primary"
             aria-hidden="true"
           />
-          <h2 className="font-semibold">Verified API owner</h2>
+          <h2 className="font-semibold">Verified device identity</h2>
           <p className="mono mt-4 break-all rounded-lg bg-muted p-4 text-sm">
-            {identity.user_id}
+            {identity.device_id}
           </p>
           <p className="mt-4 text-sm leading-6 text-muted-foreground">
-            This identity comes from the API, not an unverified token. A human
-            operator and a machine-to-machine client usually have different
-            subjects. The current API cannot let a human manage another
-            subject&apos;s devices; doing so requires an explicit backend
-            delegation model, not broader UI permissions.
+            This device ID comes from the verified JWT, not an upload or form.
+            Devices have globally unique IDs and names. Operators with
+            manage:devices can register devices, configure policies and read
+            fleet data; agents are limited to their own JWT-bound device.
           </p>
         </CardContent>
       </Card>
@@ -50,12 +49,12 @@ export default async function Workspace() {
           [
             Layers3,
             "Policy management",
-            "Only policy changes require manage:devices. Agents can read their configuration, acknowledge capabilities and upload encrypted batches without a management grant.",
+            "Device registration and policy changes require manage:devices. Agents can read their configuration, acknowledge capabilities and upload encrypted batches without a management grant.",
           ],
           [
             Server,
             "Read & write separation",
-            "Analysis reads use the backend's configured replica policy. Policy reads and writes use primary. Local single-node development is the explicit primary-read exception.",
+            "Analysis reads use the backend's configured replica policy. Inventory, registration and policy operations use primary. Local single-node development is the explicit primary-read exception.",
           ],
         ].map(([Icon, title, text]) => (
           <Card key={title} className="border shadow-none">

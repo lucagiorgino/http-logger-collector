@@ -50,7 +50,7 @@ async def require_secure_transport(
     ):
         return JSONResponse(status_code=400, content={"detail": "HTTPS is required"})
     response = await call_next(request)
-    if request.url.path.startswith("/api/v1/devices/"):
+    if request.url.path.startswith("/api/v1/devices"):
         response.headers["Cache-Control"] = "no-store"
     return response
 

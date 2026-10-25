@@ -46,6 +46,165 @@ class RoutingListener(CommandListener):
         pass
 
 
+@pytest.mark.skipif(
+    not os.getenv("MONGO_TEST_URI"), reason="Set MONGO_TEST_URI for device registration"
+)
+def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
+    monkeypatch, encryption_keys, traffic_payload
+):
+    traffic_payload["timestamp"] = datetime.now(UTC).isoformat()
+    monkeypatch.setattr(settings, "mongo_allow_primary_reads", True)
+    monkeypatch.setattr(settings, "app_env", "development")
+
+    async def scenario():
+        database_name = "device_registration_test_" + uuid4().hex
+        repository = MongoRepository(uri=os.environ["MONGO_TEST_URI"], db_name=database_name)
+        claims = {
+            "sub": "registration-operator",
+            DEVICE_ID_CLAIM: "device-456",
+            "permissions": ["manage:devices"],
+        }
+        original_overrides = app.dependency_overrides.copy()
+        app.dependency_overrides[require_bearer_token] = lambda: claims.copy()
+        app.dependency_overrides[get_mongo_repository] = lambda: repository
+        app.dependency_overrides[get_encryption_keys] = lambda: encryption_keys
+        try:
+            await repository.ensure_indexes()
+            async with AsyncClient(
+                transport=ASGITransport(app), base_url="https://testserver"
+            ) as client:
+                url = "/api/v1/devices"
+                payload = {
+                    "device_id": "device-456",
+                    "name": "Registered laptop",
+                    "encryption_mode": "required",
+                }
+                response = await client.post(url, json=payload)
+                assert response.status_code == 201
+                assert (await client.get(response.headers["location"])).json()["name"] == payload[
+                    "name"
+                ]
+                document = await repository.get_device_configuration("device-456")
+                assert document["name"] == payload["name"]
+                assert document["version"] == 1
+                claims["sub"] = "another-operator"
+                assert (await client.get(url + "/device-456")).json()["version"] == 1
+                assert (
+                    await client.post(url, json=payload | {"name": "Different name"})
+                ).status_code == 400
+                assert (
+                    await client.post(url, json=payload | {"device_id": "different-id"})
+                ).status_code == 400
+                assert await repository.get_device_configuration("device-456") == document
+                claims["permissions"] = []
+                gzip_batch = gzip.compress(json.dumps({"logs": [traffic_payload]}).encode())
+                upload_headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+                assert (
+                    await client.post(
+                        "/api/v1/traffic-log-batches", content=gzip_batch, headers=upload_headers
+                    )
+                ).status_code == 403
+                claims["permissions"] = ["manage:devices"]
+                response = await client.patch(
+                    url + "/device-456/configuration",
+                    json={"expected_version": 1, "encryption_mode": "tls_only"},
+                )
+                assert response.status_code == 200
+                assert response.json()["name"] == payload["name"]
+                assert (
+                    await client.post(
+                        "/api/v1/traffic-log-batches", content=gzip_batch, headers=upload_headers
+                    )
+                ).status_code == 202
+                assert (
+                    await client.post(
+                        url, json={"device_id": "device-789", "name": "Second device"}
+                    )
+                ).status_code == 201
+                first = (await client.get(url, params={"limit": 1})).json()
+                assert first["items"][0]["device_id"] == "device-456"
+                second = (await client.get(url, params={"after": first["next_after"]})).json()
+                assert [item["device_id"] for item in second["items"]] == ["device-789"]
+                assert second["next_after"] is None
+
+                await repository.update_device_configuration("legacy-device", 0, "optional")
+                legacy = {"device_id": "legacy-device", "name": "Existing agent"}
+                assert (await client.post(url, json=legacy)).status_code == 400
+                response = await client.post(
+                    url, json=legacy | {"expected_version": 1, "encryption_mode": "optional"}
+                )
+                assert response.status_code == 422
+                assert (await repository.get_device_configuration("legacy-device"))["version"] == 1
+                assert await repository.report_device_configuration(
+                    "agent-discovered@clients",
+                    {
+                        "version": 0,
+                        "status": "applied",
+                        "supports_encryption": False,
+                        "reported_at": datetime.now(UTC),
+                    },
+                )
+                inventory = (await client.get(url)).json()
+                assert [item["device_id"] for item in inventory["items"]] == [
+                    "agent-discovered@clients",
+                    "device-456",
+                    "device-789",
+                    "legacy-device",
+                ]
+                assert inventory["items"][0]["name"] is None
+                assert inventory["items"][0]["registered_at"] is None
+                detail = await client.get(url + "/agent-discovered%40clients")
+                assert detail.status_code == 200
+                assert detail.json()["version"] == 0
+                assert detail.json()["configuration_status"]["status"] == "applied"
+                assert (await client.get(url + "/legacy-device")).status_code == 200
+                assert (await client.get(url + "/missing-device")).status_code == 404
+                first = (await client.get(url, params={"limit": 1})).json()
+                assert first["next_after"] == "agent-discovered@clients"
+                remaining = (await client.get(url, params={"after": first["next_after"]})).json()
+                assert [item["device_id"] for item in remaining["items"]] == [
+                    "device-456",
+                    "device-789",
+                    "legacy-device",
+                ]
+
+                for candidates in (
+                    [
+                        {"device_id": "race-id", "name": "First race device"},
+                        {"device_id": "race-id", "name": "Second race device"},
+                    ],
+                    [
+                        {"device_id": "race-name-a", "name": "Shared race name"},
+                        {"device_id": "race-name-b", "name": "Shared race name"},
+                    ],
+                ):
+                    responses = await asyncio.gather(
+                        *(client.post(url, json=candidate) for candidate in candidates)
+                    )
+                    assert sorted(response.status_code for response in responses) == [201, 400]
+                assert (
+                    await repository.device_configurations.count_documents(
+                        {"name": "Shared race name"}
+                    )
+                    == 1
+                )
+                claims["permissions"] = []
+                assert [item["device_id"] for item in (await client.get(url)).json()["items"]] == [
+                    "device-456"
+                ]
+                assert (await client.get(url + "/device-789")).status_code == 403
+                assert (await client.get(url + "/device-789/configuration")).status_code == 403
+                claims["sub"] = "yet-another-subject"
+                assert (await client.get(url + "/device-456")).json()["version"] == 2
+        finally:
+            app.dependency_overrides.clear()
+            app.dependency_overrides.update(original_overrides)
+            await repository.client.drop_database(database_name)
+            await repository.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("allow_primary", "uri"),
     [

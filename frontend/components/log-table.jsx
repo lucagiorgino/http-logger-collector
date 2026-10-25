@@ -10,6 +10,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { dateTime, requestTarget } from "@/lib/format";
+import { devicePath } from "@/lib/api-client";
 
 export function StatusBadge({ status }) {
   return (
@@ -31,8 +32,9 @@ export function LogTable({ items, compact = false }) {
         </span>
         <h2 className="font-semibold">No traffic in this view</h2>
         <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
-          Send a log batch as this owner or adjust the filters. Replica-backed
-          analysis may take a moment to show newly accepted traffic.
+          Send a log batch from an accessible device or adjust the filters.
+          Replica-backed analysis may take a moment to show newly accepted
+          traffic.
         </p>
       </div>
     );
@@ -74,7 +76,7 @@ export function LogTable({ items, compact = false }) {
             </TableCell>
             <TableCell>
               <Link
-                href={`/devices?device_id=${encodeURIComponent(log.device_id)}`}
+                href={devicePath(log.device_id)}
                 prefetch={false}
                 className="mono text-xs text-muted-foreground hover:text-primary"
               >

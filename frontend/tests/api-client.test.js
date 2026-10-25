@@ -3,6 +3,8 @@ import { test } from "node:test";
 import {
   ApiError,
   createApiClient,
+  devicePath,
+  deviceRegistration,
   logQuery,
   policyUpdate,
 } from "../lib/api-client.js";
@@ -124,12 +126,12 @@ test("log filters use UTC, preserve cursor, and bound page size", () => {
 
 test("policy writes require a bounded device ID, valid mode and exact safe version", () => {
   const form = new FormData();
-  form.set("device_id", "device/one");
+  form.set("device_id", "device@clients");
   form.set("expected_version", "4");
   form.set("encryption_mode", "required");
   assert.deepEqual(policyUpdate(form), {
-    deviceId: "device/one",
-    path: "/api/v1/devices/device%2Fone/configuration",
+    deviceId: "device@clients",
+    path: "/api/v1/devices/device%40clients/configuration",
     body: { expected_version: 4, encryption_mode: "required" },
   });
   for (const [key, value] of [
@@ -137,11 +139,29 @@ test("policy writes require a bounded device ID, valid mode and exact safe versi
     ["expected_version", "9007199254740993"],
     ["encryption_mode", "off"],
     ["device_id", ""],
+    ["device_id", "device/one"],
+    ["device_id", ".."],
   ]) {
     const invalid = new FormData();
     for (const [name, original] of form) invalid.set(name, original);
     invalid.set(key, value);
     assert.throws(() => policyUpdate(invalid), ApiError);
+  }
+});
+
+test("device detail links encode IDs and reject path traversal or controls", () => {
+  assert.equal(devicePath(" agent@clients "), "/devices/agent%40clients");
+  assert.equal(devicePath("device?error=400"), "/devices/device%3Ferror%3D400");
+  for (const value of [
+    "",
+    ".",
+    "..",
+    "../settings",
+    "a\\b",
+    "bad\nid",
+    "a".repeat(256),
+  ]) {
+    assert.throws(() => devicePath(value), ApiError);
   }
 });
 
@@ -157,4 +177,33 @@ test("backend config prevents credential-bearing, redirected, or insecure remote
   }
   assert.throws(() => backendSettings({ BACKEND_API_TIMEOUT_MS: "NaN" }));
   assert.ok(missingAuthSettings({}).includes("AUTH0_SECRET"));
+});
+
+test("registration sends only device fields and validates identity, name and policy", () => {
+  const form = new FormData();
+  form.set("device_id", "device-123");
+  form.set("name", " Operator laptop ");
+  form.set("expected_version", "2");
+  form.set("encryption_mode", "required");
+  form.set("user_id", "forged-user");
+  assert.deepEqual(deviceRegistration(form), {
+    deviceId: "device-123",
+    body: {
+      device_id: "device-123",
+      name: "Operator laptop",
+      encryption_mode: "required",
+    },
+  });
+  for (const [field, value] of [
+    ["name", ""],
+    ["name", "x".repeat(129)],
+    ["name", "Laptop\nforged"],
+    ["device_id", "../another-device"],
+    ["encryption_mode", "off"],
+  ]) {
+    const invalid = new FormData();
+    for (const [key, original] of form) invalid.set(key, original);
+    invalid.set(field, value);
+    assert.throws(() => deviceRegistration(invalid), ApiError);
+  }
 });

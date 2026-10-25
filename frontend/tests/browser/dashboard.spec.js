@@ -85,6 +85,190 @@ test("policy forms progressively submit without browser JavaScript", async ({
   await context.close();
 });
 
+test("registering a device persists inventory and supports subsequent policy changes without JavaScript", async ({
+  browser,
+}) => {
+  const context = await browser.newContext({ javaScriptEnabled: false });
+  await signIn(context);
+  const page = await context.newPage();
+  await page.goto("/devices");
+  await page
+    .getByLabel("Device ID to register", { exact: true })
+    .fill("registration-device");
+  await page.getByLabel("Device name", { exact: true }).fill("Operator laptop");
+  await page
+    .getByLabel("Initial encryption policy", { exact: true })
+    .selectOption("required");
+  await page
+    .getByRole("button", { name: "Register device", exact: true })
+    .click();
+  await expect(
+    page.getByText("Device registered", { exact: true }),
+  ).toBeVisible();
+  await expect(page).toHaveURL(/\/devices\/registration-device\?registered=1/);
+  await expect(page.getByText("Version 1", { exact: true })).toBeVisible();
+  await expect(page.getByRole("radio", { name: /Required JWE/ })).toBeChecked();
+  await page.goto("/devices");
+  await page
+    .getByRole("link", { name: /Operator laptop.*registration-device/ })
+    .click();
+  await page.getByRole("radio", { name: /^Optional JWE/ }).check();
+  await page.getByRole("button", { name: "Save policy", exact: true }).click();
+  await expect(page.getByText("Policy saved", { exact: true })).toBeVisible();
+  await expect(page.getByText("Version 2", { exact: true })).toBeVisible();
+  await page
+    .getByRole("link", { name: "Back to devices", exact: true })
+    .click();
+  await page
+    .getByLabel("Device ID to register", { exact: true })
+    .fill("registration-device");
+  await page
+    .getByLabel("Device name", { exact: true })
+    .fill("Different laptop");
+  await page
+    .getByRole("button", { name: "Register device", exact: true })
+    .click();
+  await expect(
+    page.getByText("Device already exists", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Device registered", { exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByLabel("Device ID to register", { exact: true })
+    .fill("different-registration-device");
+  await page.getByLabel("Device name", { exact: true }).fill("Operator laptop");
+  await page
+    .getByRole("button", { name: "Register device", exact: true })
+    .click();
+  await expect(
+    page.getByText("Device already exists", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Device registered", { exact: true }),
+  ).toHaveCount(0);
+  await page.goto("/devices");
+  await expect(
+    page.getByRole("link", { name: /Operator laptop.*registration-device/ }),
+  ).toHaveCount(1);
+  await expect(
+    page.getByRole("link", { name: /different-registration-device/ }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("link", { name: /Operator laptop.*registration-device/ })
+    .click();
+  await expect(page.getByText("Version 2", { exact: true })).toBeVisible();
+  await context.close();
+});
+
+test("stored agent devices appear in inventory and open dedicated details without JavaScript", async ({
+  browser,
+}) => {
+  const context = await browser.newContext({ javaScriptEnabled: false });
+  await signIn(context);
+  const page = await context.newPage();
+  await page.goto("/devices");
+  const inventory = page.getByRole("table", { name: "Device inventory" });
+  const row = inventory
+    .getByRole("row")
+    .filter({ hasText: "agent-discovered@clients" });
+  await expect(row.getByText("Unnamed device", { exact: true })).toBeVisible();
+  await expect(
+    row.getByText("Agent / policy record", { exact: true }),
+  ).toBeVisible();
+  await row
+    .getByRole("link", {
+      name: "Inspect device agent-discovered@clients",
+      exact: true,
+    })
+    .click();
+  await expect(page).toHaveURL(/\/devices\/agent-discovered%40clients$/);
+  await expect(
+    page.getByRole("heading", { name: "Device details", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("agent-discovered@clients", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("applied", { exact: true })).toBeVisible();
+  await page.getByRole("radio", { name: /Required JWE/ }).check();
+  await page.getByRole("button", { name: "Save policy", exact: true }).click();
+  await expect(page.getByText("Policy saved", { exact: true })).toBeVisible();
+  await expect(page.getByText("Version 1", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(
+      "Waiting for the agent to acknowledge the current version.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await page
+    .getByRole("link", { name: "View device traffic", exact: true })
+    .click();
+  await expect(page).toHaveURL(/\/logs\?device_id=agent-discovered%40clients/);
+  await context.close();
+});
+
+test("device detail IDs are decoded exactly once", async ({
+  page,
+  context,
+}) => {
+  await signIn(context);
+  await page.goto("/devices");
+  await page
+    .getByRole("link", {
+      name: "Inspect device literal%40device@clients",
+      exact: true,
+    })
+    .click();
+  await expect(page).toHaveURL(/\/devices\/literal%2540device%40clients$/);
+  await expect(
+    page.getByRole("heading", { name: "Device details", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("literal%40device@clients", { exact: true }),
+  ).toBeVisible();
+});
+
+test("missing or unavailable device details show explicit API errors", async ({
+  page,
+  context,
+}) => {
+  await signIn(context);
+  await page.goto("/devices/missing-device");
+  await expect(
+    page.getByText("Unable to load workspace data · HTTP 404", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Save policy", exact: true }),
+  ).toHaveCount(0);
+  await page.goto("/devices/unavailable");
+  await expect(
+    page.getByText("Unable to load workspace data · HTTP 503", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("private-device-details")).toHaveCount(0);
+});
+
+test("device registration surfaces missing permission without reporting success", async ({
+  page,
+  context,
+}) => {
+  await signIn(context);
+  await page.goto("/devices");
+  await page
+    .getByLabel("Device ID to register", { exact: true })
+    .fill("denied");
+  await page.getByLabel("Device name", { exact: true }).fill("Denied laptop");
+  await page
+    .getByRole("button", { name: "Register device", exact: true })
+    .click();
+  await expect(page.getByText(/This operation is not permitted/)).toBeVisible();
+  await expect(
+    page.getByText("Device registered", { exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByText("private-registration-permission")).toHaveCount(
+    0,
+  );
+});
+
 test("traffic filters, cursor pagination, detail links and failure states work", async ({
   page,
   context,
@@ -101,6 +285,26 @@ test("traffic filters, cursor pagination, detail links and failure states work",
     page.getByRole("heading", { name: "Request details", exact: true }),
   ).toBeVisible();
   await expect(page.getByText("[REDACTED]", { exact: true })).toBeVisible();
+  await expect(page.getByText("203.0.113.50", { exact: true })).toBeVisible();
+  await expect(page.getByText("192.0.2.10", { exact: true })).toBeVisible();
+  await expect(page.getByText("1.0 KB", { exact: true })).toBeVisible();
+  await expect(page.getByText("12.5 ms", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText('chrome.exe <script>alert("untrusted")</script>', {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.locator("script").filter({ hasText: 'alert("untrusted")' }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "Response headers", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: "device-alpha", exact: true }).click();
+  await expect(page).toHaveURL(/\/devices\/device-alpha$/);
+  await expect(
+    page.getByRole("heading", { name: "Device details", exact: true }),
+  ).toBeVisible();
   await page.goto("/logs?device_id=unavailable");
   await expect(page.getByText(/Unable to load workspace data/)).toBeVisible();
   await expect(page.getByText("private-storage-details")).toHaveCount(0);
@@ -161,7 +365,7 @@ test("stale policy forms cannot overwrite a newer version", async ({
   ).toBeChecked();
 });
 
-test("workspace exposes verified owner boundary and browser token route is disabled", async ({
+test("workspace exposes verified device identity and browser token route is disabled", async ({
   page,
   context,
   request,
@@ -170,7 +374,7 @@ test("workspace exposes verified owner boundary and browser token route is disab
   await page.goto("/settings");
   await expect(page.getByText("operator-test", { exact: true })).toBeVisible();
   await expect(
-    page.getByText(/requires an explicit backend delegation model/),
+    page.getByText(/agents are limited to their own JWT-bound device/),
   ).toBeVisible();
   const tokenRoute = await request.get("/auth/access-token", {
     maxRedirects: 0,

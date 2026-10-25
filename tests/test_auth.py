@@ -45,6 +45,8 @@ def test_api_exposes_only_current_resources() -> None:
     assert set(schema["paths"]) == {
         "/health",
         "/api/v1/me",
+        "/api/v1/devices",
+        "/api/v1/devices/{device_id}",
         "/api/v1/devices/{device_id}/configuration",
         "/api/v1/devices/{device_id}/configuration-status",
         "/api/v1/traffic-log-batches",

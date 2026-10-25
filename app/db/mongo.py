@@ -17,6 +17,10 @@ class PersistenceError(RuntimeError):
     pass
 
 
+class DuplicateDeviceError(PersistenceError):
+    pass
+
+
 class MongoRepository:
     collection_name = "traffic_logs"
 
@@ -102,6 +106,12 @@ class MongoRepository:
                     "traffic_logs must use timestamp and metadata as its time-series fields"
                 )
             await self.traffic_logs.create_indexes(indexes)
+            await self.device_configurations.create_index(
+                "name",
+                name="unique_device_name",
+                unique=True,
+                partialFilterExpression={"name": {"$type": "string"}},
+            )
         except PyMongoError as exc:
             raise PersistenceError("Failed to initialize MongoDB storage") from exc
 
@@ -155,6 +165,42 @@ class MongoRepository:
             return await self.analysis_logs.find_one(query)
         except PyMongoError as exc:
             raise PersistenceError("Failed to read traffic log from a replica") from exc
+
+    async def register_device(self, device_id: str, name: str, mode: str) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        document = {
+            "_id": device_id,
+            "name": name,
+            "registered_at": now,
+            "updated_at": now,
+            "encryption_mode": mode,
+            "version": 1,
+        }
+        try:
+            await self.device_configurations.insert_one(document)
+            return document
+        except DuplicateKeyError as exc:
+            raise DuplicateDeviceError("Device ID or name already exists") from exc
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to register device") from exc
+
+    async def list_devices(
+        self, *, device_id: str | None, after: str | None, limit: int
+    ) -> list[dict[str, Any]]:
+        query: dict[str, Any] = {}
+        if after is not None:
+            query["_id"] = {"$gt": after}
+        if device_id is not None:
+            query.setdefault("_id", {})["$eq"] = device_id
+        try:
+            return await (
+                self.device_configurations.find(query)
+                .sort("_id", ASCENDING)
+                .limit(limit)
+                .to_list(length=limit)
+            )
+        except PyMongoError as exc:
+            raise PersistenceError("Failed to list devices") from exc
 
     async def get_device_configuration(self, device_id: str) -> dict[str, Any]:
         try:

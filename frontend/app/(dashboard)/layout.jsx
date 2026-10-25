@@ -25,8 +25,8 @@ export default async function DashboardLayout({ children }) {
           />
           <p className="text-sm font-medium">Owner-scoped access</p>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            Only the signed-in owner&apos;s logs and policies are visible. This
-            is not a cross-tenant fleet view.
+            Device-bound agents see only their own data; authorized operators
+            see the fleet. This is not a cross-tenant fleet view.
           </p>
           <a
             href="/settings"
