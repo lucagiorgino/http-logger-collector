@@ -17,6 +17,7 @@ router = APIRouter(prefix="/api/v1/traffic-logs", tags=["traffic logs"])
 @router.get(
     "",
     response_model=TrafficLogPage,
+    summary="Search retained traffic logs with cursor pagination",
     response_model_exclude={"items": {"__all__": {"body"}}},
     responses={401: {}, 403: {}, 422: {}, 503: {}},
 )
@@ -29,6 +30,15 @@ async def list_traffic_logs(
     cursor: Annotated[str | None, Query(max_length=512)] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> TrafficLogPage:
+    """List newest events first, optionally filtering by device and event-time range.
+
+    **Required permission:** None beyond authentication for the token's own logs;
+    `manage:devices` to read all devices or filter by another device ID.
+
+    Timestamps must include a timezone; `start_time` is inclusive and `end_time` exclusive.
+    Pass `next_cursor` unchanged as `cursor` for the next page. Body content and ciphertext
+    are omitted; credential headers are redacted. `suspicious` is server-owned classification.
+    """
     if start_time is not None and end_time is not None and start_time >= end_time:
         raise HTTPException(status_code=422, detail="start_time must be before end_time")
     documents = await repository.list_traffic_logs(
@@ -45,13 +55,27 @@ async def list_traffic_logs(
     )
 
 
-@router.get("/{record_id}", response_model=StoredTrafficLog, responses={401: {}, 404: {}, 503: {}})
+@router.get(
+    "/{record_id}",
+    response_model=StoredTrafficLog,
+    summary="Read a retained event and its available request body",
+    responses={401: {}, 404: {}, 503: {}},
+)
 async def get_traffic_log(
     record_id: Annotated[str, Path(pattern=r"^[0-9a-f]{24}$")],
     claims: AuthenticatedClaims,
     repository: MongoRepositoryDep,
     storage: StorageEncryptionDep,
 ) -> StoredTrafficLog:
+    """Fetch one event by its 24-character lowercase hexadecimal record ID.
+
+    **Required permission:** None beyond authentication for the token's own logs;
+    `manage:devices` to read another device's logs.
+
+    Retained bodies are decrypted for this response; discarded bodies are null while
+    length/digest remain. Authorization and cookie values stay redacted.
+    Missing, expired and inaccessible records all return 404.
+    """
     document = await repository.get_traffic_log(
         ObjectId(record_id), device_id=authorized_device_id(claims)
     )

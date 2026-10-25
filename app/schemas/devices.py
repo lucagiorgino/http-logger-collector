@@ -5,9 +5,28 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 EncryptionMode = Literal["tls_only", "optional", "required"]
 
+DEVICE_EXAMPLE = {
+    "device_id": "device-456",
+    "name": "Office laptop",
+    "registered_at": "2026-10-25T07:00:00Z",
+    "version": 1,
+    "encryption_mode": "tls_only",
+}
+
 
 class DeviceRegistration(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "device_id": "device-456",
+                    "name": "Office laptop",
+                    "encryption_mode": "tls_only",
+                }
+            ]
+        },
+    )
 
     device_id: str = Field(min_length=1, max_length=255)
     name: str = Field(min_length=1, max_length=128)
@@ -44,19 +63,39 @@ class DeviceSummary(BaseModel):
 
 
 class DevicePage(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{"items": [DEVICE_EXAMPLE], "next_after": None}]}
+    )
+
     items: list[DeviceSummary]
     next_after: str | None
 
 
 class ConfigurationPatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"expected_version": 1, "encryption_mode": "required"}]},
+    )
 
     expected_version: int = Field(ge=0, le=2**63 - 2)
     encryption_mode: EncryptionMode
 
 
 class ConfigurationStatus(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "version": 1,
+                    "status": "applied",
+                    "supports_encryption": False,
+                    "key_id": None,
+                    "detail": "TLS-only policy applied",
+                }
+            ]
+        },
+    )
 
     version: int = Field(ge=0, le=2**63 - 1)
     status: Literal["applied", "unsupported", "error"]
@@ -66,6 +105,21 @@ class ConfigurationStatus(BaseModel):
 
 
 class ReportedConfigurationStatus(ConfigurationStatus):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "version": 1,
+                    "status": "applied",
+                    "supports_encryption": False,
+                    "key_id": None,
+                    "detail": "TLS-only policy applied",
+                    "reported_at": "2026-10-25T07:01:00Z",
+                }
+            ]
+        }
+    )
+
     reported_at: datetime
 
 
@@ -78,6 +132,20 @@ class EncryptionParameters(BaseModel):
 
 
 class DeviceConfiguration(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    **DEVICE_EXAMPLE,
+                    "updated_at": "2026-10-25T07:00:00Z",
+                    "encryption": None,
+                    "refresh_after_seconds": 300,
+                    "configuration_status": None,
+                }
+            ]
+        }
+    )
+
     device_id: str
     name: str | None = None
     registered_at: datetime | None = None

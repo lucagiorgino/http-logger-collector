@@ -14,7 +14,18 @@ auth0 = Auth0FastAPI(
 verify_with_auth0 = auth0.require_auth()
 
 JWT_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
-bearer_scheme = HTTPBearer(auto_error=False, scheme_name="Auth0Bearer")
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+    scheme_name="Auth0Bearer",
+    bearerFormat="JWT",
+    description=(
+        "Auth0 RS256 access token for this API's configured audience. "
+        "Use Authorization: Bearer <access_token> over HTTPS. "
+        "Each operation lists its required permission and device-access restrictions. "
+        "manage:devices is accepted from the JWT permissions array or space-separated scope claim; "
+        "it grants fleet management/read access, not permission to impersonate another device."
+    ),
+)
 
 
 class AuthenticationUnavailable(RuntimeError):

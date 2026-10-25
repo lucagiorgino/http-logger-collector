@@ -63,6 +63,7 @@ def require_device_management(claims: dict) -> None:
     "",
     status_code=201,
     response_model=DeviceConfiguration,
+    summary="Register a named device and its initial transfer policy",
     responses={400: {}, 401: {}, 403: {}, 422: {}, 503: {}},
 )
 async def register_device(
@@ -72,6 +73,13 @@ async def register_device(
     keys: EncryptionKeysDep,
     response: Response,
 ) -> DeviceConfiguration:
+    """Create a device with a unique ID and name; return its resource URL in `Location`.
+
+    **Required permission:** `manage:devices`.
+
+    Registration is atomic and rejects an existing ID or name with 400.
+    `optional` and `required` transfer encryption need an available application key.
+    """
     require_device_management(claims)
     if payload.encryption_mode != "tls_only" and keys.public_key is None:
         raise HTTPException(status_code=503, detail="Application encryption is unavailable")
@@ -87,13 +95,25 @@ async def register_device(
     return configuration_response(payload.device_id, document, keys)
 
 
-@router.get("", response_model=DevicePage, responses={401: {}, 422: {}, 503: {}})
+@router.get(
+    "",
+    response_model=DevicePage,
+    summary="List registered and agent-discovered devices",
+    responses={401: {}, 422: {}, 503: {}},
+)
 async def list_devices(
     claims: AuthenticatedClaims,
     repository: MongoRepositoryDep,
     after: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> DevicePage:
+    """List known devices in device-ID order, including unnamed agent-discovered records.
+
+    **Required permission:** None beyond authentication for the token's own device;
+    `manage:devices` for fleet-wide results.
+
+    Pass the returned `next_after` as `after` for the next page; null means the final page.
+    """
     documents = await repository.list_devices(
         device_id=authorized_device_id(claims), after=after, limit=limit + 1
     )
@@ -116,6 +136,7 @@ async def list_devices(
 @router.get(
     "/{device_id}",
     response_model=DeviceConfiguration,
+    summary="Read a stored device and its transfer configuration",
     responses={401: {}, 403: {}, 404: {}, 503: {}},
 )
 async def get_device(
@@ -124,6 +145,13 @@ async def get_device(
     repository: MongoRepositoryDep,
     keys: EncryptionKeysDep,
 ) -> DeviceConfiguration:
+    """Return a stored device's name, transfer policy and latest acknowledgement.
+
+    **Required permission:** None beyond authentication for the token's own device;
+    `manage:devices` to read another device.
+
+    Unknown devices return 404. Non-TLS-only policies include public JWE encryption parameters.
+    """
     authorized_device_id(claims, device_id)
     document = await repository.get_device_configuration(device_id)
     if "_id" not in document:
@@ -134,6 +162,7 @@ async def get_device(
 @router.get(
     "/{device_id}/configuration",
     response_model=DeviceConfiguration,
+    summary="Fetch the effective device transfer policy",
     responses={401: {}, 403: {}, 503: {}},
 )
 async def get_configuration(
@@ -142,6 +171,14 @@ async def get_configuration(
     repository: MongoRepositoryDep,
     keys: EncryptionKeysDep,
 ) -> DeviceConfiguration:
+    """Return the policy an agent should apply and the suggested refresh interval.
+
+    **Required permission:** None beyond authentication for the token's own device;
+    `manage:devices` to read another device.
+
+    Unlike the device detail endpoint, an unknown ID returns the default version-0
+    `tls_only` configuration. `optional`/`required` include public JWE parameters.
+    """
     authorized_device_id(claims, device_id)
     document = await repository.get_device_configuration(device_id)
     return configuration_response(device_id, document, keys)
@@ -150,6 +187,7 @@ async def get_configuration(
 @router.patch(
     "/{device_id}/configuration",
     response_model=DeviceConfiguration,
+    summary="Change a device's transfer encryption policy",
     responses={401: {}, 403: {}, 409: {}, 503: {}},
 )
 async def patch_configuration(
@@ -159,6 +197,14 @@ async def patch_configuration(
     repository: MongoRepositoryDep,
     keys: EncryptionKeysDep,
 ) -> DeviceConfiguration:
+    """Set `tls_only`, `optional` or `required` application encryption for uploads.
+
+    **Required permission:** `manage:devices`.
+
+    Read the current configuration first and send its version as `expected_version`.
+    A stale version returns 409; a successful write increments the version.
+    This policy controls transfer encryption, not workspace field encryption at rest.
+    """
     require_device_management(claims)
     if payload.encryption_mode != "tls_only" and keys.public_key is None:
         raise HTTPException(status_code=503, detail="Application encryption is unavailable")
@@ -173,6 +219,7 @@ async def patch_configuration(
 @router.put(
     "/{device_id}/configuration-status",
     response_model=ReportedConfigurationStatus,
+    summary="Acknowledge the policy applied by the authenticated device",
     responses={401: {}, 403: {}, 409: {}, 503: {}},
 )
 async def put_configuration_status(
@@ -182,6 +229,15 @@ async def put_configuration_status(
     repository: MongoRepositoryDep,
     keys: EncryptionKeysDep,
 ) -> ReportedConfigurationStatus:
+    """Report `applied`, `unsupported` or `error` for the current configuration version.
+
+    **Required permission:** None beyond authentication.
+
+    **Device restriction:** The path ID must match the token's device, even with
+    `manage:devices`. Managers cannot acknowledge another device's policy.
+    Stale versions return 409. Applying an encrypted policy requires encryption support
+    and the active public key's `kid`; mismatches return 422.
+    """
     if authenticated_identity(claims).device_id != device_id:
         raise HTTPException(
             status_code=403, detail="Only the authenticated device can report status"

@@ -9,10 +9,23 @@ from app.schemas.workspace import WorkspaceConfiguration, WorkspacePatch
 router = APIRouter(prefix="/api/v1/workspace/configuration", tags=["workspace"])
 
 
-@router.get("", response_model=WorkspaceConfiguration, responses={401: {}, 403: {}, 503: {}})
+@router.get(
+    "",
+    response_model=WorkspaceConfiguration,
+    summary="Read workspace storage and retention policies",
+    responses={401: {}, 403: {}, 503: {}},
+)
 async def get_configuration(
     claims: AuthenticatedClaims, repository: MongoRepositoryDep
 ) -> WorkspaceConfiguration:
+    """Read shared storage/discard choices, field encryption and log-retention windows.
+
+    **Required permission:** `manage:devices`.
+
+    Defaults retain sensitive categories encrypted, expire ordinary logs after 7 days
+    and suspicious logs after 30 days. Disabling a retention window keeps that category
+    indefinitely. The returned version is required for updates.
+    """
     require_device_management(claims)
     return WorkspaceConfiguration.model_validate(await repository.get_workspace_configuration())
 
@@ -20,6 +33,7 @@ async def get_configuration(
 @router.patch(
     "",
     response_model=WorkspaceConfiguration,
+    summary="Update workspace storage and retention policies",
     responses={401: {}, 403: {}, 409: {}, 422: {}, 503: {}},
 )
 async def patch_configuration(
@@ -28,6 +42,19 @@ async def patch_configuration(
     repository: MongoRepositoryDep,
     storage: StorageEncryptionDep,
 ) -> WorkspaceConfiguration:
+    """Save versioned policies shared by all devices.
+
+    **Required permission:** `manage:devices`.
+
+    Send the current `expected_version` and all three `encrypt_*` flags. Other omitted
+    settings keep their saved values. A false `retain_*` discards that category before
+    storage; discarding a body preserves its byte length and SHA-256 digest.
+    Storage changes affect new uploads only. Retention changes also affect existing
+    logs through asynchronous, event-time MongoDB TTL deletion.
+
+    A stale version returns 409. A TTL-index failure returns 503 even if desired
+    settings were saved; read the latest version and retry to reconcile indexes.
+    """
     require_device_management(claims)
     changes = payload.model_dump(exclude={"expected_version"}, exclude_unset=True)
     policy = WorkspaceConfiguration.model_validate(

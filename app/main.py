@@ -34,7 +34,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await repository.close()
 
 
-app = FastAPI(title="Amazing HTTP Logger", lifespan=lifespan)
+app = FastAPI(
+    title="Amazing HTTP Logger",
+    description=(
+        "Collect HTTP traffic from authenticated devices and manage their configuration. "
+        "Expand an operation to see its **Required permission**, access restrictions and examples. "
+        "All `/api/v1/` operations require an Auth0 bearer access token and HTTPS by default. "
+        "An operation stating **None beyond authentication** does not require any OAuth scope. "
+        "The device identity comes from the verified `https://amazing-http-logger/device_id` "
+        "claim, falling back to `sub`; `/api/v1/me` shows the resolved identity. "
+        "Use **Authorize** to supply an access token; this API does not issue tokens."
+    ),
+    lifespan=lifespan,
+)
 
 app.include_router(auth_router)
 app.include_router(batches_router)
@@ -73,8 +85,17 @@ async def storage_unavailable(
     )
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    tags=["health"],
+    summary="Check that the API process is responding",
+    responses={200: {"content": {"application/json": {"example": {"status": "ok"}}}}},
+)
 async def health() -> dict[str, str]:
+    """Return process liveness; this does not check MongoDB, OpenBao or Auth0 availability.
+
+    **Required permission:** None. Public endpoint; no bearer token is required.
+    """
     return {"status": "ok"}
 
 

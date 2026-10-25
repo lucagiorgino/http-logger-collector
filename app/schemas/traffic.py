@@ -20,6 +20,50 @@ Duration = Annotated[float, Field(strict=True, ge=0, le=86_400_000, allow_inf_na
 CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 HTTP_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
+TRAFFIC_BATCH_EXAMPLE = {
+    "logs": [
+        {
+            "timestamp": "2026-10-25T07:00:00Z",
+            "method": "POST",
+            "url": "https://example.com/api/events",
+            "status_code": 201,
+            "request_headers": {"Content-Type": "text/plain"},
+            "response_headers": {"Content-Type": "application/json"},
+            "captured_source_ip": "192.0.2.10",
+            "destination_ip": "198.51.100.20",
+            "source_port": 49152,
+            "destination_port": 443,
+            "http_version": "2",
+            "duration_ms": 12.5,
+            "process_name": "example-agent",
+            "process_id": 1234,
+            "request_id": "request-123",
+            "body": "hello",
+        }
+    ]
+}
+STORED_TRAFFIC_LOG_EXAMPLE = {
+    "id": "507f1f77bcf86cd799439011",
+    "batch_id": "2cc6199a-08e5-4aae-8ab3-60c7c96d1141",
+    "device_id": "device-456",
+    "suspicious": False,
+    "client_id": "agent-client",
+    "timestamp": "2026-10-25T07:00:00Z",
+    "received_at": "2026-10-25T07:00:01Z",
+    "method": "POST",
+    "url": "https://example.com/api/events",
+    "status_code": 201,
+    "headers": {"Content-Type": "text/plain"},
+    "request_headers": {"Content-Type": "text/plain"},
+    "response_headers": {"Content-Type": "application/json"},
+    "source_ip": "203.0.113.10",
+    "captured_source_ip": "192.0.2.10",
+    "destination_ip": "198.51.100.20",
+    "body_length": 5,
+    "body_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    "storage_encrypted_fields": ["body"],
+}
+
 
 class TrafficLogRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -149,18 +193,36 @@ class TrafficLogRequest(BaseModel):
 
 
 class TrafficLogBatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid", json_schema_extra={"examples": [TRAFFIC_BATCH_EXAMPLE]}
+    )
 
     logs: list[TrafficLogRequest] = Field(min_length=1, max_length=500)
 
 
 class BatchReceipt(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "batch_id": "2cc6199a-08e5-4aae-8ab3-60c7c96d1141",
+                    "accepted_count": 1,
+                    "status": "stored",
+                },
+            ]
+        }
+    )
+
     batch_id: str
     accepted_count: int
     status: Literal["stored", "queued"]
 
 
 class StoredTrafficLog(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{**STORED_TRAFFIC_LOG_EXAMPLE, "body": "hello"}]}
+    )
+
     id: str
     batch_id: str
     device_id: str
@@ -197,5 +259,11 @@ class StoredTrafficLog(BaseModel):
 
 
 class TrafficLogPage(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [{"items": [STORED_TRAFFIC_LOG_EXAMPLE], "next_cursor": None}]
+        }
+    )
+
     items: list[StoredTrafficLog]
     next_cursor: str | None

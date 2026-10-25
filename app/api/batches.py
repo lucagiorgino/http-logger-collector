@@ -15,7 +15,12 @@ from app.deps import (
     MongoRepositoryDep,
     StorageEncryptionDep,
 )
-from app.schemas.traffic import BatchReceipt, TrafficLogBatch, TrafficLogRequest
+from app.schemas.traffic import (
+    TRAFFIC_BATCH_EXAMPLE,
+    BatchReceipt,
+    TrafficLogBatch,
+    TrafficLogRequest,
+)
 from app.schemas.workspace import WorkspaceConfiguration
 from app.services.traffic_service import ingest_traffic_logs, ingestion_context
 
@@ -107,7 +112,7 @@ async def read_compressed_batch(
                 " Identity fields are server-derived from the verified JWT; source_ip "
                 "comes from the trusted connection. Do not include attribution in logs. "
                 "Captured endpoints, HTTP metrics and process fields are agent-reported observations. "
-                "Unexpected/duplicate fields, unsafe header keys and invalid types reject the whole batch. "
+                "Unexpected/duplicate fields, unsafe header keys and invalid types reject the batch. "
                 "Each batch belongs to the single authenticated device returned by /api/v1/me."
             ),
             "content": {
@@ -123,10 +128,24 @@ async def read_compressed_batch(
                                 "maxItems": 500,
                                 "items": TrafficLogRequest.model_json_schema(),
                             },
-                            "application/jose": {"schema": {"type": "string"}},
                         },
-                    }
-                }
+                    },
+                    "examples": {
+                        "before_compression": {
+                            "summary": "JSON before gzip compression; do not send uncompressed",
+                            "value": TRAFFIC_BATCH_EXAMPLE,
+                        }
+                    },
+                },
+                "application/jose": {
+                    "schema": {"type": "string"},
+                    "examples": {
+                        "compact_jwe_structure": {
+                            "summary": "Illustrative only; generate a real JWE using the device key",
+                            "value": "<protected-header>..<iv>.<ciphertext>.<authentication-tag>",
+                        }
+                    },
+                },
             },
         }
     },
@@ -139,6 +158,20 @@ async def create_traffic_log_batch(
     storage: StorageEncryptionDep,
     payload: Annotated[TrafficLogBatch, Depends(read_compressed_batch)],
 ) -> BatchReceipt:
+    """Validate and accept 1–500 HTTP events as one all-or-nothing batch.
+
+    **Required permission:** None beyond authentication.
+
+    **Device restriction:** All events belong to the token's device, even with
+    `manage:devices`; do not send identity or `suspicious` fields in the payload.
+    The device's transfer policy determines whether gzip JSON or JWE is allowed.
+    The JSON example shows the data **before gzip compression**; Swagger UI does not
+    gzip or encrypt it. Send compressed bytes with `Content-Encoding: gzip`, or generate
+    a compact JWE over those bytes with no Content-Encoding header.
+
+    HTTP 202 with `status=stored` means the complete validated batch was persisted.
+    Workspace storage/discard rules apply before publishing; storage failures return 503.
+    """
     context = ingestion_context(claims, request)
     configuration = await repository.get_device_configuration(context.identity.device_id)
     mode = configuration["encryption_mode"]

@@ -25,11 +25,52 @@ class RetentionPolicy(BaseModel):
 
 
 class WorkspaceConfiguration(StoragePolicy, RetentionPolicy):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "version": 3,
+                    "updated_at": "2026-10-25T07:00:00Z",
+                    "retain_request_body": True,
+                    "retain_authorization_header": True,
+                    "retain_cookies": True,
+                    "encrypt_request_body": True,
+                    "encrypt_authorization_header": True,
+                    "encrypt_cookies": True,
+                    "retention_enabled": True,
+                    "retention_days": 7,
+                    "suspicious_retention_enabled": True,
+                    "suspicious_retention_days": 30,
+                }
+            ]
+        }
+    )
+
     version: int = 0
     updated_at: datetime | None = None
 
 
 class WorkspacePatch(StoragePolicy, RetentionPolicy):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "expected_version": 2,
+                    "retain_request_body": True,
+                    "retain_authorization_header": True,
+                    "retain_cookies": True,
+                    "encrypt_request_body": True,
+                    "encrypt_authorization_header": True,
+                    "encrypt_cookies": True,
+                    "retention_enabled": True,
+                    "retention_days": 7,
+                    "suspicious_retention_enabled": True,
+                    "suspicious_retention_days": 30,
+                }
+            ]
+        }
+    )
+
     expected_version: Annotated[int, Field(strict=True, ge=0, le=2**53 - 1)]
     encrypt_request_body: bool = Field(strict=True)
     encrypt_authorization_header: bool = Field(strict=True)
