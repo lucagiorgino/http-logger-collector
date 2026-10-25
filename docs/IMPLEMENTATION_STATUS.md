@@ -1,12 +1,30 @@
 # Implementation status
 
 ## Current status
+- **Storage and encryption** offers independent discard, retain encrypted (default)
+  and retain plaintext choices for request bodies, authorization headers and
+  cookies. Strict `retain_*` settings default to true and are preserved when
+  omitted by existing clients. Discard happens before KMS/publishing, removes
+  credential/cookie entries from both header maps, and preserves body length/digest
+  metadata. Existing logs remain unchanged. Workspace saves validate KMS only
+  for categories configured for encrypted retention.
+- Workspace configuration includes independent enabled retention windows for
+  ordinary logs (7 days) and suspicious logs (30 days). MongoDB 7+ partial TTL
+  indexes on event time expire each metadata category independently; disabled
+  means indefinite. Startup/save reconcile indexes, rebuilding changed TTL
+  indexes on MongoDB 7 and reporting failures explicitly. Changes affect existing
+  logs, with asynchronous bucket/monitor delay and irreversible-deletion warnings.
+  New records have a server-owned `metadata.suspicious=false`, exposed as
+  `suspicious` in analysis responses. Agents cannot supply this flag.
+  The future analysis job/classification workflow is intentionally not implemented.
 - Root-level `frontend/` implements a Next.js SSR management dashboard using
   JavaScript/JSX, Tailwind and shadcn/ui. Auth0 sessions/API tokens stay server-side.
   Screens cover sample overview metrics, filtered/paginated traffic, request
-  details, exact-device policy management and acknowledgement, and verified owner.
-  It preserves current owner boundaries; cross-owner fleet management and inventory
-  require new backend contracts and are not implied by management permission.
+  details, named device registration/inventory, policy management and acknowledgement,
+  application-wide storage encryption settings, and verified device identity.
+  Registration and initial policy are saved atomically;
+  IDs and names are globally unique and duplicates return 400. Management tokens
+  can administer the fleet; ordinary agents remain restricted to their JWT device.
 - Project structure initialized.
 - Core FastAPI app skeleton created.
 - API, service, publisher, and persistence layers are implemented.
@@ -18,8 +36,16 @@
   depends on deprecated `authlib.jose`; this upstream import warning remains visible.
 - Versioned identity, gzip-batch ingestion, and log collection/item analysis endpoints
   use verified Auth0 bearer tokens. Login/token issuance remains delegated to Auth0.
-- Traffic logs are normalized, redacted, and persisted to MongoDB with authenticated ownership checks.
-- MongoDB time-series storage uses stable user/device metadata and supports indexed
+- Device registration uses `POST /api/v1/devices` with `manage:devices`, a server-owned
+  registration timestamp and unique ID/name constraints. Inventory collection/item reads
+  are device-authorized and primary-backed; registration does not issue credentials or
+  change the JWT-bound ingestion identity. Existing policy-only agents remain supported.
+- Traffic logs are normalized, redacted, and persisted with server-owned attribution.
+  Verified JWT claims supply device and optional OAuth client identity;
+  the ASGI connection supplies source IP after trusted-proxy handling. Batch
+  schemas reject client attribution fields, including inside JWE payloads.
+  `/me` exposes the JWT-bound device used for ingestion policy enforcement.
+- MongoDB time-series storage buckets by device and suspicious classification and supports indexed
   event-time queries with keyset pagination.
 - Writes use primary with majority acknowledgement; deployment analysis uses strict
   secondary reads. Single-node local development explicitly enables primary analysis,
@@ -39,9 +65,23 @@
   values opt into a persistent three-member MongoDB StatefulSet and bootstrap Job.
 - The bundled development database has a headless Service and ingress NetworkPolicy;
   it has no authentication/TLS and must not be used in production.
-- Raw request bodies are not stored; body length and SHA-256 are retained for correlation.
+- Request bodies, authorization headers and cookies are retained with default-on
+  workspace field encryption. A dedicated non-exportable OpenBao Transit AES-256-GCM
+  key, separate from upload keys/the KEK, uses random 96-bit nonces and record-bound
+  associated data. Body length and SHA-256 are also retained for correlation.
+  Explicit plaintext choices permit future unencrypted storage; discard choices
+  remove the selected fields before persistence. Existing logs are unchanged.
+  Versioned workspace GET/PATCH operations require `manage:devices` and use primary.
+  Replica-backed detail reads decrypt bodies; collections omit bodies and all
+  credential header responses remain redacted. KMS failures fail closed.
+- HTTP events retain timestamp/method/URL/status, redacted request/response headers,
+  captured endpoints/ports, HTTP version, sizes, duration, process name/PID and request ID.
+  Optional observations remain untrusted and distinct from JWT/network attribution.
+  New documents use `request_headers`; historical `headers` remains readable.
+  Gzip/JWE share closed, typed, bounded validation with duplicate-JSON-key and unsafe
+  header-key rejection; invalid records reject the entire batch before publishing.
 - Security-oriented defaults and redaction rules have been documented.
-- Device policy/status APIs implement owner-scoped configuration, permission-gated
+- Device policy/status APIs implement device-scoped configuration, permission-gated
   changes, atomic versions, and client capability/error reporting.
 - JWE application encryption uses configured ECDH/AES suites (default NIST P-384,
   ECDH-ES+A256KW and A256GCM) with bounded decrypt/gzip
@@ -57,6 +97,9 @@
   TokenReview RBAC, bootstrap Job, and root credentials isolated from API pods.
 
 ## Open items
+- design the trusted per-record suspicious-classification job around MongoDB
+  time-series update constraints and ordinary TTL deadlines; it is not included
+  in the retention implementation
 - replace placeholder Auth0 domain and audience values with a real tenant configuration
 - validate the token flow against a real Auth0 API and permission grant
 - validate MongoDB behavior against production-scale retention and query requirements
@@ -72,9 +115,24 @@
   or redesign the client protocol; OpenBao Transit does not offer ECDH JWE decryption
 
 ## Test inventory
+- Field discard tests cover independent categories, mixed-case request/response
+  headers, preserved body fingerprints, no KMS call for discarded values, legacy
+  omitted settings, and historical record readability. Real API/MongoDB checks
+  verify discarded values are absent from storage; JavaScript-disabled workspace
+  browser tests persist discard/encrypted/plaintext choices.
+- Strict retention configuration, permission/version handling, legacy classification,
+  read-back flags and rejection of agent-assigned suspicious status
+- Real MongoDB partial TTL deletion of old ordinary/legacy and suspicious records,
+  preservation under longer suspicious/disabled ordinary windows, changed windows,
+  independently removed indexes and startup reconciliation
+- JavaScript-disabled workspace browser form persists independent windows/enabled
+  states and rejects stale combined encryption/retention edits
 - API surface and normalized/redacted batch persistence
-- gzip batch validation, size limits, ownership checks, and publisher replacement
-- owner-scoped analysis, filter validation, and timestamp/ID pagination
+- gzip batch validation, size limits, trusted attribution, and publisher replacement
+- Signed-JWT ingestion attribution, device-claim fallback/rejection, forbidden
+  payload metadata, IPv4/IPv6/missing peers and trusted/untrusted proxy forwarding
+- JWT device-scoped analysis, operator fleet reads, filter validation, and timestamp/ID pagination
+- Global ID/name uniqueness under concurrent registration and duplicate HTTP 400
 - explicit ingestion/read failures and replica-set connection constraints
 - time-series initialization, startup races, invalid collection options, and routing
 - optional real replica-set integration test: time-series indexes and inserts,
@@ -100,7 +158,7 @@
   EC key generation/curve validation, non-configured cipher rejection, and unsafe
   configuration or ephemeral-private-key rejection
 - Real single-node integration covers persistent policies/status, concurrent
-  compare-and-swap, encrypted and plaintext ingestion, and owner isolation
+  compare-and-swap, encrypted and plaintext ingestion, and device isolation
 - OpenBao unit tests cover token/Kubernetes authentication, sanitized failures,
   HTTPS enforcement, wrapped-only CAS writes, and incompatible/exportable KEK rejection
 - Real OpenBao tests cover Transit unwrap, staged EC rotation/activation/retirement,
@@ -111,8 +169,8 @@
   privileged-credential log checks, and the Helm smoke test
 - An opt-in HTTP-only whole-stack test exchanges two dedicated OAuth client
   credentials on device threads, uploads encrypted/plain batches, and verifies
-  persisted analysis, redaction, policy enforcement and cross-owner isolation.
-  It uses stable configured device IDs, reads pre-existing policies and reports
+  persisted analysis, redaction, policy enforcement and cross-device isolation.
+  It discovers JWT-bound device IDs from `/me`, reads pre-existing policies and reports
   agent status without changing policy or requesting management permission.
   Harness unit tests cover concurrent identities, advertised JWE suites, safe
   configuration and explicit OAuth/storage/visibility failures. A live Auth0 run
@@ -124,6 +182,49 @@ These Mermaid diagrams describe the **current implementation**, not a proposed
 fleet-management or queue deployment. Keep this section synchronized when changing
 routes, authentication, publisher boundaries, deployment profiles, or KMS commands.
 Ports shown are defaults; environment variables and Helm values remain authoritative.
+
+### High-level component diagram
+
+This logical view shows the application components and their external dependencies,
+independently of where they run. The development and deployment views below add
+infrastructure, ports, credentials and lifecycle details.
+
+```mermaid
+flowchart LR
+    Operator["Operator browser"]
+    Agents["Device agents"]
+    Identity["Auth0<br/>Identity and access tokens"]
+
+    subgraph Application["Application components"]
+        Dashboard["Next.js SSR dashboard<br/>Server-side sessions and API calls"]
+        API["FastAPI backend<br/>Authentication, device/workspace policy<br/>Batch validation and storage encryption"]
+        Publisher["IngestionPublisher interface<br/>MVP: direct MongoDB adapter"]
+    end
+
+    Primary[("MongoDB primary<br/>Time-series logs with category TTL<br/>Device and workspace configuration/status")]
+    Replica[("MongoDB read replicas<br/>Traffic analysis")]
+    KMS["OpenBao<br/>Transit KEK, wrapped EC key set<br/>Separate non-exportable storage key"]
+
+    Operator -->|"HTML, forms and session cookie"| Dashboard
+    Operator -->|"Interactive authorization"| Identity
+    Dashboard -->|"Server-side code/token exchange"| Identity
+    Agents -->|"Access-token acquisition"| Identity
+    Dashboard -->|"Server-side bearer API requests"| API
+    Agents -->|"Bearer API requests<br/>gzip JSON or JWE batches"| API
+    API -->|"Token verification via discovery/JWKS"| Identity
+    API -->|"Load and unwrap EC keys at startup"| KMS
+    API -->|"Encrypt stored fields and decrypt authorized details"| KMS
+    API -->|"Normalized documents with protected field ciphertext"| Publisher
+    Publisher -->|"Majority log writes"| Primary
+    API -->|"Device inventory/status and workspace configuration"| Primary
+    Primary -->|"Replication"| Replica
+    API -->|"Analysis reads, strict secondary"| Replica
+```
+
+The publisher is the replaceable queue boundary; no broker or consumer is deployed
+in the MVP. Analysis reads use read replicas in deployment, with an explicit
+primary-read exception for single-member local development. Device configuration
+and status operations use the primary in both environments.
 
 ### Development architecture
 
@@ -141,7 +242,7 @@ flowchart LR
         FrontEnv["frontend/.env.local<br/>Web application credentials and session secret"]
         Env[".env<br/>Parameterized backend and Compose settings"]
         Front["Next.js SSR frontend<br/>127.0.0.1:3000<br/>Server-side Auth0 session and API adapter"]
-        API["FastAPI / Uvicorn<br/>127.0.0.1:8001<br/>Auth0FastAPI, validation and owner checks"]
+        API["FastAPI / Uvicorn<br/>127.0.0.1:8001<br/>Auth0FastAPI, validation and device checks"]
         Keys["EC key set cached in API RAM<br/>Local JWE decryption"]
         Publisher["IngestionPublisher interface"]
         Direct["MongoIngestionPublisher<br/>Direct-write MVP adapter"]
@@ -184,9 +285,10 @@ flowchart LR
 ```
 
 There is no broker or consumer process in the MVP. The replaceable publisher
-receives normalized/redacted documents **after** decryption, validation and policy
-checks. Development OpenBao restart loses the KEK and EC key set; it does not
-erase already normalized MongoDB logs.
+receives normalized documents **after** upload decryption, validation, policy
+checks and storage field encryption. Development OpenBao restart loses the KEK,
+EC key set and storage key; existing MongoDB logs remain, but encrypted fields
+become permanently unreadable. Production requires persistent key storage/backups.
 
 ### Deployment architecture
 
@@ -275,9 +377,10 @@ replicas. Every replica has its own startup-loaded EC key cache.
 ### Operation inventory
 
 The sequences below share the authentication guard rather than repeating its
-discovery/JWKS exchange on every API request. All resource paths are owner-scoped.
-`manage:devices` permits policy changes within the verified owner, not impersonation
-or cross-owner administration.
+discovery/JWKS exchange on every API request. Resource keys use only device IDs.
+Ordinary agents are restricted to their JWT-bound device; `manage:devices` permits
+fleet-wide registration, policy changes and reads, but not agent impersonation
+for status reports.
 
 | Operation | Sequence |
 | --- | --- |
@@ -285,7 +388,9 @@ or cross-owner administration.
 | Machine-to-machine agent token acquisition | [Agent authentication](#agent-authentication) |
 | HTTPS and bearer verification for `/api/v1/*` | [Shared API authentication guard](#shared-api-authentication-guard) |
 | `GET /api/v1/me` | [Verified identity](#verified-identity) |
+| `GET/PATCH /api/v1/workspace/configuration`, workspace form and `rotate-storage` | [Workspace storage configuration](#workspace-storage-configuration) |
 | SSR overview, traffic, request details and workspace | [Server-rendered dashboard reads](#server-rendered-dashboard-reads) |
+| `POST /api/v1/devices`, `GET /api/v1/devices`, `GET /api/v1/devices/{id}` and UI registration | [Device registration and inventory](#device-registration-and-inventory) |
 | `GET /api/v1/devices/{id}/configuration` | [Device policy lookup](#device-policy-lookup) |
 | `PATCH /api/v1/devices/{id}/configuration`, including UI form save | [Device policy change](#device-policy-change) |
 | `PUT /api/v1/devices/{id}/configuration-status` | [Agent acknowledgement](#agent-acknowledgement) |
@@ -302,7 +407,7 @@ or cross-owner administration.
 
 Schema validation and persistence-unavailable errors apply across resource
 operations, even where their shared branches are omitted. There are no local
-login/token, fleet-inventory, cross-owner management, or log/device deletion APIs.
+login/token, aggregation, or log/device deletion APIs.
 
 #### Dashboard authentication
 
@@ -343,7 +448,12 @@ sequenceDiagram
         Browser->>UI: GET /auth/logout
         UI-->>Browser: Clear local session#59; redirect through Auth0 logout
         Browser->>IdP: End provider session
-        IdP-->>Browser: Return to configured application URL
+        alt Configured APP_BASE_URL is in this Web application's Allowed Logout URLs
+            IdP-->>Browser: End provider session and return to configured application URL
+        else Return URL not allowed
+            IdP-->>Browser: 400 invalid_request on Auth0-hosted error page
+            Note over Browser,IdP: Local cookie already cleared#59; provider SSO may remain active
+        end
     end
     Note over Browser,UI: Browser API-token endpoint is disabled#59; tokens are not client component props
 ```
@@ -403,7 +513,7 @@ sequenceDiagram
                 alt Verified bearer contains proof-binding claim
                     API-->>Caller: 401, proof-bound tokens unsupported by this API
                 else Token is not proof-bound
-                    API->>API: Execute resource-specific owner and permission checks
+                    API->>API: Execute resource-specific device and permission checks
                 end
             end
         end
@@ -421,13 +531,14 @@ sequenceDiagram
     participant Caller as Agent or frontend server
     participant API as FastAPI
     Caller->>API: GET /api/v1/me with verified bearer
-    API->>API: Require nonempty string sub
-    alt Subject available
-        API-->>Caller: 200 with user_id equal to verified sub
-    else Subject missing or invalid
+    API->>API: Validate bounded nonempty sub and any device/client identity claims
+    alt Identity claims valid
+        API->>API: Derive device_id from signed device claim or sub
+        API-->>Caller: 200 with device_id and optional JWT OAuth client_id
+    else Identity missing or invalid
         API-->>Caller: 401 with bearer challenge
     end
-    Note over Caller,API: No local login, token-issuance or owner-selection endpoint
+    Note over Caller,API: No local login, token-issuance or upload identity-selection endpoint
 ```
 
 #### Server-rendered dashboard reads
@@ -454,7 +565,7 @@ sequenceDiagram
         end
         Note over UI,API: Server-only bearer forwarding#59; no-store#59; no redirect following
         alt Backend operation succeeds
-            API-->>UI: Owner-scoped JSON
+            API-->>UI: Device-authorized JSON
             UI-->>Browser: Private, server-rendered HTML
         else Backend denies or cannot serve request
             API-->>UI: 401, 403, 404, 409, 422 or 503
@@ -463,6 +574,89 @@ sequenceDiagram
     end
     Note over Browser,UI: Overview metrics describe the latest-50-record sample, not fleet totals
 ```
+
+#### Workspace storage configuration
+
+```mermaid
+sequenceDiagram
+    actor Operator
+    participant UI as Next.js SSR and Server Action
+    participant API as FastAPI
+    participant Primary as MongoDB primary
+    participant Transit as OpenBao dedicated storage key
+    Operator->>UI: Open Workspace
+    UI->>API: GET /api/v1/workspace/configuration with server-side bearer
+    API->>API: Require manage:devices
+    API->>Primary: Majority read of application-wide configuration
+    Primary-->>API: Saved switches/version or all-enabled version 0 defaults
+    API-->>UI: Three switches, version and update timestamp
+    UI-->>Operator: Storage/encryption and retention forms with discard/plaintext/deletion warnings
+    Operator->>UI: Change switches/windows and save
+    UI->>API: PATCH encryption/retention policy and expected_version
+    API->>API: Require manage:devices and strict Boolean schema
+    opt Any category retained and encrypted
+        API->>Transit: Validate non-exportable randomized AES-256-GCM key
+    end
+    API->>Primary: Atomic expected-version update with majority acknowledgement
+    alt Stale version
+        Primary-->>API: No match or concurrent first-write conflict
+        API-->>UI: 409
+        UI-->>Operator: Explicit conflict and current settings
+    else Saved
+        Primary-->>API: Incremented version and server update time
+        API->>Primary: Reconcile partial TTL indexes and recheck latest settings version
+        Note over API,Primary: DDL failure returns 503; desired settings may already be saved
+        API-->>UI: 200 configuration
+        UI-->>Operator: Field storage for future uploads; retention also affects existing logs
+    end
+    Note over API,Transit: KMS failures return sanitized 503, never plaintext fallback
+    Note over Operator,Transit: Admin rotate-storage creates a new key version, preserving older decrypt versions
+```
+
+#### Device registration and inventory
+
+```mermaid
+sequenceDiagram
+    actor Operator
+    participant UI as Next.js SSR and Server Actions
+    participant API as FastAPI
+    participant Primary as MongoDB primary
+    Operator->>UI: Enter JWT-bound device ID, name and initial policy
+    UI->>UI: Require session and validate form fields
+    UI->>API: POST /api/v1/devices with server-side bearer
+    API->>API: Verify manage:devices, schema and encryption-key availability
+    API->>Primary: Atomic insert with unique device ID and name indexes
+    alt Device ID or name already exists
+        Primary-->>API: Duplicate key
+        API-->>UI: 400, no overwrite
+        UI-->>Operator: Device already exists; use unique ID/name or edit existing policy
+    else Registration persisted with majority acknowledgement
+        Primary-->>API: Name, registration time and policy version 1
+        API-->>UI: 201, Location and configuration/public key
+        UI-->>Operator: Device registered; dedicated detail page and policy editor
+    end
+    UI->>API: GET /api/v1/devices with bounded limit/after
+    API->>Primary: All accessible stored configuration records ordered by device ID
+    Primary-->>API: Page plus lookahead
+    API-->>UI: items and next_after
+    UI-->>Operator: Stored device links, optional names and current policy
+    Operator->>UI: Select device; navigate to /devices/id
+    UI->>API: GET /api/v1/devices/id
+    API->>Primary: Read stored policy, registration metadata and acknowledgement
+    Primary-->>API: Device configuration or absent
+    API-->>UI: Device details or 404 if absent
+    UI-->>Operator: Identity, policy editor, acknowledgement, public suite and traffic link
+    Note over Operator,Primary: No Auth0 credentials issued; registration does not prove connectivity
+```
+
+Policy/status-only records already reserve their device ID; registration rejects
+them with 400 rather than overwriting or adopting them. Inventory includes stored
+policy/status-only and version-zero records, with nullable name/registration time.
+A default-only `/configuration` lookup does not persist a device or add it to
+inventory. Missing item reads return 404; they never silently appear as defaults.
+Registration is not an additional admission
+check for legacy agents. The device-only schema starts with an explicitly reset
+test database; there is no migration or automatic reset path.
 
 #### Device policy lookup
 
@@ -473,7 +667,8 @@ sequenceDiagram
     participant Primary as MongoDB primary
     participant Keys as API EC key cache
     Caller->>API: GET /api/v1/devices/id/configuration
-    API->>Primary: Find configuration by verified sub and device ID#59; majority read
+    API->>API: Require matching JWT device or management grant
+    API->>Primary: Find configuration by device ID#59; majority read
     alt No saved configuration
         Primary-->>API: No document
         API->>API: Default version 0, tls_only
@@ -515,12 +710,12 @@ sequenceDiagram
     else Enabling JWE without available keys
         API-->>UI: 503
     else Authorized and representable policy
-        API->>Primary: Owner-scoped compare-and-swap#59; increment version#59; majority write
+        API->>Primary: Device-keyed compare-and-swap#59; increment version#59; majority write
         alt Expected version current
             Primary-->>API: Updated configuration
             API-->>UI: 200 new configuration/version
         else Stale version or concurrent create
-            Primary-->>API: No matching update or duplicate owner/device ID
+            Primary-->>API: No matching update or duplicate device ID
             API-->>UI: 409
         end
     end
@@ -529,7 +724,7 @@ sequenceDiagram
     UI->>API: Reload current policy and acknowledgement
     API-->>UI: Current configuration
     UI-->>Browser: SSR policy#59; distinguish saved version from agent-applied version
-    Note over Operator,Primary: Permission remains owner-scoped#59; human and M2M subjects are not interchangeable
+    Note over Operator,Primary: Management permission covers the fleet#59; uploads and reports still use JWT device identity
 ```
 
 Invalid JSON/schema values return 422 before a write. Policy changes do not
@@ -547,7 +742,8 @@ sequenceDiagram
     Agent->>Agent: Apply advertised configuration or detect unsupported/error state
     Agent->>API: PUT /api/v1/devices/id/configuration-status
     Note over Agent,API: Report version, applied/unsupported/error, capability and optional key/detail
-    API->>Primary: Read current owner/device policy on primary
+    API->>API: Require path ID to equal JWT-bound device ID
+    API->>Primary: Read current device policy on primary
     alt Report version is stale
         API-->>Agent: 409#59; refresh configuration
     else Applied JWE report has wrong key or lacks encryption capability
@@ -561,7 +757,7 @@ sequenceDiagram
             API-->>Agent: 200 report with server reported_at
         end
     end
-    Note over Agent,Primary: No manage:devices grant required#59; only this owner's device is affected
+    Note over Agent,Primary: No manage:devices grant required#59; only the JWT-bound device is affected
 ```
 
 Agents must refresh public key/suite data even when the policy version is
@@ -574,6 +770,7 @@ sequenceDiagram
     participant Agent
     participant API as FastAPI
     participant Keys as API EC key cache
+    participant Transit as OpenBao storage key
     participant Primary as MongoDB primary
     participant Publisher as IngestionPublisher
     participant Adapter as MongoIngestionPublisher
@@ -588,16 +785,23 @@ sequenceDiagram
         Agent->>API: POST same resource#59; application/json and Content-Encoding gzip
     end
     API->>API: Bound gzip to 1 MiB and expanded JSON to 8 MiB
-    API->>API: Validate exactly one gzip member, full batch schema and all owner IDs
-    loop Every distinct device in batch
-        API->>Primary: Majority read of current owner/device policy
-        Primary-->>API: Effective encryption mode
-        API->>API: Reject plaintext for required or JWE for tls_only
-    end
-    alt Envelope, format, limit, schema, ownership or policy check fails
-        API-->>Agent: Explicit 400, 403, 413, 415, 422 or dependency 503#59; do not publish
+    API->>API: Validate exactly one gzip member and full schema#59; reject payload attribution
+    API->>API: Derive device/client from verified JWT and source IP from trusted ASGI peer
+    Note over Agent,API: One authenticated device per batch#59; raw forwarding headers cannot set attribution
+    API->>Primary: Majority read of JWT-bound device policy
+    Primary-->>API: Effective encryption mode
+    API->>API: Reject plaintext for required or JWE for tls_only
+    alt Envelope, format, limit, schema, identity or policy check fails
+        API-->>Agent: Explicit 400, 401, 403, 413, 415, 422 or dependency 503#59; do not publish
     else Whole batch accepted
-        API->>API: Normalize timestamps/methods#59; redact headers#59; hash/minimize bodies
+        API->>Primary: Read primary-backed workspace storage switches
+        API->>API: Assign trusted attribution and server IDs/time#59; normalize observations
+        API->>API: Discard categories not retained#59; preserve body length/digest
+        opt Selected sensitive fields present
+            API->>Transit: Batch encrypt with record/device/batch associated data
+            Transit-->>API: Versioned AES-256-GCM ciphertext or failure
+        end
+        Note over API,Publisher: Settings or KMS failure returns 503 before publish
         API->>Publisher: publish batch ID and normalized documents
         Publisher->>Adapter: Direct MVP adapter
         Adapter->>Primary: Unordered bulk insert into time-series logs#59; majority acknowledgement
@@ -611,7 +815,7 @@ sequenceDiagram
         end
     end
     Note over Agent,Primary: Bulk failure may partially persist#59; retries are not deduplicated
-    Note over Keys,Publisher: OpenBao is not called for each batch#59; runtime EC keys are cached in RAM
+    Note over Keys,Publisher: Upload EC keys are cached#59; storage encryption calls OpenBao for protected fields
 ```
 
 The flow groups failure outcomes for readability; an actual failed guard
@@ -626,16 +830,17 @@ sequenceDiagram
     participant Caller as Agent or frontend server
     participant API as FastAPI
     participant Replica as Configured analysis node
+    participant Transit as OpenBao storage key
     Caller->>API: GET /api/v1/traffic-logs with optional device/time/cursor/limit
-    API->>API: Validate filters and cursor#59; add verified-owner predicate
+    API->>API: Validate filters and cursor#59; restrict agents to JWT device, allow management fleet reads
     API->>Replica: Majority read sorted by event timestamp and record ID#59; limit plus one
     Note over API,Replica: Deployment: strict secondary#59; local single-node development: explicit primary exception
     alt Matching records available
-        Replica-->>API: Owner-filtered documents
+        Replica-->>API: Accessible device documents
         API-->>Caller: 200 items and optional next_cursor
         opt More records requested
             Caller->>API: GET collection with next_cursor and same filters
-            API->>Replica: Fetch older owner-scoped page
+            API->>Replica: Fetch older device-authorized page
             API-->>Caller: 200 next page
         end
     else No match or replication not yet visible
@@ -647,11 +852,15 @@ sequenceDiagram
     end
     opt Fetch one record
         Caller->>API: GET /api/v1/traffic-logs/id
-        API->>Replica: Find by ObjectId and verified owner
-        alt Record visible for owner
-            API-->>Caller: 200 normalized record
-        else Missing, not yet replicated or belongs to another owner
-            API-->>Caller: 404 without disclosing another owner
+        API->>Replica: Find by ObjectId and JWT device predicate unless manager
+        alt Record accessible
+            opt Record has encrypted fields
+                API->>Transit: Decrypt with authenticated record context
+                Transit-->>API: Sensitive fields or authentication/KMS failure
+            end
+            API-->>Caller: 200 with retained body and redacted credential headers, or sanitized 503
+        else Missing, not yet replicated or belongs to another inaccessible device
+            API-->>Caller: 404 without disclosing another device
         end
     end
 
@@ -685,12 +894,13 @@ sequenceDiagram
     API->>Bao: Transit decrypt using runtime-only ACL
     Bao-->>API: EC key-set plaintext
     API->>API: Validate suite and key set#59; cache keys in RAM
+    API->>Bao: Validate separate non-exportable AES-256-GCM storage key
     API->>Primary: Validate replica-set URI#59; create/verify time-series collection and indexes
     alt KMS, configuration or storage initialization fails
         API-->>Process: Startup fails#59; do not serve as ready
     else Initialization succeeds
         API-->>Process: Ready to serve
-        Note over API,Bao: Running process keeps keys during later KMS outages#59; revocation does not erase RAM
+        Note over API,Bao: Upload EC keys remain cached#59; protected storage writes and detail decryption still require KMS
         Process->>API: Graceful shutdown signal
         API->>Primary: Await async MongoDB client close
         API-->>Process: Lifespan exits
@@ -743,6 +953,7 @@ sequenceDiagram
     CLI->>Files: Read administrative credential
     CLI->>Bao: Ensure compatible Transit and KV v2 mounts
     CLI->>Transit: Ensure non-exportable AES-256-GCM KEK#59; plaintext backup disabled
+    CLI->>Transit: Ensure separate non-exportable randomized AES-256-GCM storage key
     CLI->>KV: Read current wrapped record
     alt Key set already exists
         KV-->>CLI: Ciphertext and KV version
@@ -754,7 +965,7 @@ sequenceDiagram
         Transit-->>CLI: Wrapped ciphertext
         CLI->>KV: Write ciphertext with CAS version 0
     end
-    CLI->>Bao: Install runtime ACL for exact KV read and Transit decrypt only
+    CLI->>Bao: Install exact KV/wrapping-decrypt ACL plus storage metadata/encrypt/decrypt, no create/export/rotate
     alt bootstrap-dev
         CLI->>Bao: Create nonrenewable 24-hour runtime token
         Bao-->>CLI: Runtime token
@@ -940,19 +1151,19 @@ sequenceDiagram
     participant Encrypted as Encrypted device thread
     participant IdP as Real Auth0 tenant
     participant API as Running backend stack
-    Tester->>Test: Load private profile with two clients and stable preconfigured device IDs
+    Tester->>Test: Load private profile with two clients and optional expected device IDs
     par Plain device
         Test->>Plain: Release synchronized start
         Plain->>IdP: Client-credentials token request
         IdP-->>Plain: Access token
-        Plain->>API: Read /me and existing plaintext-compatible policy#59; acknowledge
+        Plain->>API: Discover JWT-bound device via /me#59; read existing plaintext policy and acknowledge
         Plain->>API: Upload three synthetic logs as gzip JSON
         API-->>Plain: 202 stored or durable queued receipt
     and Encrypted device
         Test->>Encrypted: Release synchronized start
         Encrypted->>IdP: Client-credentials token request without management scope
         IdP-->>Encrypted: Agent access token
-        Encrypted->>API: Read /me and existing JWE-compatible policy
+        Encrypted->>API: Discover JWT-bound device via /me#59; read existing JWE-compatible policy
         Encrypted->>API: Acknowledge advertised suite/key
         opt Existing policy is required
             Encrypted->>API: Attempt plaintext gzip
@@ -965,9 +1176,9 @@ sequenceDiagram
         Plain->>API: Read own batch through paginated analysis API
         Encrypted->>API: Read own batch through paginated analysis API
     end
-    Test->>Test: Verify counts, IDs, redaction, body minimization and distinct owners
-    Test->>API: Query each other owner's device and record IDs
-    API-->>Test: Empty collections and 404 records
+    Test->>Test: Verify counts, IDs, redaction, body minimization and distinct devices
+    Test->>API: Query each other device and record IDs
+    API-->>Test: 403 for explicit foreign device queries#59; 404 for foreign records
     Test-->>Tester: Pass or explicit failure#59; synthetic records remain
     Note over Test,Encrypted: No policy writes or management scope#59; incompatible setup fails explicitly
 ```
@@ -984,8 +1195,8 @@ sequenceDiagram
     Test->>UI: Start loopback 3301 with test-only configuration
     Test->>Browser: Supply session via public Auth0 generateSessionCookie test helper
     Browser->>UI: Render pages, including JavaScript-disabled requests
-    UI->>Mock: Server-side bearer reads and policy PATCH requests
-    Mock-->>UI: Fixture data, permission denials and version conflicts
+    UI->>Mock: Server-side bearer reads, registration POST and policy PATCH
+    Mock-->>UI: Fixture data, duplicate 400, permission denials and version conflicts
     UI-->>Browser: SSR HTML and form outcomes
     Test->>Test: Assert token non-disclosure, mobile layout, disabled token endpoint and concurrency protection
     Test->>UI: Stop temporary frontend server

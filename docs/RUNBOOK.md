@@ -146,7 +146,9 @@ Installing the bundled profile therefore requires ClusterRoleBinding privileges.
 
 The bundled KMS is ephemeral. After an OpenBao pod restart, run `make helm-up`
 to bootstrap again, then restart the API Deployment to discard its old cached
-keys. This cannot recover previously buffered encrypted envelopes. The chart
+keys. This cannot recover previously buffered encrypted envelopes or retained
+log fields encrypted under the lost storage key. Do not restart development
+OpenBao if encrypted test logs must remain readable. The chart
 does not implement persistent production OpenBao or automatic unsealing.
 
 ## External MongoDB and OpenBao / production
@@ -225,12 +227,55 @@ For externally managed dependencies, set their reachable addresses and runtime
 credential path in `.env` and use `make run` instead of `make dev`. Kubernetes MongoDB DNS names remain
 cluster-internal; forwarding a single member port does not preserve replica discovery.
 
+## Device-only test database
+
+This release removes user keys from application resources. MongoDB device
+configuration `_id` values become globally unique device IDs; time-series metadata
+contains `device_id` and a server-owned `suspicious` flag. `/me` and log responses
+no longer expose `user_id`.
+`manage:devices` now grants fleet-wide management and reads, rather than a user's
+namespace. Review existing Auth0 grants before deployment; do not give this
+permission to ordinary agents.
+
+The old database contained only test data and was explicitly reset for this
+schema. There is no migration and startup never deletes data automatically.
+Future test-data resets must target only the explicitly approved application
+database, with API/ingestion writers stopped. Startup recreates the time-series
+collection and global uniqueness indexes in an empty database.
+
+Registration is create-only: existing IDs (including policy/status-only records)
+or names return `400`; updates still use the versioned policy PATCH API.
+
 ## Run tests
 For the JavaScript SSR management UI, see [`frontend/README.md`](../frontend/README.md).
 Run `make frontend-dev` on its separate default port 3000 with the backend running.
 It requires its own Auth0 Regular Web Application in `frontend/.env.local`, not
 agent M2M credentials. `make frontend-test` checks adapter tests and lint;
 `make frontend-test-browser` builds and runs isolated browser tests.
+The **Device policies** screen now registers named devices with an initial
+encryption policy and loads all accessible persisted devices from the API,
+including unnamed/version-zero records created by agent acknowledgements or policy
+changes. Open a row to inspect device identity, edit policy, check acknowledgement
+and public encryption details, or view its traffic. A missing registration timestamp
+does not hide a stored device. Use the agent's
+JWT-bound ID, not an arbitrary upload-supplied ID. IDs and names are globally unique.
+Registration and policy changes need `manage:devices`; credentials are provisioned
+separately through the issuer. See the [registration contract](../README.md#register-a-device-and-configure-its-policy)
+and [real browser/API/MongoDB test](../frontend/README.md#validation).
+
+The **Workspace > Storage and encryption** section (`/settings`) controls original
+bodies, authorization headers and cookies for all devices. Each category offers
+**Do not retain**, **Retain encrypted** (default), or **Retain plaintext**.
+Discard removes body content before publishing/KMS but preserves its byte length
+and SHA-256 digest; discarded header entries disappear from both maps.
+Changes affect future uploads only, not existing records. Discarded data cannot
+be recovered; plaintext retention is a deliberate opt-out from encryption.
+Both workspace API reads and versioned updates require `manage:devices`.
+Existing installations can run `python -m app.kms initialize` to provision the
+dedicated `OPENBAO_STORAGE_KEY` and runtime ACL without replacing existing keys.
+Rotate with `python -m app.kms rotate-storage`; retain old versions and persistent
+OpenBao backups throughout log retention. Follow the
+[algorithm, nonce, usage-limit and retention requirements](ENCRYPTION.md#workspace-storage-encryption).
 
 Install the current dependencies with `make install`. The backend uses native async
 PyMongo, the official Auth0FastAPI SDK for token verification, and HTTPX2 for HTTP
@@ -248,7 +293,7 @@ ruff check app tests integration_tests
 To exercise local time-series storage and primary analysis, point `MONGO_TEST_URI` at
 the single-node replica set. Use `MONGO_REPLICA_TEST_URI` for a separate multi-member
 replica set to exercise strict secondary routing. Run `pytest -q tests/test_mongo_integration.py`. Each test
-creates a unique `traffic_test_*` database and drops it afterward. Do not point tests
+creates a unique `traffic_test_*` or `device_registration_test_*` database and drops it afterward. Do not point tests
 at an unapproved production cluster.
 
 For the local Compose database:
@@ -300,27 +345,31 @@ application needs `manage:devices`: the workers act only as agents and never
 PATCH a device policy. These test-only credentials should not be deployed to
 ordinary agents.
 
-Each client authenticates as its own owner (typically `<client-id>@clients`), not
-as an interactive human user. The test obtains the verified subject from `/api/v1/me`
-instead of decoding an unverified token or assuming the subject format.
+Each client authenticates as its own device. The test obtains its JWT-bound
+device ID from `/api/v1/me`, instead of decoding an unverified token or assuming
+an identifier format. Resources no longer include a user key.
 
-Configure device policies before the test. The stable IDs default to
-`stack-test-plaintext` and `stack-test-encrypted`, or can be set with
-`STACK_TEST_PLAINTEXT_DEVICE_ID` and `STACK_TEST_ENCRYPTED_DEVICE_ID`. The plaintext
+Configure device policies before the test using the ID returned by `/api/v1/me`.
+Device identity comes from the signed `https://amazing-http-logger/device_id`
+claim, otherwise the verified subject. Optional
+`STACK_TEST_PLAINTEXT_DEVICE_ID` and `STACK_TEST_ENCRYPTED_DEVICE_ID` values are
+assertions only: they must match `/me`, and cannot select a different device.
+Leave them empty to discover the IDs automatically. Old `stack-test-*` policy
+IDs must be bound by the issuer or their policies recreated for the JWT-bound IDs.
+The plaintext
 device must use `tls_only`; the encrypted device must
 allow JWE (`optional` or `required`). An incompatible policy fails with a setup
 message instead of being changed automatically.
 
-Policy management remains a frontend/operator responsibility, subject to the
-existing backend ownership rules. **The current frontend cannot manage an M2M
-owner's devices from a different human subject.** That requires an explicit
-delegation model; the test does not bypass this restriction or provision it.
+Policy management remains a frontend/operator responsibility. An operator with
+`manage:devices` can configure either M2M device by its exact JWT-bound ID.
+Do not grant this fleet-wide permission to the agent test clients.
 
 ```bash
 cp .env.stack-test.example .env.stack-test
 chmod 600 .env.stack-test
 # Edit .env.stack-test locally: set the backend URL, Auth0 token URL/audience,
-# and the separate plaintext/encrypted client IDs, secrets and stable device IDs.
+# and the separate plaintext/encrypted client IDs and secrets.
 # Configure the devices' policies before running.
 make test-stack
 ```
@@ -338,8 +387,8 @@ Alternatively export the `STACK_TEST_*` settings and run
 `STACK_TEST_ENABLED=true .venv/bin/python -m pytest -q integration_tests/test_stack.py`.
 The default `.env.stack-test` is optional when all values come from the environment.
 This standalone test does not load the application unit-test fixtures or `.env`.
-Environment variables override profile values. Both the two client IDs and the
-two device IDs must differ.
+Environment variables override profile values. The two client IDs must differ;
+explicitly configured expected device IDs must also differ.
 
 Two worker threads independently obtain fresh bearer tokens, discover their
 identities, and read their existing device configurations without changing them.
@@ -347,12 +396,14 @@ Both acknowledge the advertised policy version; the encrypted device reports the
 active key. It sends JSON -> gzip -> compact JWE using only the advertised suite
 and public key. If its existing policy is `required`, the test also verifies
 that a gzip-only upload is rejected. The plaintext device sends gzip JSON. Both
-submit three synthetic logs with unique per-run URLs.
+submit three synthetic traffic observations with unique per-run URLs and no
+identity, IP or other attribution fields. The backend adds JWT/connection metadata.
 
 The test waits for records from each acknowledged batch, following analysis
 pagination as necessary. Older batches on the same stable device do not affect
-the counts. It verifies receipt IDs, ownership, redaction and body minimization,
-then checks cross-owner list/item isolation. Policies are never changed or reset.
+the counts. It verifies receipt IDs, device attribution, redaction and body minimization,
+then checks cross-device access denial (`403` for explicit list/configuration queries,
+`404` for inaccessible record IDs). Policies are never changed or reset.
 
 `STACK_TEST_HTTP_TIMEOUT` bounds each request (default 10 seconds);
 `STACK_TEST_VISIBILITY_TIMEOUT` bounds the read-back wait (default 30 seconds).
@@ -371,10 +422,58 @@ commit secrets or print token responses. Do not enable HTTP debug logging or
 responses, credentials and request bodies.
 
 Run only against an approved test stack. **Each run leaves six synthetic logs and
-updates status for the configured stable devices**; the API
+updates status for the JWT-bound devices**; the API
 does not expose deletion. It does not modify existing device policies; do not
 target production. It needs no MongoDB/OpenBao administrator credentials. Unit tests for this
 client harness use an explicit mock transport; they do not claim a live Auth0 run.
+
+## Retention operations
+
+Use **Workspace > Retention policies** to enable/disable or change each category's
+window. Ordinary logs default to 7 days; suspicious logs default to 30 days.
+Disabled means indefinite retention for that category; its chosen window remains
+saved. `manage:devices` is required. Retention applies to existing records too,
+using event timestamps. Back up evidence before enabling or shortening a window:
+deletion is permanent, and old offline uploads may immediately qualify.
+
+MongoDB 7.0+ is required. The API's database role needs `createIndex`, `dropIndex`
+and `listIndexes`, in addition to its existing collection/settings privileges.
+Inspect `db.traffic_logs.getIndexes()` for `retention_ordinary` and
+`retention_suspicious`; each enabled category has its own partial TTL index on
+`timestamp`. Disabling a category drops only its index. Window changes rebuild
+the affected index on MongoDB 7, so plan large-collection changes off peak.
+Never configure a collection-wide `expireAfterSeconds`: it overrides longer
+suspicious retention and causes startup to fail. Remove any pre-existing global
+TTL with an authorized, reviewed MongoDB collection change before deployment.
+
+Settings are majority-persisted before index application. A failure returns
+sanitized `503`, not success, but the desired settings may already be saved and
+some old indexes may remain active. Reload, fix permissions/connectivity, then
+save again using the current version, or restart the backend to reconcile indexes.
+Do not assume expiration was disabled after a failed save.
+Startup fails explicitly if retention indexes cannot be reconciled.
+
+MongoDB's monitor deletes whole expired time-series buckets in the background,
+typically on a 60-second cycle with additional bucket-span/load delay. A seconds
+granularity bucket can span an hour; retention is not a strict erasure deadline.
+Disabling expiration cannot cancel a deletion already in progress.
+
+New records store `metadata.suspicious=false`; old records without the flag use
+ordinary retention. Authorized analysis responses expose the Boolean.
+No analysis job, classification API, or existing-data migration is supplied.
+A future trusted classification job must address time-series per-record update
+restrictions and finish before ordinary TTL deletes the evidence.
+
+Validate actual TTL deletion and index changes in an approved development replica set:
+
+```bash
+MONGO_TEST_URI='mongodb://localhost:28017/?replicaSet=rs0' \
+  .venv/bin/python -m pytest -q tests/test_mongo_integration.py -k retention
+```
+
+This test creates/drops only its unique `retention_test_*` database and waits for
+real TTL-monitor deletion (allow several minutes); it does not change global
+MongoDB settings or the application's database/indexes.
 
 ## Storage initialization
 

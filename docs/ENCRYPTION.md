@@ -8,16 +8,30 @@ The backend rejects HTTP `/api/v1/` requests by default outside development.
 OpenAPI, and documentation paths remain reachable by internal HTTP probes.
 
 Terminate TLS at a separately managed ingress/gateway. Set `FORWARDED_ALLOW_IPS`
-to only that proxy's actual IPs or CIDRs so Uvicorn can trust its forwarded scheme.
+to only that proxy's actual IPs or CIDRs so Uvicorn can trust its forwarded scheme
+and resolve the upload's source IP. The application uses the resulting ASGI peer,
+never raw forwarding headers. Gateways must sanitize forwarded addresses.
 Never trust arbitrary callers or use `*` on an externally reachable backend.
 Restrict direct pod access to the gateway; use TLS on internal hops when required.
 This chart does not install a gateway or provision certificates.
 
 Application encryption supplements HTTPS; it does not replace authentication.
 The backend decrypts logs for validation, redaction, and analysis. This is not
-end-to-end secrecy against the backend, nor MongoDB encryption at rest.
-The MVP publisher receives normalized, redacted documents, not encrypted envelopes.
-A future broker requiring opaque encrypted payloads needs a different worker boundary.
+end-to-end secrecy against the backend. Upload encryption and the separate
+workspace-controlled field encryption at rest have independent keys and policies.
+The MVP publisher receives normalized documents with selected sensitive fields
+encrypted for storage, not the original JWE envelope. A future broker requiring
+opaque whole-batch encryption needs a different worker boundary.
+
+Both encrypted and plaintext batches carry the same
+[typed HTTP event schema](../README.md#strict-event-validation). Captured endpoints,
+sizes/timing and process context survive ingestion. Request bodies and captured
+authorization/cookie values are retained under the default-on storage policy.
+Credential header values remain redacted in API responses; only authorized
+single-record reads decrypt retained bodies. Collection reads omit bodies.
+Unknown/duplicate fields, unsafe header keys, invalid types and per-field or
+batch size violations reject the whole batch before publishing. Captured source IP
+is an agent observation (`captured_source_ip`), never the trusted upload `source_ip`.
 
 ## Configured cryptographic suite
 
@@ -62,7 +76,8 @@ ECC is **not post-quantum secure**; NIST's post-quantum KEM is
 
 ## OpenBao key management
 
-OpenBao is the KMS for **envelope protection of the server's EC key set**:
+OpenBao manages separate keys for **EC key-set envelope protection** and
+**sensitive log field encryption at rest**. The EC key-set path is:
 
 1. The administrative CLI generates private EC keys in memory.
 2. OpenBao Transit encrypts the key set under a non-exportable `aes256-gcm96`
@@ -78,13 +93,121 @@ claim non-exportable EC keys, remote ECDH, or secrecy from a compromised backend
 There are no plaintext EC key files or private EC key Kubernetes Secrets.
 The active key ID belongs to the wrapped document, not an environment variable.
 
-Runtime permissions are restricted to the exact KV record's `read` capability
-and the exact Transit key's `decrypt` operation. The application receives no
-root token, encryption/write capability, rotation privilege, or mount administration.
+Runtime permissions are restricted to the exact KV record's `read` capability,
+the wrapping key's `decrypt` operation, and the separate storage key's metadata
+`read` plus `encrypt`/`decrypt` operations. Storage encryption grants `update`,
+not `create`, so runtime cannot create or replace keys. The application receives no
+root token, key export/write capability, rotation privilege, or mount administration.
 Fresh startup fails closed if OpenBao, credentials, or the key set are unavailable.
 An already running process keeps its cached keys during a KMS outage; revoking
 OpenBao access does not erase keys already in memory. Rotation and retirement
 require restarting every backend process.
+
+### Workspace storage encryption
+
+The **Workspace** page (`/settings`) controls application-wide storage, independently
+of per-device upload policies. Its **Storage and encryption** section offers
+**Do not retain**, **Retain encrypted** (default), and **Retain plaintext** per category.
+Both reads and changes require `manage:devices`.
+The primary/majority-backed singleton in `workspace_configurations` defaults to:
+
+```json
+{
+  "version": 0,
+  "updated_at": null,
+  "retain_request_body": true,
+  "retain_authorization_header": true,
+  "retain_cookies": true,
+  "encrypt_request_body": true,
+  "encrypt_authorization_header": true,
+  "encrypt_cookies": true
+}
+```
+
+The same workspace response includes independent ordinary/suspicious log
+retention settings (enabled by default, 7/30 days). These are not encryption
+settings: they apply to existing data and determine permanent deletion using
+MongoDB TTL indexes. See [retention policies](../README.md#retention-policies).
+
+`PATCH /api/v1/workspace/configuration` requires `expected_version` and all three
+strict Boolean switches; unexpected fields are rejected. Atomic version matching
+returns `409` for stale/concurrent edits. Optional strict Boolean `retain_*` fields
+default to true and preserve their saved values when omitted. `retain_*=false`
+takes precedence over the corresponding encryption switch.
+Enabling encryption for any retained category validates KMS
+availability before saving. Ingestion reads a primary-backed policy snapshot,
+validates the whole batch, then encrypts selected sensitive values **before**
+handing documents to the replaceable publisher. A failed settings read or KMS
+operation prevents publishing and returns sanitized `503`; there is no plaintext
+fallback, local key file, or success-shaped receipt.
+
+- **Body:** the original validated UTF-8 body is stored only if retention is enabled.
+  Byte length and SHA-256 digest are kept even when the body is discarded
+  (`0`/`null` when no body was supplied).
+- **Authorization:** case-insensitive `Authorization` and `Proxy-Authorization`
+  values in captured request/response headers.
+- **Cookies:** case-insensitive `Cookie` and `Set-Cookie` values in both maps.
+
+Discarding authorization/cookies removes matching entries from both header maps,
+not just their values. Discarded fields are never included in Transit ciphertext
+or passed to the publisher. Selecting **Retain plaintext** deliberately disables
+encryption while keeping retention enabled.
+It does not disable TLS or upload JWE policy. Changes do not rewrite existing
+logs, run migrations, or recover previously discarded data. `X-Api-Key` remains
+redacted/discarded, independently of these switches.
+
+#### Storage algorithm and key lifecycle
+
+`OPENBAO_STORAGE_KEY` defaults to `log-storage` (Helm `openbao.storageKey`).
+It must differ from the EC wrapping `OPENBAO_TRANSIT_KEY`. Idempotent bootstrap
+creates a non-exportable, non-derived Transit `aes256-gcm96` key with plaintext
+backup and convergent encryption disabled. The AES key never leaves OpenBao;
+the backend uses Transit batch encryption rather than implementing cryptography.
+OpenBao supplies random 96-bit nonces and full-length authentication tags.
+An authenticated context binds each encrypted sensitive-field bundle to its
+record ID, device ID, batch ID, field categories and format purpose/version.
+Ciphertext swapping or context changes fail authentication.
+
+MongoDB stores `storage_encryption` with format version, field categories and a
+versioned `vault:vN:...` ciphertext; selected header values are `[ENCRYPTED]`.
+Analysis collection reads stay on replicas, exclude bodies and ciphertext at the
+database query layer, and redact credentials without KMS access. Large retained
+body payloads therefore do not inflate list queries. After device authorization,
+a single-record read fetches from
+the replica and decrypts through Transit; the response exposes the retained body,
+not ciphertext/key material, and still redacts authorization/cookie values.
+Detailed responses use `Cache-Control: no-store`; the frontend escapes body text.
+Disabling a setting does not prevent decryption of older encrypted records.
+
+Standards basis: [FIPS 197](https://csrc.nist.gov/pubs/fips/197/final) specifies AES;
+[NIST SP 800-38D](https://csrc.nist.gov/pubs/sp/800/38/d/final) specifies GCM,
+including nonce uniqueness and invocation constraints; [SP 800-57 Part 1 Rev. 5](https://csrc.nist.gov/pubs/sp/800/57/pt1/r5/final)
+provides key lifecycle guidance. This is authenticated **field/object encryption**,
+not unauthenticated disk-sector encryption or a claim of a FIPS-validated deployment.
+Use a validated cryptographic module/deployment when certification is required.
+
+New storage keys auto-rotate every `720h` (30 days). Operators must monitor usage
+and rotate **before 2^32 encryption invocations per key version**, or an earlier
+organizational cryptoperiod, rather than treating the timer as a usage limiter.
+The application does not implement a cross-client invocation counter. A high-volume
+deployment must enforce a suitable shorter cryptoperiod/operational limit.
+
+```bash
+# Existing installations: provision the separate key and update the runtime ACL.
+python -m app.kms initialize
+# Rotate storage only; preserve old versions for retained logs.
+python -m app.kms rotate-storage
+```
+
+Use `--admin-token-file` outside development. Runtime tokens cannot rotate,
+export, delete or configure the storage key. Do not rename/delete the key or
+raise `min_decryption_version` past any retained record; preserve key versions
+and OpenBao storage/backups for the entire log retention period.
+**Development OpenBao is ephemeral: restarting it destroys the storage key and
+makes previously encrypted log fields permanently unreadable.** Re-bootstrap
+creates a new key, not a recovery of the old one. Persistent production OpenBao,
+TLS, access control, recovery procedures and appropriately protected backups are
+required for durable encrypted logs.
 
 ### Local development
 
@@ -96,20 +219,34 @@ make dev
 Compose runs MongoDB and OpenBao; Python still runs on the host with live reload.
 OpenBao listens on `http://localhost:28200`, separately from Kubernetes port 8200.
 `make openbao-up` creates an ignored mode-0600 root credential if absent, starts
-OpenBao, provisions Transit/KV and the key set, then writes a separate least-privilege
-runtime token. The root credential is used only for development bootstrap.
+OpenBao, provisions Transit/KV, the wrapped EC key set and the dedicated storage
+key, then writes a separate least-privilege runtime token. The root credential
+is used only for development bootstrap.
+
+For an already running, initialized/unsealed OpenBao, the existing initialization
+script can be run independently, without restarting the server:
+
+```bash
+.venv/bin/python -m app.kms initialize
+```
+
+It creates missing application keys and updates the runtime ACL, preserving
+existing key material and versions. It does not rotate keys, change MongoDB data,
+or issue a runtime token. To issue a fresh development runtime token without a
+container restart, use `.venv/bin/python -m app.kms bootstrap-dev`.
 
 `.env.example` supplies parameterized addresses, mounts, key names, timeout, and
 credential paths. The defaults are `.secrets/openbao-dev-root-token` and
 `.secrets/openbao-token`. Do not print, commit, or share either file. The runtime
-token expires after 24 hours; run `make openbao-up` again before restarting Python
+token expires after 24 hours; run `bootstrap-dev` again before restarting Python
 to issue a fresh token. The root credential file is preserved, not regenerated.
 
 **Development OpenBao is ephemeral**, auto-unsealed, and has no TLS. Restarting
-it loses its in-memory KEK and EC key set, even though its root credential file
-remains. Run `make openbao-up` and restart Python afterward. Buffered envelopes
-encrypted to the lost keys cannot be recovered. MongoDB's persistent volume and
-already normalized logs are unaffected. Do not use dev mode for production.
+it loses its in-memory KEK, EC key set and storage key, even though its root
+credential file remains. Run `make openbao-up` and restart Python afterward.
+Buffered envelopes and retained log fields encrypted to the lost keys cannot be
+recovered. MongoDB's volume remains intact, but initialization cannot restore
+those encrypted fields. Do not use dev mode for production.
 
 ### Production and Kubernetes
 
@@ -174,7 +311,7 @@ the least-privilege token is mounted. Provision/rotate it outside Helm and resta
 the backend when it changes. Never place credentials in values or `--set`.
 
 For host processes the matching settings are `OPENBAO_ADDR`, `OPENBAO_TOKEN_FILE`,
-`OPENBAO_CA_CERT`, `OPENBAO_TRANSIT_MOUNT`, `OPENBAO_TRANSIT_KEY`, `OPENBAO_KV_MOUNT`,
+`OPENBAO_CA_CERT`, `OPENBAO_TRANSIT_MOUNT`, `OPENBAO_TRANSIT_KEY`, `OPENBAO_STORAGE_KEY`, `OPENBAO_KV_MOUNT`,
 `OPENBAO_KV_PATH`, and `OPENBAO_TIMEOUT_SECONDS`. Kubernetes auth additionally uses
 `OPENBAO_AUTH_MOUNT`, `OPENBAO_KUBERNETES_ROLE`, and `OPENBAO_JWT_FILE`.
 Mounts/key names must be single safe path components. HTTPS is mandatory outside
@@ -196,10 +333,29 @@ References: [Transit](https://openbao.org/docs/secrets/transit/),
 
 ## Management protocol
 
-Every device is scoped by the verified Auth0 `sub` and device ID. Management calls
-cannot select another owner. Device IDs use the same namespace as submitted logs;
-there is no separate device enrollment/credential service. Clients authenticated
-as the same owner share that owner's device access.
+Every resource is keyed only by globally unique device ID. Agents discover their JWT-bound `device_id` through
+`GET /api/v1/me` before polling configuration: it is the signed
+`https://amazing-http-logger/device_id` claim, or `sub` if absent. This ID, not a
+batch field, selects the ingestion policy. Issuer-managed device claims must not
+come from editable user metadata or token-request parameters. There is no separate
+device enrollment/credential service. Tokens bound to the same device share its
+access, regardless of their subject; different devices cannot access each other's
+data without the global management grant.
+
+Operators can register a named device and initial encryption policy through
+`POST /api/v1/devices` or the frontend's **Device policies** form. This uses the
+JWT-bound device ID and `manage:devices` authorization as policy management;
+it does not issue credentials. Inventory uses primary-backed collection/item
+reads, independently of traffic-analysis replica routing. All persisted records,
+including unnamed/version-zero agent and policy records, appear in inventory;
+`name` and `registered_at` may be null. The dedicated device detail page combines
+identity, policy editing, acknowledgement, public suite metadata and a traffic link.
+Item reads return `404` only when the record is absent; effective default
+configuration lookups alone do not persist a device. See
+[device registration](../README.md#register-a-device-and-configure-its-policy).
+IDs and names are globally unique; duplicate registration returns `400`, including
+attempts to register an existing policy-only ID. Initial registration is an insert,
+not a policy update.
 
 `GET /api/v1/devices/{id}/configuration` returns:
 
@@ -236,7 +392,8 @@ These responses use `Cache-Control: no-store`.
 `PATCH /api/v1/devices/{id}/configuration` requires **`manage:devices`** in the
 verified token's `permissions` array or space-separated `scope`. Configure this
 permission in Auth0 and grant it only to administrators, not ordinary agent tokens.
-The permission is still owner-scoped, not cross-tenant administration.
+The permission authorizes fleet-wide policy management and reads. It is not
+tenant-scoped; ordinary agents must not receive it.
 
 ```json
 {"expected_version": 0, "encryption_mode": "optional"}
@@ -252,6 +409,8 @@ the policy version has not changed; suite selection and key rotation are indepen
 of per-device policy versions.
 
 `PUT /api/v1/devices/{id}/configuration-status` reports capability and outcome:
+the path ID must equal the reporting token's device ID (`403` otherwise), even if
+the token has management permission.
 
 ```json
 {
@@ -278,7 +437,9 @@ required. Buffer or surface delivery errors; do not silently drop logs.
 
 ## Encrypted ingestion
 
-1. Serialize `{"logs": [...]}` containing 1-500 logs.
+1. Serialize `{"logs": [...]}` containing 1-500 traffic observations without
+   identity, source IP or other attribution fields. Attribution comes from the
+   verified JWT and trusted connection for both gzip and JWE uploads.
 2. Gzip once.
 3. Encrypt the gzip bytes as compact JWE using the advertised suite and public EC key.
 4. POST the JWE string to `/api/v1/traffic-log-batches` with an Auth0 bearer token
@@ -328,8 +489,8 @@ response.raise_for_status()
 ```
 
 Limits: 1,500,000 bytes encrypted wire size, 1 MiB decrypted gzip, 8 MiB expanded.
-Authentication, envelope integrity, decompression bounds, ownership, and every
-device's effective encryption policy are checked before publishing any log.
+Authentication, envelope integrity, decompression bounds, trusted attribution, and
+the JWT-bound device's effective encryption policy are checked before publishing any log.
 Malformed/tampered/unknown-key envelopes return generic `400`; wrong media encoding
 returns `415`; size overflow returns `413`; policy violations return `403`; storage
 or policy/key-management unavailability returns `503`. Successful receipts remain `202` with

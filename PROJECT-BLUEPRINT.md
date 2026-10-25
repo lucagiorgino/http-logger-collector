@@ -87,6 +87,10 @@ Rules:
   OpenBao Transit protects EC keys stored as ciphertext in KV v2. Backend processes
   unwrap keys into RAM and decrypt JWE locally; clients receive only public keys.
   No plaintext EC files or private EC Secrets are used. See `docs/ENCRYPTION.md`.
+- MongoDB 7+ time-series retention uses separate partial TTL indexes on the time
+  field for ordinary and suspicious metadata buckets, never a collection-wide TTL.
+  Workspace policy defaults to 7/30 days and can independently disable either.
+  Suspicious classification is server-owned; the analysis job is not implemented.
 - See `docs/PLAN.md` for the time-series schema and queue contract, and
   `docs/RUNBOOK.md` for replica-set setup and deployment commands.
 - `tests/` validates behavior and imports the application package, not vice versa.

@@ -56,7 +56,7 @@ The application is responsible for:
 ### Management dashboard
 
 The root-level [`frontend/`](frontend/README.md) provides an SSR overview, traffic
-explorer, request details, and owner-scoped device encryption policy management.
+explorer, request details, and device encryption policy management.
 It uses JavaScript (no TypeScript), shadcn/ui, and server-side Auth0 sessions.
 
 ```bash
@@ -68,9 +68,9 @@ make frontend-dev
 
 The development UI defaults to **http://localhost:3000** and calls the running backend at
 `http://127.0.0.1:8001` from its server. Ordinary agent credentials do not need
-`manage:devices`; only an operator changing policy does. The current backend has
-no cross-owner fleet access: a human session cannot manage a separate M2M
-subject's devices. See the frontend guide for Auth0 setup, permissions and tests.
+`manage:devices`; operators with that grant can register devices, change policies
+and read fleet data. Ordinary agents can access only their JWT-bound device.
+See the frontend guide for Auth0 setup, permissions and tests.
 
 ### 1) Create a virtual environment
 
@@ -117,8 +117,9 @@ initialization service.
 OpenBao uses loopback port **28200**. Bootstrap creates private, git-ignored
 root/runtime credential files under `.secrets/`; the backend uses only the
 least-privilege runtime token. OpenBao dev mode is **ephemeral**: restarting it
-loses its encryption keys and makes previously buffered encrypted uploads
-undecryptable. MongoDB data remains persistent. See [KMS operations](docs/ENCRYPTION.md).
+loses its encryption keys and makes previously buffered uploads and retained
+encrypted log fields undecryptable. MongoDB data remains persistent, not its
+decryption keys. See [KMS operations](docs/ENCRYPTION.md).
 
 Local `.env` enables `MONGO_ALLOW_PRIMARY_READS=true` because a one-node replica set
 has no secondary. This option is rejected outside `APP_ENV=development`; Helm
@@ -174,25 +175,161 @@ upstream warning remains visible. Application JWE encryption uses `joserfc`.
 
 | Method | Resource | Behavior |
 | --- | --- | --- |
-| GET | `/api/v1/me` | Return the authenticated `user_id` |
+| GET | `/api/v1/me` | Return JWT-derived `device_id` and optional OAuth `client_id` |
+| GET | `/api/v1/workspace/configuration` | Read application-wide storage encryption and retention settings; requires `manage:devices` |
+| PATCH | `/api/v1/workspace/configuration` | Change storage encryption and retention policies with an expected version; requires `manage:devices` |
+| POST | `/api/v1/devices` | Register a device and initial policy atomically; requires `manage:devices`; returns `201` and `Location` |
+| GET | `/api/v1/devices` | List accessible stored devices with keyset pagination, including agent/policy-created records; management tokens see all |
+| GET | `/api/v1/devices/{id}` | Retrieve a stored device, policy and acknowledgement; `404` only if absent |
 | POST | `/api/v1/traffic-log-batches` | Accept gzip JSON or a JWE-encrypted batch; return `202` with a receipt |
 | GET | `/api/v1/devices/{id}/configuration` | Read the caller's effective device policy and public encryption key |
 | PATCH | `/api/v1/devices/{id}/configuration` | Change policy with `manage:devices` permission and an expected version |
 | PUT | `/api/v1/devices/{id}/configuration-status` | Report applied version, encryption support, or a client error |
-| GET | `/api/v1/traffic-logs` | List the caller's logs from a secondary |
-| GET | `/api/v1/traffic-logs/{id}` | Read one of the caller's logs from a secondary; otherwise `404` |
+| GET | `/api/v1/traffic-logs` | List device logs from a secondary; management tokens may analyze the fleet |
+| GET | `/api/v1/traffic-logs/{id}` | Read an accessible device's log from a secondary; otherwise `404` |
 | GET | `/health` | Process liveness, not database or replica readiness |
+
+#### Register a device and configure its policy
+
+Open **Device policies** in the frontend, enter the device's exact JWT-bound ID
+and a display name, choose **TLS only**, **Optional JWE**, or **Required JWE**, and
+select **Register device**. The authenticated Server Action calls the backend;
+the device appears in the API-backed **Devices** list. The list also includes
+existing records created by agent acknowledgements or policy changes, even without
+a name or registration timestamp. Select a device to open its dedicated details
+page, inspect the policy/public key, save later policy changes, see the agent's
+versioned acknowledgement, or navigate to its traffic. Both registration and policy writes require
+`manage:devices`; listing and viewing your own devices do not.
+
+The equivalent API request is:
+
+```http
+POST /api/v1/devices
+Content-Type: application/json
+Authorization: Bearer <operator-access-token>
+
+{"device_id":"issuer-bound-device","name":"Operator laptop","encryption_mode":"optional"}
+```
+
+Registration stores `name`, server-generated `registered_at`, and the initial
+policy in **one primary/majority atomic insert**, returning `201`, a resource
+`Location`, and configuration version 1. Device IDs and names are globally unique
+(case-sensitive, exact matching after frontend whitespace trimming).
+An existing ID or name returns **`400 Bad Request`**, including concurrent
+registrations, without changing the existing device or policy. JWE modes require available public encryption keys before
+any write. Names are 1–128 characters; IDs are 1–255 characters and a single URL
+path segment. Blank/control-containing text and unexpected fields are rejected.
+
+An existing policy/status record also reserves its device ID: registration returns
+`400`, rather than adopting or overwriting it. Use the policy editor to change an
+existing policy; only policy PATCH uses `expected_version` and returns `409` on
+concurrent edits. Registration does not accept `expected_version`.
+Existing unregistered agents and version-zero policy lookups remain supported;
+registration is inventory, not a new ingestion gate.
+
+`GET /api/v1/devices?limit=25` returns `{items, next_after}` sorted by device ID.
+Pass `next_after` unchanged as `after` for the next page (`limit` 1–100).
+All persisted device configuration records appear, including version-zero agent
+records. `name` and `registered_at` are nullable when not explicitly registered;
+the UI labels these records rather than inventing registration metadata.
+`GET /api/v1/devices/{id}` returns `404` only when no stored record exists.
+Looking up an unknown ID through `/configuration` still returns its effective
+TLS-only default, but does not create an inventory entry. All inventory/policy
+operations use the primary, while traffic analysis keeps its replica routing.
+A stored record is not proof that an agent is online.
+
+**Identity boundary:** resources are identified only by globally unique `device_id`,
+not by a user/device pair. Operators with `manage:devices` can manage the fleet;
+ordinary agents can read only their own device's inventory, policy and logs.
+Explicit queries for another device return `403`; another device's log ID returns
+`404`. Status reports must match the JWT-bound device, even for management tokens.
+Use the ID returned by the agent's `/api/v1/me`; arbitrary registration IDs do not
+change JWT identity. This workflow does **not** create Auth0 clients or credentials.
+Grant management access only to trusted operators: it is global, not tenant-scoped.
+This test application uses a fresh database for the device-only schema; old test
+data is discarded, not migrated.
 
 #### Upload a batch
 
 Send `Content-Type: application/json` and `Content-Encoding: gzip`. The decompressed
 body is `{"logs": [...]}`, containing 1-500 traffic records.
-Every `user_id` must match the verified token subject. A batch is limited to 1 MiB
+Attribution is server-owned: do not send `user_id`, `device_id`, `client_id`,
+`source_ip`, `metadata`, record/batch IDs or ingestion timestamps in a record.
+Such extra fields return `422`; older agents must update their payloads.
+A batch is limited to 1 MiB
 compressed and 8 MiB decompressed; malformed/truncated gzip, trailing data, and
 concatenated gzip members are rejected.
 
+Each stored record retains the HTTP event, **not just a hash**: timestamp, method,
+URL, status, request/response headers, optional network endpoints,
+sizes, duration and process context. Original bodies and captured authorization/cookie
+values are retained under the workspace's storage policy, encrypted by default.
+Body UTF-8 byte length and SHA-256 are also retained for correlation.
+Authorization/cookies remain redacted in API responses; collection reads omit bodies,
+while authorized request details can decrypt and display retained bodies.
+
+An expanded agent record looks like this (all fields after `status_code` are optional):
+
+```json
+{
+  "timestamp": "2025-01-15T10:23:45.123Z",
+  "method": "POST",
+  "url": "https://api.example.com/v1/login",
+  "status_code": 200,
+  "request_headers": {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+  "response_headers": {"Content-Type": "application/json"},
+  "captured_source_ip": "192.0.2.10",
+  "destination_ip": "203.0.113.50",
+  "source_port": 49152,
+  "destination_port": 443,
+  "http_version": "2",
+  "request_size_bytes": 256,
+  "response_size_bytes": 1024,
+  "duration_ms": 12.5,
+  "process_name": "chrome.exe",
+  "process_id": 1234,
+  "request_id": "agent-request-123"
+}
+```
+
+`source_ip` in the **stored/read** record remains the trusted upload peer. Use
+`captured_source_ip` for the observed request's origin; an agent cannot overwrite
+ingestion attribution. Destination addresses are validated literals, not resolved
+through DNS or independently verified by the backend. Optional observations absent
+from an older record return `null` (header maps return `{}`).
+`headers` is accepted as a legacy input alias for `request_headers`, but supplying
+both is rejected. New storage uses `request_headers`; reads also return the
+deprecated `headers` alias and support historical documents without migration.
+
+#### Strict event validation
+
+Both gzip and decrypted JWE batches use the same closed schema. Any invalid
+record rejects the **entire batch before publishing** (`422`). Wire/expanded size
+violations return `413`. Errors do not echo captured values.
+
+| Fields | Validation |
+| --- | --- |
+| Batch and records | No unexpected fields or duplicate JSON keys; UTF-8 JSON; 1–500 records; existing 1 MiB gzip/8 MiB expanded limits |
+| `timestamp` | ISO 8601 with seconds and timezone, normalized to UTC; epoch numbers/strings rejected |
+| `method`, `url`, `status_code` | HTTP token up to 16 characters, normalized uppercase; HTTP(S) URL up to 8192 characters without credentials, raw controls or surrounding whitespace; integer 100–599 |
+| Both header maps | At most 100 entries and 32 KiB combined UTF-8 key/value bytes per map; names ≤256 characters, values ≤8192; no controls or case-insensitive duplicates |
+| Header keys | HTTP tokens; dots, dollar signs and prototype-map keys are rejected, not interpreted as paths/operators |
+| Captured IPs and ports | IPv4/IPv6 literals without zone IDs; integer ports 1–65535 |
+| HTTP version | `1.0`, `1.1`, `2` or `3` |
+| Message sizes | Agent-measured request/response byte counts, integers 0 through signed BSON int64 maximum; no numeric-string/boolean coercion |
+| `duration_ms` | Finite nonnegative milliseconds, at most 24 hours; no numeric strings, NaN or infinity |
+| Process context and correlation | Nonblank, control-free process name ≤255 characters; integer PID 0–2147483647; request ID ≤128 ASCII letters/digits/`._:-`, starting alphanumeric |
+| Optional `body` | String up to 1,000,000 characters; valid UTF-8; storage encryption enabled by default |
+
+Captured text is **untrusted data**, even after validation. Valid URLs/header values
+may contain attack attempts worth analyzing: validation is not a SQL/HTML sanitizer.
+Queries use fixed server-owned field/operator names and typed values, never
+`$where`, eval, string-built queries or uploaded query expressions. The dashboard
+renders values as escaped text, never raw HTML. Any future analytics/export consumer
+must preserve this separation and use output-context escaping/parameterized queries.
+
 ```bash
-printf '%s' '{"logs":[{"user_id":"YOUR_AUTH0_SUBJECT","device_id":"device-1","timestamp":"2026-10-24T05:00:00Z","method":"GET","url":"https://example.com/","status_code":200}]}' |
+printf '%s' '{"logs":[{"timestamp":"2026-10-24T05:00:00Z","method":"GET","url":"https://example.com/","status_code":200}]}' |
   gzip -c |
   curl -X POST http://localhost:8001/api/v1/traffic-log-batches \
     -H "Authorization: Bearer $ACCESS_TOKEN" \
@@ -207,6 +344,36 @@ before any publishing. A storage failure returns `503`, never an accepted receip
 MongoDB bulk writes are not transactional: a failed batch can have partially persisted,
 and retries can create duplicates. Exactly-once delivery and retry deduplication are
 not provided by this MVP.
+
+#### Trusted ingestion attribution
+
+- No user identity is persisted or exposed as a resource key.
+- `device_id` is the verified `https://amazing-http-logger/device_id` claim when
+  present, otherwise `sub`. A missing claim therefore means one logical device
+  per principal; separate physical devices need issuer-managed, device-bound
+  credentials/claims. Invalid identity claims return `401`, not a fallback.
+  Configure the namespaced claim through trusted issuer-side data, never editable
+  user metadata or values copied from a token request.
+- OAuth `client_id` comes from verified `azp`, or `client_id` when `azp` is absent.
+  It is `null` if neither claim exists; the backend never stores the JWT itself.
+- `source_ip` is the upload connection address supplied by ASGI, including
+  Uvicorn's trusted-proxy resolution. Payloads and arbitrary forwarding headers
+  cannot set it. Configure `FORWARDED_ALLOW_IPS` only for actual gateways, restrict
+  direct backend access, and ensure gateways sanitize forwarded addresses.
+  Without a network peer the value is `null`; no IP is invented.
+- IDs and `received_at` are server-generated. Event `timestamp`, URL, method,
+  status, headers, captured endpoints, sizes/timing, process context and body
+  remain **agent-reported traffic observations**, not
+  independently verified facts. The upload IP is not the source of each captured
+  HTTP request and may identify a NAT or proxy, not a physical device.
+
+Call `/api/v1/me` first and use its `device_id` to poll configuration and report
+status. Each batch belongs to this single JWT-bound device; its policy is read
+from primary before publishing. Existing policies under client-chosen IDs must be
+recreated for the JWT-bound ID, or the issuer must bind that existing ID in the
+signed device claim. Source IP/device provenance is not retroactively verified,
+and missing OAuth
+client IDs are returned as `null`.
 
 #### Encryption and remote client configuration
 
@@ -239,7 +406,8 @@ ordered by event timestamp and record ID, descending. Pass `next_cursor` unchang
 with the same filters, to retrieve the next page; `null` marks the end. Concurrent or
 late-arriving events do not provide a snapshot across pages.
 
-All analysis queries are owner-scoped. Deployments use strict `SECONDARY` routing
+Agent analysis queries are restricted to the JWT-bound device. Management tokens
+can read the fleet or select a device. Deployments use strict `SECONDARY` routing
 with majority read concern and never fall back to primary: no secondary means `503`.
 The single-node local profile explicitly selects primary reads instead.
 Replica reads are eventually consistent, so a just-ingested record may temporarily
@@ -248,15 +416,84 @@ be absent (including `404` on a single-record lookup).
 #### Storage and ingestion boundary
 
 Logs use the `traffic_logs` MongoDB time-series collection, with `timestamp` as the
-time field and `{user_id, device_id}` as stable `metadata`. Startup validates the
+time field and `{device_id, suspicious}` as bucket `metadata`. Startup validates the
 collection options and creates query indexes. Writes use the elected primary with
 majority acknowledgement. `MONGO_URI` must specify `replicaSet`; `directConnection=true`
 is rejected so analysis cannot accidentally read a standalone or primary.
 
-Sensitive headers are redacted and bodies replaced with byte length and SHA-256
-before the `IngestionPublisher` boundary. The MVP's `MongoIngestionPublisher` stores
+Selected sensitive fields are encrypted before the `IngestionPublisher` boundary,
+using a dedicated, non-exportable OpenBao storage key, not the upload key set or its
+wrapping key. With encryption enabled, neither the publisher nor MongoDB receives
+the selected plaintext. Discarded categories are removed before this boundary;
+explicitly disabling encryption for a retained category permits plaintext storage.
+`X-Api-Key` remains discarded/redacted. The MVP's `MongoIngestionPublisher` stores
 directly; a durable queue producer can replace it without changing the routes.
 See [the plan](docs/PLAN.md) for the producer/worker contract.
+
+#### Workspace storage and encryption
+
+Open **Workspace > Storage and encryption** (`/settings`) to choose **Do not retain**,
+**Retain encrypted** (the default), or **Retain plaintext** independently for request
+bodies, authorization headers, and cookies for **all devices**. Discarded bodies
+are not stored or encrypted, but their byte length and SHA-256 digest are retained.
+Discarded authorization/cookie header entries are removed from both
+captured header maps before publishing. Choices apply to **future uploads**;
+existing logs are never rewritten or migrated. Discarded data cannot be recovered.
+
+`GET/PATCH /api/v1/workspace/configuration` require `manage:devices`; PATCH requires
+the three `encrypt_*` Boolean fields and `expected_version`. Three independent,
+strict Boolean `retain_request_body`, `retain_authorization_header`, and
+`retain_cookies` fields default to true and are preserved when omitted in PATCH.
+`retain_*=false` takes precedence over encryption; retained fields use encryption
+unless deliberately configured otherwise. Concurrent edits return
+`409`; configuration writes and enforcement reads use primary/majority, while log
+analysis still reads replicas. Saving validates KMS availability only for categories
+configured to retain encrypted values; ingestion never sends discarded values to KMS.
+
+The dedicated `OPENBAO_STORAGE_KEY` (default `log-storage`, Helm `openbao.storageKey`)
+is generated and retained inside OpenBao Transit as non-exportable
+`aes256-gcm96`: AES-256-GCM with randomized 96-bit nonces and authenticated
+record/device/batch binding. It is distinct from `OPENBAO_TRANSIT_KEY`.
+Bootstrap/`python -m app.kms initialize` provision it without replacing existing
+keys. `python -m app.kms rotate-storage` creates a new version while old versions
+remain available for old records. New keys auto-rotate every 30 days; operators
+must also rotate before per-version usage limits are reached. Missing keys or KMS
+failures return `503`, never a plaintext fallback or successful batch receipt.
+See [storage standards and key retention](docs/ENCRYPTION.md#workspace-storage-encryption)
+before using persistent logs.
+
+#### Retention policies
+
+The **Workspace** page has independent, enabled-by-default retention windows:
+**7 days for ordinary logs** and **30 days for suspicious logs**. Either can be
+disabled to retain that category indefinitely. Windows are whole days, 1-24855.
+They apply to all devices and existing records, measured from the captured event
+`timestamp`, not upload time or classification time. Shortening/enabling retention
+can permanently delete old data; increasing/disabling it cannot restore deleted logs.
+
+Workspace GET/PATCH expose `retention_enabled`, `retention_days`,
+`suspicious_retention_enabled`, and `suspicious_retention_days`, under the same
+`manage:devices` permission and `expected_version` concurrency check as encryption.
+The UI saves both sections together. Existing API clients can omit retention
+fields when updating encryption; omitted values are preserved.
+
+MongoDB **7.0+** uses separate partial TTL indexes on `timestamp`, filtered by
+`metadata.suspicious`. There is no collection-wide TTL that could delete
+suspicious logs under the ordinary window. New logs get a server-owned
+`metadata.suspicious: false`; historical logs without it count as ordinary.
+Collection/item analysis responses expose `suspicious`. Agents cannot set it;
+the analysis job and classification writes are **not implemented**. A future job
+must handle MongoDB's time-series update restrictions when reclassifying records
+and classify them before ordinary expiration; expired evidence cannot be recovered.
+
+Expiration runs asynchronously on whole time-series buckets, so deletion may lag
+the window by a bucket span (normally up to one hour) plus TTL-monitor/load delay.
+Saving settings reconciles the indexes; startup reapplies the saved policy.
+MongoDB 7 requires dropping/rebuilding the affected partial TTL index to change
+its window. Settings and index DDL are not transactional: on failure the API returns
+`503`, but settings may already be saved. Reload and retry after fixing database
+permissions/connectivity, or restart to reconcile; never assume a failed save
+disabled expiration. See the [retention runbook](docs/RUNBOOK.md#retention-operations).
 
 ## Validation
 
@@ -309,5 +546,5 @@ supply a published application image and real Auth0 values. See the runbook for 
 
 - keep credentials in ignored files or externally managed Secrets, never in source files
 - validate all inbound payloads before persistence
-- redact sensitive fields before logging or storage
+- encrypt selected captured fields before storage; redact credentials in API responses and operational logs
 - keep the API layer thin and delegate business logic to services
