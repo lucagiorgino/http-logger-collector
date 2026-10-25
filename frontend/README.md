@@ -21,31 +21,36 @@ openssl rand -hex 32
 make frontend-dev
 ```
 
-Open **http://localhost:3000**. Without complete Auth0 configuration, the welcome
+Start NGINX with `make proxy-up` and open **http://localhost:8080**.
+Without complete Auth0 configuration, the welcome
 page displays setup instructions instead of pretending to be authenticated.
 There is no mock/demo bypass in the application.
 
 The frontend has its own environment file; it does not read the backend's `.env`.
-Its default development port **3000** differs from host Python **8001**, Kubernetes API pods
-**8000**, and the API port-forward **18000**. Change the listener with
+Its listener is **3000** in development and production; Python uses **9090** in both.
+NGINX exposes the shared development origin on **8080**. Change the listener with
 `make frontend-dev FRONTEND_PORT=3010` (or `PORT=3010 npm --prefix frontend run dev`)
 and update `APP_BASE_URL` and the corresponding Auth0 URLs together. `PORT` must
 be supplied to the process, not placed in Next.js's `.env.local`.
 
 `BACKEND_API_URL` is reached by the Next.js **server**, not the browser. When both
-processes run on the development host, it can use `http://127.0.0.1:8001`, even if
+processes run on the development host, use `http://127.0.0.1:9090`, even if
 the browser reaches the frontend through a public HTTPS reverse proxy. To test
 through a public backend tunnel instead, set it to that tunnel's HTTPS origin.
+Use the origin only, without `/api` or `/api/v1`: request paths already contain
+`/api/v1`. Adding a prefix produces incorrect paths such as `/api/api/v1/devices`.
 The public frontend origin belongs in `APP_BASE_URL`; it does not determine the
 API address.
 
-For ngrok, configure the existing **backend** endpoint's upstream as
-`http://127.0.0.1:8001`, not port 8000. The **frontend** endpoint's upstream is
-`http://127.0.0.1:3000`. These loopback addresses assume the ngrok agent runs on
-the same host/network as the corresponding process; otherwise use an address
-reachable from the agent. Keep the public frontend origin in the identity
-provider's callback/logout configuration. Changing a tunnel's upstream does not
-require changing its public domain or the frontend's API URL.
+For ngrok, point the **single public endpoint** at `http://127.0.0.1:8080`.
+NGINX sends `/api/v1/*`, API docs and health requests to **9090**, and everything
+else (including `/auth/*`) to **3000**, preserving paths. Set backend-stack
+`PROXY_EXTERNAL_SCHEME=https` only when that loopback listener is exclusively
+behind the trusted HTTPS tunnel. Use the public origin as `APP_BASE_URL` and in
+Auth0's callback/logout configuration. The Compose proxy publishes port 8080
+and uses the Docker Desktop host gateway by default. On native Linux, run
+`make proxy-up DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml`
+to reach loopback-bound applications through host networking.
 
 If the UI reports **HTTP 502** while the local backend works, check
 `BACKEND_API_URL` from the frontend host. A proxy can return 502 HTML before the
@@ -66,9 +71,9 @@ For the defaults, register:
 
 | Auth0 setting         | Value                                 |
 | --------------------- | ------------------------------------- |
-| Allowed Callback URLs | `http://localhost:3000/auth/callback` |
-| Allowed Logout URLs   | `http://localhost:3000`               |
-| Allowed Web Origins   | `http://localhost:3000`               |
+| Allowed Callback URLs | `http://localhost:8080/auth/callback` |
+| Allowed Logout URLs   | `http://localhost:8080`               |
+| Allowed Web Origins   | `http://localhost:8080`               |
 
 Set `AUTH0_DOMAIN`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET`, `AUTH0_SECRET`,
 `APP_BASE_URL`, and `AUTH0_AUDIENCE` in `frontend/.env.local`. The audience must be
@@ -87,6 +92,16 @@ identify an API in the configured tenant. Copy the backend's exact
 URL, or client ID is not a substitute. The frontend and backend must use the same
 tenant and API identifier.
 
+If the callback reports **`Client ... is not authorized to access resource server ...`**,
+the frontend application lacks user-delegated access to that API. In Auth0
+**Applications > APIs**, select the API matching `AUTH0_AUDIENCE`. Under
+**Settings > Application Access Policy**, use **Per-app authorization** for
+**User-Delegated Access**. Under **Application Access > Edit**, grant the frontend
+Regular Web Application **User-Delegated Access**, including the requested
+`manage:devices` permission for operators, and save. Do not substitute a
+**Client Access** machine-to-machine grant or enable all applications.
+See [Auth0 API access policies](https://auth0.com/docs/get-started/apis/api-access-policies-for-applications).
+
 After changing environment settings, restart `make frontend-dev` and begin a
 fresh sign-in from the configured `APP_BASE_URL` rather than reloading an old
 callback URL. That origin's `/auth/callback` must be in the Web application's
@@ -100,6 +115,12 @@ Verify that the frontend/backend tenant and `AUTH0_AUDIENCE` match, and that
 the **API** issues **RS256** access tokens. The backend's Auth0 SDK accepts
 RS256 only. An HS256 token is rejected even with the correct issuer, audience
 and expiration; repeatedly signing in cannot repair that mismatch.
+
+`AUTH0_AUDIENCE` is an exact API identifier, not a request base URL. For example,
+it may end in `/api` even though `BACKEND_API_URL` must be an origin without
+that suffix. Changing SSR requests from loopback to the public HTTPS proxy does
+not fix a token with the wrong audience. After correcting the audience, sign out
+and sign in again: the existing session still contains the old access token.
 
 Open Auth0 **Applications > APIs**, select the API whose **Identifier** equals
 `AUTH0_AUDIENCE`, and check its **JWT Signing Algorithm** under **Token Settings**.
@@ -219,6 +240,9 @@ discarded data and plaintext storage, and uses
 Existing records are not rewritten; old discarded bodies cannot be recovered.
 Authorized request details display retained bodies as escaped text. Collection
 reads omit bodies; authorization/cookie values stay redacted even in details.
+MongoDB's nested `ingestion`/`logdata` storage layout is internal to the backend:
+the traffic-log API still returns the same flat fields consumed by these pages.
+Both historical flat records and new nested records are supported without a UI migration.
 
 **Retention policies:** a separate Workspace section controls ordinary logs
 (enabled, 7 days by default) and suspicious logs (enabled, 30 days by default).
@@ -273,10 +297,12 @@ replica set, never production. The fixture is not a deployment entry point and
 does not validate live Auth0 authentication or require OpenBao.
 
 For production, use `make frontend-build` followed by `make frontend-start`
-(listener default **3001**, overridable with `FRONTEND_PORT`),
+(listener default **3000**, overridable with `FRONTEND_PORT`),
 provide private configuration through the runtime environment, and serve both
 the public frontend and its remote API connection over HTTPS. The provided
 scripts bind loopback for use behind a trusted reverse proxy. Do not cache
-authenticated pages at that proxy. The existing Helm chart deploys the Python
-stack only; frontend deployment infrastructure is not bundled with this UI.
+authenticated pages at that proxy. The Helm chart deploys both applications and
+can create an optional path-routing Ingress; the external Ingress controller
+provides reverse proxy/TLS termination, so no extra NGINX pod is deployed.
+Build the standalone frontend image with `make frontend-image`.
 No fonts or images are fetched from third-party services at runtime.

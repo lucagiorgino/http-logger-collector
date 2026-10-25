@@ -47,22 +47,70 @@
   `/me` exposes the JWT-bound device used for ingestion policy enforcement.
 - MongoDB time-series storage buckets by device and suspicious classification and supports indexed
   event-time queries with keyset pagination.
+- New documents group collector provenance in `ingestion` and captured HTTP,
+  network/process fields and body length/digest in `logdata`; root timestamp and
+  device/classification bucket metadata are unchanged. New nested ingestion-time
+  and batch/record indexes match the storage paths. HTTP contracts remain flat,
+  so the frontend is unaffected. Historical flat records still read/decrypt;
+  workers accept version-1 flat and version-2 nested BSON without rewriting data.
+  Deploy workers first and drain version-2 work before any worker downgrade.
 - Writes use primary with majority acknowledgement; deployment analysis uses strict
   secondary reads. Single-node local development explicitly enables primary analysis,
   guarded against use outside development.
-- A replaceable ingestion publisher decouples the HTTP boundary from storage; the MVP
-  writes directly to MongoDB rather than running a broker.
-- Local development uses MongoDB/OpenBao Compose and host Python with Uvicorn reload;
-  backend edits do not require image rebuilds. One self-initializing MongoDB container
-  uses loopback port 28017; Python uses 8001. Both load the same parameterized `.env`.
+- Redis Streams queues protected batches; HTTP `200` with `status=queued` follows
+  `XADD` and same-connection `WAITAOF 1 0 <timeout>` confirmation of local AOF fsync.
+  There is no direct MongoDB log-write fallback. MongoDB policy/config reads,
+  validation and OpenBao field protection still complete before queuing. MongoDB,
+  pooled OpenBao and Redis network I/O and FastAPI resource providers are async;
+  bounded CPU preparation uses `asyncio.to_thread`, independent of FastAPI's shared
+  AnyIO thread limiter. Responses are not guaranteed instantaneous.
+- A scalable `python -m app.worker` consumer group processes one producer batch
+  (1–500 events) at a time, reclaims stale pending entries and ACK/deletes only after
+  majority MongoDB writes. Poison entries remain pending/logged, not auto-discarded.
+  The queue never trims pending entries. Batch capacity and no-eviction memory
+  limits produce explicit `503` overload, not dropped success.
+- Delivery is at-least-once. Best-effort retry deduplication uses stable `(batch_id, _id)` pairs,
+  but time-series has no unique IDs; crash/network-ambiguous or partial writes can
+  duplicate records. Fsync timeout may return `503` after enqueue.
+- Local development uses MongoDB/OpenBao/Redis/NGINX Compose and host API/worker
+  Python plus a separately started frontend; backend edits do not require image
+  rebuilds. The public loopback proxy uses 8080, backend 9090 and frontend 3000.
+  MongoDB uses loopback 28017; backend/Compose share the parameterized `.env`.
+  Compose publishes proxy port 8080 by default with Docker Desktop
+  `host.docker.internal` upstreams. Native Linux uses a host-network override
+  while host applications stay loopback-only.
 - Development OpenBao uses loopback port 28200, generated private credentials,
   automatic bootstrap, and a separate least-privilege runtime token. Its dev-mode
   storage is ephemeral: restarting it loses keys, unlike MongoDB's persistent volume.
 - Kubernetes API/MongoDB pod ports and the separate local port-forward are configurable.
-- Helm deploys the API to Kubernetes with hardened pod settings, resource limits,
-  health probes, and a ClusterIP Service.
+- Helm deploys the API (9090), worker, and enabled-by-default standalone Next.js
+  frontend (3000), with hardened settings, resource limits, health probes and
+  ClusterIP Services. The frontend has a read-only filesystem with a bounded
+  writable cache, no service-account token mount, and its own Auth0 existing Secret;
+  it never receives MongoDB/Redis/OpenBao credentials. `frontend.enabled=false`
+  retains the backend-only option.
+- Optional path-preserving Ingress resources use an independently installed
+  controller; no proxy workload is bundled. Backend API/docs/health paths route
+  to 9090, while `/` and `/auth/*` route to frontend 3000. TLS certificates,
+  trusted proxy source IPs/CIDRs and controller configuration remain operator-owned.
+  Frontend SSR requests default to the required public HTTPS app origin, not an
+  HTTP ClusterIP URL, preserving frontend HTTPS checks and backend HTTPS enforcement.
 - Default chart values require an existing Secret for external MongoDB; development
   values opt into a persistent three-member MongoDB StatefulSet and bootstrap Job.
+- Redis defaults to an external `REDIS_URL` Secret (authenticated `rediss://` in
+  production). Development bundles unauthenticated Redis 7.4, AOF/PVC, noeviction,
+  resource limits and API/worker-only network ingress. Redis >=7.2 is required.
+- Bundled Redis uses `appendfsync always`; `WAITAOF` still confirms local durability
+  with a 2000 ms default deadline and 3-second socket timeout. External AOF
+  `everysec` normally adds up to a second to collector latency; a 1000 ms timeout
+  can race that flush schedule.
+- Startup validates Redis `INFO persistence` (`aof_enabled=1`), `INFO memory`
+  (`maxmemory_policy=noeviction`), and `WAITAOF` support. External ACLs must permit
+  `INFO`, stream/group commands, `EVAL`, `WAITAOF`, and transactional ACK/delete
+  (`MULTI`/`EXEC`). Local AOF acknowledgement is not a replication/failover-loss
+  guarantee; external HA requires suitable persistence and failover policy.
+- The separate worker Deployment uses the application image, hardened non-root
+  settings and a 60-second SIGTERM grace period, without Auth0 or KMS credentials.
 - The bundled development database has a headless Service and ingress NetworkPolicy;
   it has no authentication/TLS and must not be used in production.
 - Request bodies, authorization headers and cookies are retained with default-on
@@ -103,9 +151,12 @@
 - replace placeholder Auth0 domain and audience values with a real tenant configuration
 - validate the token flow against a real Auth0 API and permission grant
 - validate MongoDB behavior against production-scale retention and query requirements
-- implement durable broker/consumer infrastructure and external idempotency before
-  enabling queue retries; partial bulk-write failures and client retries can duplicate records
+- provision production Redis persistence/TLS/authentication, capacity monitoring and
+  recovery; external idempotency remains needed for stronger duplicate guarantees
 - provision production MongoDB credentials, TLS, networking, and operational monitoring
+- provision the frontend Auth0 Web application Secret and exact callback/logout URLs,
+  public HTTPS origin/certificates, and narrowly trusted ingress/gateway source IPs;
+  verify frontend pods can reach the public origin for SSR API requests
 - refine logging and redaction policies for production traffic data
 - implement the documented polling/encryption protocol in external agent clients;
   provision keys and grant Auth0 `manage:devices` only to intended administrators
@@ -115,6 +166,12 @@
   or redesign the client protocol; OpenBao Transit does not offer ECDH JWE decryption
 
 ## Test inventory
+- Nested document round-trips cover gzip/JWE ingestion, storage/discard choices,
+  unchanged flat API responses, authenticated ciphertext binding and non-mutating
+  decryption. Historical flat records remain readable, including encrypted bodies.
+  Queue tests recover version-1 records and reject malformed version-2 nesting;
+  replay queries cover both layouts. Real MongoDB checks use the nested batch index
+  and exclude nested bodies/ciphertext from list queries.
 - Field discard tests cover independent categories, mixed-case request/response
   headers, preserved body fingerprints, no KMS call for discarded values, legacy
   omitted settings, and historical record readability. Real API/MongoDB checks
@@ -142,8 +199,10 @@
   and sanitized unexpected SDK failures (real tenant validation pending)
 - Deprecation and pending-deprecation warnings fail tests, except the exact upstream
   Auth0/Authlib JOSE import warning, which is reported in the warning summary
-- Helm lint/render validation for external and bundled MongoDB profiles, plus a
-  Helm smoke-test pod checking the deployed Service and OpenAPI routes
+- Helm lint/render validation for development/production profiles, enabled/disabled
+  frontend, frontend credential isolation, HTTPS/missing-setting rejection and
+  Ingress TLS/path routing. The Helm smoke-test pod checks the API Service/OpenAPI
+  routes and the enabled frontend's public landing page.
 - Isolated Kubernetes validation covers development install/upgrade, external-Secret
   deployment, real time-series/replica integration, and PVC/Secret retention on uninstall
 - Local development validation covers MongoDB/OpenBao Compose initialization, host-run
@@ -178,8 +237,8 @@
 
 ## Architecture and operation diagrams
 
-These Mermaid diagrams describe the **current implementation**, not a proposed
-fleet-management or queue deployment. Keep this section synchronized when changing
+These Mermaid diagrams describe the **current implementation**, including queued
+ingestion. Keep this section synchronized when changing
 routes, authentication, publisher boundaries, deployment profiles, or KMS commands.
 Ports shown are defaults; environment variables and Helm values remain authoritative.
 
@@ -198,9 +257,11 @@ flowchart LR
     subgraph Application["Application components"]
         Dashboard["Next.js SSR dashboard<br/>Server-side sessions and API calls"]
         API["FastAPI backend<br/>Authentication, device/workspace policy<br/>Batch validation and storage encryption"]
-        Publisher["IngestionPublisher interface<br/>MVP: direct MongoDB adapter"]
+        Publisher["IngestionPublisher interface<br/>Redis Streams producer"]
+        Worker["MongoDB writer workers<br/>Shared consumer group and stale reclaim"]
     end
 
+    Queue[("Redis >=7.2<br/>Persistent AOF and noeviction")]
     Primary[("MongoDB primary<br/>Time-series logs with category TTL<br/>Device and workspace configuration/status")]
     Replica[("MongoDB read replicas<br/>Traffic analysis")]
     KMS["OpenBao<br/>Transit KEK, wrapped EC key set<br/>Separate non-exportable storage key"]
@@ -215,22 +276,29 @@ flowchart LR
     API -->|"Load and unwrap EC keys at startup"| KMS
     API -->|"Encrypt stored fields and decrypt authorized details"| KMS
     API -->|"Normalized documents with protected field ciphertext"| Publisher
-    Publisher -->|"Majority log writes"| Primary
+    Publisher -->|"XADD + same-connection WAITAOF<br/>200 queued after local fsync"| Queue
+    Queue -->|"One batch per read"| Worker
+    Worker -->|"Majority log writes before ACK/delete"| Primary
     API -->|"Device inventory/status and workspace configuration"| Primary
     Primary -->|"Replication"| Replica
     API -->|"Analysis reads, strict secondary"| Replica
 ```
 
-The publisher is the replaceable queue boundary; no broker or consumer is deployed
-in the MVP. Analysis reads use read replicas in deployment, with an explicit
+The publisher is the durable Redis queue boundary. Policy/config reads and KMS
+protection still precede it, using async network I/O and offloaded CPU preparation.
+Analysis reads use read replicas in deployment, with an explicit
 primary-read exception for single-member local development. Device configuration
 and status operations use the primary in both environments.
 
 ### Development architecture
 
-Compose runs only MongoDB and OpenBao. Python and the optional management frontend
-are separate host processes with live development reload. A development agent may
-use the loopback HTTP API; remote traffic requires HTTPS.
+Compose runs MongoDB, OpenBao, Redis and NGINX. API, worker and the optional
+management frontend are separate host processes with live development reload.
+The public development origin is `http://127.0.0.1:8080`, routing to loopback
+backend 9090 and frontend 3000. A development agent may use this loopback HTTP
+origin; remote traffic requires HTTPS. Compose publishes loopback 8080 and uses
+Docker Desktop's `host.docker.internal` upstreams without exposing host applications.
+Native Linux uses `DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml`.
 
 ```mermaid
 flowchart LR
@@ -242,14 +310,16 @@ flowchart LR
         FrontEnv["frontend/.env.local<br/>Web application credentials and session secret"]
         Env[".env<br/>Parameterized backend and Compose settings"]
         Front["Next.js SSR frontend<br/>127.0.0.1:3000<br/>Server-side Auth0 session and API adapter"]
-        API["FastAPI / Uvicorn<br/>127.0.0.1:8001<br/>Auth0FastAPI, validation and device checks"]
+        API["FastAPI / Uvicorn<br/>127.0.0.1:9090<br/>Auth0FastAPI, validation and device checks"]
         Keys["EC key set cached in API RAM<br/>Local JWE decryption"]
         Publisher["IngestionPublisher interface"]
-        Direct["MongoIngestionPublisher<br/>Direct-write MVP adapter"]
+        Worker["python -m app.worker<br/>Consumer group, stale reclaim"]
         CLI["app.kms administrative CLI"]
         Credentials[".secrets/<br/>Separate root and runtime credential files"]
 
         subgraph Compose["Docker Compose"]
+            Proxy["NGINX reverse proxy<br/>Public origin 127.0.0.1:8080<br/>Host networking or Desktop bridge override"]
+            Redis[("Redis 7.4<br/>Loopback 28379<br/>AOF volume, noeviction, bounded memory")]
             Mongo[("MongoDB single-member replica set<br/>Loopback 28017<br/>Time-series logs and device policies")]
             Volume[("Persistent MongoDB volume")]
             Bao["OpenBao dev instance<br/>Loopback 28200<br/>Ephemeral, auto-unsealed"]
@@ -258,25 +328,30 @@ flowchart LR
         end
     end
 
-    Browser -->|"Session cookie and HTML/forms"| Front
+    Browser -->|"Session cookie and HTML/forms"| Proxy
+    Proxy -->|"Frontend, assets and /auth/*"| Front
     Browser -->|"Interactive authorization"| IdP
     Front -->|"Server-side code and token exchange"| IdP
     Agent -->|"Client credentials or external user login"| IdP
-    Front -->|"Bearer token, server to server"| API
-    Agent -->|"Bearer token and gzip JSON or JWE"| API
+    Front -->|"Server-side bearer API requests"| Proxy
+    Agent -->|"Bearer token and gzip JSON or JWE"| Proxy
+    Proxy -->|"API/docs/health paths, unchanged"| API
     API -->|"Discovery and JWKS, SDK-cached"| IdP
     API -->|"Unwrap once at process startup"| Bao
     Bao --> Transit
     Bao --> KV
     Bao -->|"Unwrapped EC keys"| Keys
     Keys --> API
-    API --> Publisher --> Direct
-    Direct -->|"Majority inserts to primary"| Mongo
+    API --> Publisher
+    Publisher -->|"XADD + WAITAOF before 200 queued"| Redis
+    Redis -->|"One batch per read"| Worker
+    Worker -->|"Majority inserts before ACK/delete"| Mongo
     API -->|"Policy reads/writes on primary"| Mongo
     API -->|"Analysis on primary: explicit development-only exception"| Mongo
     Mongo --> Volume
     FrontEnv -.-> Front
     Env -.-> API
+    Env -.-> Worker
     Env -.-> Compose
     Credentials -.->|"Runtime token only"| API
     Credentials -.->|"Administrative credential"| CLI
@@ -284,7 +359,7 @@ flowchart LR
     CLI -->|"Provision, wrap, rotate and configure ACL"| Bao
 ```
 
-There is no broker or consumer process in the MVP. The replaceable publisher
+Redis runs in Compose; workers run separately on the host (`make worker`). The publisher
 receives normalized documents **after** upload decryption, validation, policy
 checks and storage field encryption. Development OpenBao restart loses the KEK,
 EC key set and storage key; existing MongoDB logs remain, but encrypted fields
@@ -295,27 +370,31 @@ become permanently unreadable. Production requires persistent key storage/backup
 Solid dependency connections below describe the default external-dependency
 profile. Dotted connections labeled as alternatives describe the bundled Helm
 development profile; the API does not use both database providers simultaneously.
-The frontend and TLS gateway must be deployed separately: the chart currently
-packages the Python API and optional development dependencies, not the frontend,
-ingress, certificates, or production dependency operations.
+The chart packages the Python API, worker, frontend and optional development
+dependencies. Optional Ingress resources use an externally installed controller;
+an external TLS gateway is also supported. Certificates, trusted forwarded-header
+configuration and production dependency operations remain externally managed.
+Disable `frontend.enabled` for backend-only installations.
 
 ```mermaid
 flowchart TB
     Browser["Operator browser"]
     Agent["Device agents"]
     IdP["Auth0 tenant"]
-    Front["Separately hosted Next.js SSR frontend<br/>Private Web application credentials"]
-    Gateway["Externally managed HTTPS gateway<br/>Trusted forwarded scheme"]
+    Gateway["External HTTPS Ingress controller or gateway<br/>Optional chart Ingress rules<br/>Trusted forwarded scheme"]
     Kube["Kubernetes control plane<br/>TokenReview"]
 
     subgraph Cluster["Kubernetes namespace / Helm release"]
-        Service["API ClusterIP Service<br/>80 to API pod port 8000"]
-        API["FastAPI Deployment replicas<br/>Init: wait for primary and KMS<br/>Per-process EC keys in RAM<br/>Publisher interface and direct MongoDB adapter"]
+        Front["Next.js SSR Deployment and ClusterIP<br/>3000, private Web application Secret<br/>No database or KMS credentials"]
+        Service["API ClusterIP Service<br/>9090 to API pod port 9090"]
+        API["FastAPI Deployment replicas<br/>Init: wait for primary and KMS<br/>Per-process EC keys in RAM<br/>Redis Streams publisher"]
+        Worker["Worker Deployment replicas<br/>Same image, shared consumer group<br/>No Auth0 or KMS credentials"]
         Config["ConfigMap<br/>Tenant, audience, suite and dependency settings"]
-        Secrets["Existing Secrets<br/>External MongoDB URI, optional KMS token and CA"]
+        Secrets["Existing Secrets<br/>External MongoDB/Redis URIs, optional KMS token and CA"]
         SA["Dedicated API ServiceAccount<br/>Projected audience-bound JWT<br/>No general-purpose automatic token mount"]
 
         subgraph Bundled["Alternative: bundled Helm development dependencies"]
+            DevRedis[("Redis StatefulSet and Service<br/>6379, AOF/PVC, noeviction<br/>Unauthenticated development only")]
             Init["Revision-named MongoDB initializer Job"]
             Headless["MongoDB headless Service"]
             DevPrimary[("MongoDB primary<br/>Pod port 27017")]
@@ -329,28 +408,37 @@ flowchart TB
     end
 
     subgraph External["Externally operated production dependencies"]
+        Redis[("Authenticated TLS Redis >=7.2<br/>Persistent AOF, noeviction")]
         Primary[("MongoDB primary<br/>TLS and authentication")]
         Secondary[("MongoDB read replicas<br/>TLS and authentication")]
         Bao["Persistent HTTPS OpenBao<br/>Transit KEK and KV v2 wrapped keys"]
     end
 
-    Browser -->|"HTTPS, session cookie"| Front
+    Browser -->|"HTTPS, session cookie"| Gateway
+    Gateway -->|"Frontend and /auth/* paths"| Front
     Browser -->|"Interactive authorization"| IdP
     Front -->|"Code/token exchange and optional refresh"| IdP
     Agent -->|"Access-token acquisition"| IdP
-    Front -->|"Server-side bearer requests"| Gateway
+    Front -->|"SSR bearer requests through public HTTPS origin"| Gateway
     Agent -->|"HTTPS API requests"| Gateway
     Gateway --> Service --> API
     API -->|"Discovery and JWKS"| IdP
-    API -->|"Majority log writes; primary policy reads/writes"| Primary
+    API -->|"XADD + WAITAOF before 200 queued"| Redis
+    Redis --> Worker
+    Worker -->|"Majority log writes before ACK/delete"| Primary
+    API -->|"Primary policy reads/writes"| Primary
     API -->|"Strict secondary analysis; no primary fallback"| Secondary
     Primary -->|"Replication"| Secondary
     API -->|"Login, wrapped-key read and Transit unwrap at startup"| Bao
     Bao -->|"Kubernetes auth: configured TokenReview access"| Kube
     Config -.-> API
     Secrets -.-> API
+    Secrets -.->|"MongoDB/Redis URI only"| Worker
     SA -.-> API
     API -.->|"Alternative primary provider"| DevPrimary
+    API -.->|"Alternative queue"| DevRedis
+    DevRedis -.-> Worker
+    Worker -.->|"Alternative majority writer"| DevPrimary
     API -.->|"Alternative strict secondary provider"| DevSecondary
     DevPrimary -->|"Replication"| DevSecondary
     Init --> Headless
@@ -773,7 +861,8 @@ sequenceDiagram
     participant Transit as OpenBao storage key
     participant Primary as MongoDB primary
     participant Publisher as IngestionPublisher
-    participant Adapter as MongoIngestionPublisher
+    participant Redis as Redis Streams and local AOF
+    participant Worker as Consumer-group worker
     Agent->>Agent: Build JSON batch of 1 to 500 logs#59; gzip exactly once
     alt Device sends application encryption
         Agent->>Agent: Use advertised EC public key and configured ECDH/AES suite
@@ -803,25 +892,38 @@ sequenceDiagram
         end
         Note over API,Publisher: Settings or KMS failure returns 503 before publish
         API->>Publisher: publish batch ID and normalized documents
-        Publisher->>Adapter: Direct MVP adapter
-        Adapter->>Primary: Unordered bulk insert into time-series logs#59; majority acknowledgement
-        alt Write acknowledged
-            Primary-->>Adapter: Insert acknowledged
-            Adapter-->>API: Receipt status stored and accepted_count
-            API-->>Agent: 202 receipt
-        else Persistence failure
-            Adapter-->>API: PersistenceError
+        Publisher->>Redis: XADD versioned envelope#59; enforce batch capacity without trimming
+        Publisher->>Redis: WAITAOF 1 0 timeout on same connection
+        alt Local AOF fsync confirmed
+            Redis-->>Publisher: Local fsync acknowledgement
+            Publisher-->>API: Receipt status queued and accepted_count
+            API-->>Agent: 200 queued receipt
+        else Queue full, unavailable or fsync unconfirmed
+            Publisher-->>API: PersistenceError
             API-->>Agent: Sanitized 503#59; no success receipt
         end
     end
-    Note over Agent,Primary: Bulk failure may partially persist#59; retries are not deduplicated
+    Worker->>Redis: Read one producer batch or reclaim stale pending
+    Redis-->>Worker: Protected normalized documents with stable IDs
+    Worker->>Primary: Best-effort batch_id and _id deduplication and majority bulk insert
+    alt Majority insertion succeeds
+        Primary-->>Worker: Acknowledged
+        Worker->>Redis: Transactional ACK/delete completed entry with MULTI/EXEC
+    else Write fails or poison entry
+        Note over Worker,Redis: Keep pending and log#59; retry/reclaim, never automatic discard
+    end
+    Note over Agent,Primary: At-least-once#59; time-series lacks unique IDs, ambiguous writes may duplicate
     Note over Keys,Publisher: Upload EC keys are cached#59; storage encryption calls OpenBao for protected fields
 ```
 
 The flow groups failure outcomes for readability; an actual failed guard
-short-circuits processing immediately. A future publisher may return `queued`
-after durable queue acceptance, but no broker/consumer or exactly-once processing
-is implemented.
+short-circuits processing immediately. `queued` confirms local Redis AOF durability,
+not MongoDB processing or replicated Redis durability. Queuing removes only log
+writes from the request path, not async MongoDB policy reads or async KMS work.
+Regression tests stall a worker's write and exhaust FastAPI's shared thread
+limiter while ten gzip or JWE uploads and health checks still complete.
+Pending entries are
+never trimmed. There is no exactly-once guarantee or direct-write fallback.
 
 #### Analysis reads
 
@@ -1062,8 +1164,11 @@ sequenceDiagram
     participant Make
     participant Mongo as Compose MongoDB
     participant Bao as Compose OpenBao
+    participant Redis as Compose Redis with AOF volume
+    participant Proxy as Compose NGINX on 8080
     participant CLI as app.kms
     participant API as Host Python
+    participant Worker as Host Python worker
     participant UI as Host Next.js
     Developer->>Make: make dev
     Make->>Mongo: Start and wait for health
@@ -1072,23 +1177,35 @@ sequenceDiagram
     Make->>Bao: Start and wait for health
     Make->>CLI: bootstrap-dev
     CLI->>Bao: Provision/preserve key set and refresh runtime credential
-    Make->>API: python -m app using selected ENV_FILE
+    Make->>Redis: Start with AOF, noeviction and memory limit#59; wait for health
+    Make->>Proxy: Start proxy to backend 9090 and frontend 3000
+    Make->>API: python -m app on loopback 9090 using selected ENV_FILE
     Note over API: Run startup sequence#59; reload backend source without image rebuild
+    Developer->>Make: make worker in another terminal
+    Make->>Worker: python -m app.worker using selected ENV_FILE
+    Worker->>Redis: Consume shared group and reclaim stale pending
+    Worker->>Mongo: Majority write before Redis ACK/delete
     opt Management frontend
         Developer->>Make: make frontend-dev
         Make->>UI: Start Next.js using separate frontend/.env.local and port 3000
     end
     Developer->>API: Ctrl-C
     API->>API: Graceful lifespan shutdown and awaited MongoDB close
+    Developer->>Worker: Ctrl-C#59; finish in-flight write or leave pending for reclaim
     Developer->>UI: Ctrl-C if frontend was started
     Developer->>Make: make dev-down
+    Make->>Proxy: Remove proxy container
     Make->>Mongo: Remove Compose container#59; retain persistent volume
+    Make->>Redis: Remove container#59; retain AOF volume
     Make->>Bao: Remove container#59; ephemeral KMS state is lost
     Note over CLI,API: After KMS restart, bootstrap again and restart API#59; old buffered JWE may be unrecoverable
 ```
 
-`make run` starts only Python. `mongo-up/down` and `openbao-up/down` target the
-individual dependencies. `make frontend-build` and `make frontend-start` build
+`make run` starts only API Python; `make worker` starts only the worker.
+`mongo-up/down`, `openbao-up/down`, `redis-up/down` and `proxy-up/down` target
+individual Compose services. Native Linux users pass the same
+`DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml` to Compose lifecycle targets.
+`make frontend-build` and `make frontend-start` build
 and run the production SSR bundle independently of the Python image.
 
 #### Deployment lifecycle
@@ -1099,16 +1216,17 @@ sequenceDiagram
     participant Helm
     participant Kube as Kubernetes
     participant Jobs as Optional dependency initializer Jobs
-    participant Dependencies as MongoDB and OpenBao
+    participant Dependencies as MongoDB, Redis and OpenBao
     participant API as API pod init containers and process
+    participant Worker as Worker Deployment
     Operator->>Helm: make helm-up with selected context, values and immutable image
     Helm->>Kube: Create or upgrade Service, Deployment, ConfigMap, ServiceAccount and mounts
     alt Bundled development dependencies enabled
-        Helm->>Kube: MongoDB StatefulSet/PVCs, OpenBao dev Deployment, RBAC and NetworkPolicies
+        Helm->>Kube: MongoDB and Redis StatefulSets/PVCs, OpenBao dev Deployment, RBAC and NetworkPolicies
         Helm->>Jobs: Revision-named MongoDB and OpenBao bootstrap Jobs
         Jobs->>Dependencies: Initialize only absent state#59; preserve existing membership/keys
     else External dependency profile
-        Note over Kube,Dependencies: Operator already provisioned authenticated MongoDB and persistent HTTPS OpenBao
+        Note over Kube,Dependencies: Operator provisioned authenticated MongoDB, TLS Redis with AOF, persistent HTTPS OpenBao
     end
     Kube->>API: Start wait-for-primary init container
     API->>Dependencies: Wait for primary reachability
@@ -1117,6 +1235,8 @@ sequenceDiagram
     Kube->>API: Start application container
     API->>Dependencies: Perform API startup/key-load/storage initialization
     Kube->>API: Startup/readiness/liveness probes on /health
+    Kube->>Worker: Start same image with python -m app.worker
+    Worker->>Dependencies: MongoDB/Redis only#59; shared consumer group
     Helm-->>Operator: Install or upgrade completes after workloads and Jobs are ready
     opt Deployment smoke test
         Operator->>Helm: make helm-test
@@ -1126,12 +1246,12 @@ sequenceDiagram
     end
     opt Local access
         Operator->>Kube: make helm-port-forward
-        Kube-->>Operator: Loopback 18000 to API Service
+        Kube-->>Operator: Loopback 9090 to API Service#59; override if host backend uses it
     end
     opt Uninstall
         Operator->>Helm: make helm-down
         Helm->>Kube: Remove release workloads, Services, Jobs and bundled dev root Secret
-        Note over Kube,Dependencies: MongoDB PVCs retained#59; bundled OpenBao state lost#59; external services untouched
+        Note over Kube,Dependencies: MongoDB/Redis PVCs retained#59; OpenBao state lost#59; external services untouched
     end
 
 ```
@@ -1158,7 +1278,7 @@ sequenceDiagram
         IdP-->>Plain: Access token
         Plain->>API: Discover JWT-bound device via /me#59; read existing plaintext policy and acknowledge
         Plain->>API: Upload three synthetic logs as gzip JSON
-        API-->>Plain: 202 stored or durable queued receipt
+        API-->>Plain: 200 queued receipt after local Redis fsync
     and Encrypted device
         Test->>Encrypted: Release synchronized start
         Encrypted->>IdP: Client-credentials token request without management scope
@@ -1170,7 +1290,7 @@ sequenceDiagram
             API-->>Encrypted: 403 required-encryption enforcement
         end
         Encrypted->>API: Upload three synthetic logs as compact JWE
-        API-->>Encrypted: 202 receipt
+        API-->>Encrypted: 200 queued receipt after local Redis fsync
     end
     loop Bounded visibility wait for each device
         Plain->>API: Read own batch through paginated analysis API

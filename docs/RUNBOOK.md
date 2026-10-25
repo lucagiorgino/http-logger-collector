@@ -2,9 +2,10 @@
 
 ## Prerequisites
 - Python 3.11+
-- Docker and Docker Compose for development MongoDB and OpenBao
+- Docker and Docker Compose for development MongoDB, OpenBao, Redis and NGINX
 - For Kubernetes deployment only: Kubernetes 1.27+, kubectl, Helm 3 or 4, and a
-  StorageClass when using bundled MongoDB
+  StorageClass when using bundled MongoDB/Redis
+- Redis >=7.2 with persistent AOF and `maxmemory-policy noeviction`
 
 For HTTPS proxy configuration, device encryption policies, OpenBao provisioning, and
 rotation, see [Log encryption and device configuration](ENCRYPTION.md).
@@ -17,7 +18,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-## Run the live development backend
+## Run the live development stack
 
 ```bash
 make dev
@@ -29,23 +30,45 @@ the host virtual environment through `python -m app` with Uvicorn reload.
 Python code changes do not require a Docker build, Helm, or Kubernetes.
 
 Compose also starts OpenBao and bootstraps its Transit KEK, wrapped EC key set,
-and a least-privilege runtime credential. `make dev` waits for both dependencies,
-then starts Python. All components read
-the same `.env` file, preserving Auth0 settings. The default API address is
-`127.0.0.1:8001`; use `APP_PORT` in `.env` or `make dev APP_PORT=8101` to change it.
+and a least-privilege runtime credential. It also starts persistent Redis 7.4 on
+loopback port 28379. `make dev` waits for all three dependencies and starts the
+NGINX proxy, then starts Python. Backend and Compose share `.env`, preserving
+Auth0 settings. The backend listens on `127.0.0.1:9090`; the separately started
+frontend listens on `127.0.0.1:3000`. Open the public development origin
+`http://127.0.0.1:8080`: NGINX routes API/docs/health paths to the backend and
+all other paths, including `/auth/*`, to the frontend without stripping prefixes.
+Configure frontend `APP_BASE_URL` and `BACKEND_API_URL` for that same origin in
+`frontend/.env.local`; keep frontend Auth0 Web application credentials there.
+
+Compose publishes proxy port 8080 by default and uses the Docker Desktop host
+gateway. No override is needed on Docker Desktop. On native Linux, use the
+host-network override to reach loopback-bound host applications:
+
+```bash
+make dev DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml
+# Use the same override for subsequent Compose targets, including shutdown:
+make dev-down DEV_COMPOSE_OVERRIDE=docker/docker-compose.host.yml
+```
+
+The override publishes `127.0.0.1:8080` and reaches the host applications through
+`host.docker.internal`; keep the host backend/frontend bound to loopback.
 
 To run the components independently:
 
 ```bash
 make dev-up
 make run
+# In a separate terminal:
+make worker
+# In another terminal, after frontend setup:
+make frontend-dev
 ```
 
 `make run` uses the MongoDB URI in `.env`, which interpolates `MONGO_HOST`,
 `MONGO_PORT`, and `MONGO_REPLICA_SET`, normally resolving to
 `mongodb://localhost:28017/?replicaSet=rs0`. MongoDB publishes only port 28017 on
-loopback and stores data in one named volume. No hosts-file edits, shared network
-namespaces, or extra database services are needed. OpenBao uses loopback port
+loopback and stores data in one named volume. MongoDB requires no hosts-file edits,
+shared network namespaces, or extra database services. OpenBao uses loopback port
 28200; Python loads `OPENBAO_ADDR` and `OPENBAO_TOKEN_FILE` from the same `.env`.
 The generated `.secrets/` credentials are private and ignored by Git and Docker builds.
 The application never receives the development root credential.
@@ -55,8 +78,12 @@ from its only member. This setting is allowed only with `APP_ENV=development`;
 enabling it in another environment fails startup. Deployments continue to read
 strictly from secondaries, without primary fallback.
 
-Stop Python with Ctrl+C. `make dev-down` stops both services and retains MongoDB
-volumes. Individual targets are `mongo-up/down` and `openbao-up/down`. Use the same
+Run `make worker` in a separate terminal even when using `make dev`. Both Python
+processes load `.env`; the worker does not use Auth0/OpenBao. Restart it explicitly
+after code/config changes. Stop API and worker with Ctrl+C. `make dev-down` stops
+the proxy and all three dependencies and retains MongoDB/Redis volumes.
+Individual targets are `mongo-up/down`, `openbao-up/down`, `redis-up/down`, and
+`proxy-up/down`. Use the same
 `COMPOSE_PROJECT` value for start/stop if overriding `amazing-http-logger-dev`.
 These non-TLS services are for local development only.
 
@@ -87,15 +114,21 @@ make dev MONGO_PORT=29017 APP_PORT=8101
 | --- | --- | --- |
 | Docker MongoDB, host and container | 28017 | `.env` `MONGO_PORT` |
 | Docker OpenBao, host and container | 28200 | `.env` `OPENBAO_PORT` |
-| Host Python | 8001 | `.env` `APP_HOST` / `APP_PORT` |
-| Kubernetes API pod | 8000 | Helm `app.port` |
+| Docker Redis, host (container 6379) | 28379 | `.env` `REDIS_PORT` |
+| Public development NGINX proxy | 8080 | `.env` `PROXY_BIND_HOST` / `PROXY_PORT` |
+| Host Python backend | 9090 | `.env` `APP_HOST` / `APP_PORT` |
+| Host Next.js frontend | 3000 | Make `FRONTEND_PORT`; match Compose `.env` `FRONTEND_PORT` |
+| Kubernetes API pod and Service | 9090 | Helm `app.port` / `service.port` |
+| Kubernetes frontend pod and Service | 3000 | Helm `frontend.port` / `frontend.service.port` |
 | Kubernetes MongoDB pods | 27017 | Helm `mongodb.port` |
 | Kubernetes OpenBao pod | 8200 | Helm `openbao.port` |
-| Kubernetes API port-forward | 18000 | Make `KUBE_LOCAL_PORT` |
+| Kubernetes Redis pod (development) | 6379 | Helm `redis.port` |
+| Kubernetes API port-forward | 9090 | Make `KUBE_LOCAL_PORT` |
 
-Kubernetes uses ClusterIP Services, not host ports. Its port-forward defaults to
-a separate local port. These defaults avoid overlap with one another, but cannot
-reserve ports against unrelated software; change occupied ports explicitly.
+Kubernetes uses ClusterIP Services, not host ports. Its API port-forward defaults
+to local 9090, which conflicts with a running host backend; select, for example,
+`make helm-port-forward KUBE_LOCAL_PORT=19090` when running both.
+Change any occupied ports explicitly and keep proxy upstream ports synchronized.
 Keep the same MongoDB port and replica-set name when reusing its development volume.
 Changing `.env` requires a Python restart.
 
@@ -103,10 +136,13 @@ Changing `.env` requires a Python restart.
 ```bash
 minikube start
 make image
+make frontend-image
 docker pull mongo:7
+docker pull redis:7.4
 docker pull ghcr.io/openbao/openbao:2.7.1
-minikube image load amazing-http-logger:dev mongo:7 ghcr.io/openbao/openbao:2.7.1
+minikube image load amazing-http-logger:dev amazing-http-logger-dashboard:dev mongo:7 redis:7.4 ghcr.io/openbao/openbao:2.7.1
 make helm-lint
+# Provision logger-frontend-auth0 first, as described below.
 make helm-up KUBE_CONTEXT=minikube
 make helm-test KUBE_CONTEXT=minikube
 kubectl --context=minikube -n logger get pods,jobs,pvc
@@ -117,11 +153,25 @@ Check `kubectl config current-context` before deployment. Make targets accept
 `KUBE_CONTEXT`, `KUBE_NAMESPACE`, `HELM_RELEASE`, `HELM_VALUES`, `HELM_ARGS`,
 `IMAGE_REPOSITORY`, `IMAGE_TAG`, `KUBE_SERVICE`, and `KUBE_LOCAL_PORT`. Their defaults select the `logger`
 release/namespace and the **development** Helm profile; the chart's own default
-values select **external** MongoDB and HTTPS OpenBao.
+values select **external** MongoDB, authenticated TLS Redis and HTTPS OpenBao.
 
 The development profile has placeholder Auth0 settings. Set a real tenant and
 audience with `HELM_ARGS='--set auth0.domain=your-tenant.auth0.com --set auth0.audience=https://your-api'`.
 Do not put access tokens, database passwords, or client secrets in Helm values.
+It also references a namespace-local `logger-frontend-auth0` Secret and an illustrative
+`https://logger.example.test` public origin. Provision the Secret and override
+`frontend.appBaseUrl` with a real HTTPS ingress/gateway origin reachable from both
+browser and frontend pods before using the dashboard. The sample does not install
+an Ingress controller or configure DNS/certificates. For API/worker-only deployments,
+set `frontend.enabled=false`; frontend secrets/origin are then unnecessary.
+
+The chart deploys a separate Next.js frontend Deployment/ClusterIP Service on port
+3000 by default, with resource limits, non-root execution, no automatic service-account
+token mount, a read-only root filesystem and a writable bounded `emptyDir` cache.
+Its public `/` landing page is the startup/readiness/liveness probe; no dedicated
+frontend health endpoint exists. It receives only public Auth0 domain/audience,
+frontend connection settings and its own Auth0 Secret, never backend MongoDB,
+Redis or OpenBao credentials.
 
 MongoDB starts as a three-member StatefulSet with one PVC per member, a headless
 Service, and stable in-cluster DNS names. An idempotent Job initializes `rs0` or
@@ -132,9 +182,17 @@ The revision-named Job is an ordinary resource, not a post-install hook, so
 `helm --wait --wait-for-jobs` cannot deadlock waiting for that hook to run.
 
 MongoDB is not externally exposed. Its ingress NetworkPolicy permits only the
-release's API, MongoDB, and initializer pods; enforcement requires a CNI that
+release's API, worker, MongoDB, and initializer pods; enforcement requires a CNI that
 supports NetworkPolicy. The bundled database has no authentication or TLS and is
 for development only. Do not use it for production data.
+
+Redis runs as a single-node non-root StatefulSet with a persistent PVC, AOF
+(`appendonly yes`, `appendfsync always`), `maxmemory 192mb`, a 256 MiB memory cap,
+and `noeviction`. It is unauthenticated, cluster-internal, and development-only.
+Its ingress NetworkPolicy permits only this release's API/worker pods.
+The worker Deployment uses the same application image and
+`python -m app.worker`; it receives MongoDB/Redis configuration only, without
+Auth0 settings, OpenBao tokens, projected JWTs, or KMS CA mounts.
 
 OpenBao runs as a non-root development Deployment with a ClusterIP Service and an
 ingress NetworkPolicy permitting only API/bootstrap pods. A generated development
@@ -151,12 +209,26 @@ log fields encrypted under the lost storage key. Do not restart development
 OpenBao if encrypted test logs must remain readable. The chart
 does not implement persistent production OpenBao or automatic unsealing.
 
-## External MongoDB and OpenBao / production
+## External MongoDB, Redis and OpenBao / production
 
 Provision an authenticated, TLS-enabled MongoDB replica set independently. Configure
 the real URI in the git-ignored `.env`, or use your cluster's secret-management
 operator to provision the Secret. Never pass the URI in `--set` or a values file:
 Helm persists release values in the cluster.
+
+Provision authenticated TLS Redis **7.2+** independently with persistent AOF,
+`appendonly yes`, preferably `appendfsync always`, a finite `maxmemory` with `noeviction`,
+durable disk capacity, backups and tested recovery. Startup validates
+`INFO persistence` returns `aof_enabled=1`, `INFO memory` returns
+`maxmemory_policy=noeviction`, and `WAITAOF` is supported. External Redis ACLs must
+permit `INFO`, stream/group commands, `EVAL`, `WAITAOF`, and transactional ACK/delete
+(`MULTI`/`EXEC`), with access to the configured stream/group keys. Cache-only or
+non-AOF services are unsuitable.
+The confirmation is a local fsync, not a replication/failover-loss guarantee;
+external HA requires suitable persistence and failover policy.
+Provision a namespace-local existing Secret
+`logger-redis` containing `REDIS_URL=rediss://...` through your secret-management
+operator. Never place its URL/credentials in values or `--set`.
 
 Provision persistent, initialized/unsealed, TLS-enabled OpenBao and its audit,
 backup, and recovery processes separately. Initialize its wrapped key set and
@@ -172,31 +244,104 @@ API endpoint, CA, and rotating reviewer credentials explicitly.
 kubectl --context=YOUR_CONTEXT create namespace logger
 kubectl --context=YOUR_CONTEXT -n logger create secret generic logger-mongodb \
   --from-env-file=.env
+# Populate this private, git-ignored file independently; do not put it in Helm values.
+kubectl --context=YOUR_CONTEXT -n logger create secret generic logger-frontend-auth0 \
+  --from-env-file=.secrets/frontend-auth0.env
 docker build -f docker/Dockerfile -t registry.example.com/team/amazing-http-logger:0.1.0 .
+docker build -f docker/frontend.Dockerfile -t registry.example.com/team/amazing-http-logger-frontend:0.1.0 .
 docker push registry.example.com/team/amazing-http-logger:0.1.0
+docker push registry.example.com/team/amazing-http-logger-frontend:0.1.0
 helm upgrade --install logger helm/amazing-http-logger \
   --kube-context YOUR_CONTEXT --namespace logger \
   --set externalMongo.existingSecret=logger-mongodb \
+  --set externalRedis.existingSecret=logger-redis \
   --set openbao.address=https://bao.example.com \
   --set auth0.domain=your-tenant.auth0.com \
   --set auth0.audience=https://your-api \
   --set image.repository=registry.example.com/team/amazing-http-logger \
   --set-string image.tag=0.1.0 \
+  --set frontend.image.repository=registry.example.com/team/amazing-http-logger-frontend \
+  --set-string frontend.image.tag=0.1.0 \
+  --set frontend.auth0.existingSecret=logger-frontend-auth0 \
+  --set frontend.appBaseUrl=https://logger.example.com \
   --wait --wait-for-jobs --timeout 10m
 ```
 
 The Secret must be in the release namespace and contain `MONGO_URI` (or the key
 selected by `externalMongo.uriKey`). Kubernetes environment variables do not reload
-when a Secret changes; restart the Deployment after rotation. The URI must specify
+when a Secret changes; restart both API and worker Deployments after MongoDB/Redis
+credential rotation. `externalRedis.urlKey` defaults to `REDIS_URL`. The MongoDB URI must specify
 `replicaSet=<name>`, plus authentication/TLS options, and every advertised member
 hostname must be resolvable and reachable from the pods. `directConnection=true`
 is rejected.
 
-For private image registries, configure `imagePullSecrets`. Production exposure
-requires a separately managed TLS ingress/gateway to the ClusterIP Service;
-configure it to accept the documented compressed batch size without stripping
-`Content-Encoding`. Configure database backups, access controls, and monitoring
-outside this chart.
+The frontend Secret must contain `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET`, and
+`AUTH0_SECRET` (a cryptographically random 32-byte session secret, encoded as
+64 hex characters). Use an Auth0 Regular Web Application; configure the exact
+`https://logger.example.com/auth/callback` callback and the public origin as its
+allowed logout URL. The top-level `auth0.domain`/`auth0.audience` are shared by
+API and frontend; private client credentials are not. Restart the frontend
+Deployment after rotating this Secret. Neither lint nor rendering checks that
+referenced Secrets actually exist or contain usable credentials.
+
+The frontend image uses the repository root as build context, Node 22 Alpine,
+`npm ci`, and `npm run build`; Next.js must enable `output: "standalone"`.
+Its non-root production runner starts the standalone server on `0.0.0.0:3000`,
+copies static assets and any optional `public/` contents, and needs no build-time
+Auth0 credentials. Supply credentials only at runtime.
+
+### Public ingress and trusted TLS termination
+
+For private image registries, configure shared `imagePullSecrets`. Both Services
+are ClusterIP-only (backend 9090, frontend 3000). The chart bundles **no NGINX or
+other reverse-proxy workload**. Either configure an external TLS gateway or enable
+the chart's optional Ingress resource against an independently installed controller:
+
+```yaml
+frontend:
+  appBaseUrl: https://logger.example.com
+  auth0:
+    existingSecret: logger-frontend-auth0
+app:
+  requireHttps: true
+  # Example only: replace with the actual ingress controller source IPs/CIDRs.
+  forwardedAllowIps: "10.244.4.0/24"
+ingress:
+  enabled: true
+  className: nginx
+  host: logger.example.com
+  annotations: {}
+  tls:
+    - secretName: logger-tls
+      hosts: [logger.example.com]
+```
+
+Provision that TLS Secret separately. The Ingress sends `/api/v1` and `/docs`
+(`Prefix`), `/redoc`, `/openapi.json`, and `/health` (`Exact`) to the backend;
+`/` (`Prefix`) goes to the frontend, including `/auth/*` and Next.js assets.
+Do **not** strip prefixes or add blanket rewrite annotations. With
+`frontend.enabled=false`, only the backend paths are generated.
+
+TLS may terminate at the controller/gateway and use HTTP to the pods, but it must
+overwrite untrusted forwarded headers and send `X-Forwarded-Proto: https`.
+Restrict `app.forwardedAllowIps` to its **actual** source IPs/CIDRs, never `*` or
+an all-address CIDR; the loopback default is not sufficient for a remote ingress.
+Restrict direct backend access with deployment/network controls so clients cannot
+impersonate that proxy. Keep backend `requireHttps=true`; do not disable it to
+work around an incorrect trust configuration. If an upstream external TLS gateway
+precedes an HTTP Ingress, configure the controller to trust forwarded scheme
+headers **only** from that gateway and preserve the verified HTTPS scheme.
+
+`BACKEND_API_URL` defaults to `frontend.appBaseUrl`, so SSR bearer API requests
+loop through the same public HTTPS ingress `/api/v1` route. Frontend pods must
+resolve and reach that public origin, including any gateway hairpin/NAT path.
+`frontend.backendApiUrl` may override it with a separately reachable **HTTPS**
+API origin. A plain HTTP backend Service DNS URL is intentionally rejected by
+the frontend (HTTP is allowed only for loopback development); do not weaken
+that check. HTTP loopback app origins are accepted only in the development
+profile, not production. Configure the gateway/controller to accept the documented
+compressed batch size without stripping `Content-Encoding`. Provision certificates,
+database backups, access controls, and monitoring outside this chart.
 
 For a private KMS CA set `openbao.ca.existingSecret` (key `ca.crt` by default).
 Alternatively mount a least-privilege static runtime token using
@@ -219,12 +364,12 @@ Secret on upgrade. EC key rotation/retirement changes cached runtime state only
 after an explicit API rollout; use the staged procedure in [ENCRYPTION.md](ENCRYPTION.md).
 
 Uninstall removes workloads, Services, Jobs, and the bundled dev root Secret, but
-**retains MongoDB PVCs**. Bundled OpenBao state is lost.
+**retains MongoDB and Redis PVCs**. Bundled OpenBao state is lost.
 Deleting the namespace or manually deleting those PVCs can destroy data. Use a stable
 release name and namespace for the development database.
 
 For externally managed dependencies, set their reachable addresses and runtime
-credential path in `.env` and use `make run` instead of `make dev`. Kubernetes MongoDB DNS names remain
+credential path in `.env` and use `make run` plus `make worker` instead of `make dev`. Kubernetes MongoDB DNS names remain
 cluster-internal; forwarding a single member port does not preserve replica discovery.
 
 ## Device-only test database
@@ -248,7 +393,8 @@ or names return `400`; updates still use the versioned policy PATCH API.
 
 ## Run tests
 For the JavaScript SSR management UI, see [`frontend/README.md`](../frontend/README.md).
-Run `make frontend-dev` on its separate default port 3000 with the backend running.
+Run `make frontend-dev` on loopback port 3000 with the backend (9090) and NGINX
+proxy running; browse through the shared public development origin on port 8080.
 It requires its own Auth0 Regular Web Application in `frontend/.env.local`, not
 agent M2M credentials. `make frontend-test` checks adapter tests and lint;
 `make frontend-test-browser` builds and runs isolated browser tests.
@@ -333,8 +479,9 @@ kubectl --context=minikube -n logger exec deployment/logger-amazing-http-logger 
 
 This opt-in test uses only public HTTP endpoints: **no Auth0 dependency overrides,
 in-process app transport, direct database access, or private KMS credentials**.
-Run the backend with MongoDB and a provisioned OpenBao first (`make dev` locally,
-or deploy Helm). It exercises the currently configured ingestion publisher and
+Run the backend with MongoDB, Redis, a worker and a provisioned OpenBao first
+(`make dev` plus `make worker` in another terminal locally, or deploy Helm).
+It exercises durable queued ingestion and
 reads accepted records through analysis, waiting for replication/processing.
 Deployment analysis must have a readable secondary; the local single-node profile
 uses its existing explicit development-only primary-read setting.
@@ -407,7 +554,7 @@ then checks cross-device access denial (`403` for explicit list/configuration qu
 
 `STACK_TEST_HTTP_TIMEOUT` bounds each request (default 10 seconds);
 `STACK_TEST_VISIBILITY_TIMEOUT` bounds the read-back wait (default 30 seconds).
-Increase the latter for slower replicas or a queued publisher. A `503` or any other
+Increase the latter for queue backlog or slower replicas. A `503` or any other
 unexpected HTTP status fails explicitly; the test does not fall back to primary
 or retry an upload that could have partially persisted.
 
@@ -482,23 +629,124 @@ Startup creates `traffic_logs` with `timeField=timestamp`, `metaField=metadata`,
 It fails rather than using a regular collection with the same name. Index creation
 and collection administration happen against primary; only analysis reads use replicas.
 
+New records use `{_id, timestamp, metadata, ingestion, logdata, storage_encryption?}`.
+`metadata` contains only device/classification bucket identity. Batch/client IDs,
+upload peer and reception time are under `ingestion`; captured HTTP/network/process
+fields and body length/digest are under `logdata`. Do not move per-upload values
+into time-series metadata. See the [document example](../README.md#stored-document-layout).
+The HTTP upload/read contracts remain flat and unchanged; historical flat records
+are still readable and decryptable without migration or data deletion.
+
+Startup creates `ingestion_received_at` on `ingestion.received_at` and
+`ingestion_batch_record` on `(ingestion.batch_id, _id)`. Existing
+`device_timestamp`, `timestamp_id` and both retention indexes keep their paths.
+List projections exclude both `logdata.body` and historical root `body`, as well
+as ciphertext. Existing legacy `received_at`/`batch_record` indexes are not
+automatically dropped. Keep `batch_record` while old version-1 messages can still
+be retried; remove legacy indexes only after checking their usage and draining
+those batches, on the explicitly selected application database.
+
+Deploy the new workers **before** new collectors: workers accept old version-1
+flat BSON envelopes and new version-2 nested envelopes. Older workers cannot consume
+version 2 and leave such messages pending; do not downgrade workers until those
+batches have drained. Neither deployment nor startup migrates stored records,
+purges the stream or resets the database. Direct MongoDB consumers must support
+both layouts while historical records remain.
+
 ## Operational semantics
 
 - Batch uploads require one gzip member and `application/json`. Limits are 500 records,
   1 MiB compressed, and 8 MiB decompressed; size violations return `413`.
-- `202` acknowledges durable handoff. In the MVP the receipt says `stored`; with a
-  future broker adapter it can say `queued`, which does not mean processed.
-- Ingestion failures return `503`. Bulk writes may have partially succeeded; client
-  retries are not deduplicated. Use bounded retry policies appropriate to that limitation.
+- HTTP `200`, `status=queued` acknowledges Redis `XADD` plus same-connection
+  `WAITAOF 1 0 <timeout>` confirmation of local AOF fsync, **not** MongoDB processing.
+  There is no direct-write fallback or guarantee of instantaneous response:
+  policy/config reads and OpenBao field protection still complete before queuing,
+  but MongoDB, OpenBao and Redis network I/O is async. Resource providers are async;
+  collector CPU preparation uses `asyncio.to_thread` rather than FastAPI's shared
+  AnyIO thread limiter. MongoDB log writes run only in the separate worker.
+- Queue unavailability, capacity/memory exhaustion, or missing fsync confirmation
+  returns `503`. A timeout can leave an enqueued batch despite the error.
+  Delivery is at-least-once. Worker retry deduplication by stable `(batch_id, _id)` is best-effort:
+  time-series has no unique IDs, and partial/ambiguous writes may duplicate records.
+  Client resubmissions get new IDs; use bounded retry policies.
 - Replica reads are eventually consistent. New records may briefly be missing; `404`
   does not prove that a just-accepted record was never written.
 - No secondary means analysis returns `503`, even while ingestion remains healthy.
   The explicit local-development primary-read profile does not require a secondary.
-- `/health` reports process liveness only; monitor primary/secondary availability
+- `/health` reports process liveness only; monitor Redis/AOF/worker and primary/secondary availability
   and ingestion/read error rates separately, along with OpenBao seal/auth/error metrics.
 - Fresh startup requires OpenBao. EC keys stay cached in RAM for the process lifetime;
   a running backend may continue decrypting during a KMS outage. Revoking a KMS token
   does not remove cached keys. Restart all processes after EC rotation/retirement.
+
+## Redis queue and worker operations
+
+| Environment setting | Default | Helm value |
+| --- | --- | --- |
+| `REDIS_URL` | `redis://localhost:28379/0` (development) | `externalRedis.existingSecret` / `urlKey` (`REDIS_URL`) |
+| `REDIS_STREAM` | `traffic-log-batches` | `queue.stream` |
+| `REDIS_GROUP` | `mongo-writers` | `queue.group` |
+| `REDIS_MAX_BATCHES` | `10000` | `queue.maxBatches` |
+| `REDIS_SOCKET_TIMEOUT_SECONDS` | `3` | `queue.socketTimeoutSeconds` |
+| `REDIS_AOF_TIMEOUT_MS` | `2000` | `queue.aofTimeoutMs` |
+| `WORKER_RECLAIM_IDLE_MS` | `60000` | `worker.reclaimIdleMs` |
+| `WORKER_WRITE_TIMEOUT_SECONDS` | `30` | `worker.writeTimeoutSeconds` |
+| `WORKER_RETRY_SECONDS` | `1` | `worker.retrySeconds` |
+
+The socket timeout must leave room for AOF confirmation. Keep reclaim idle time
+above the maximum write duration plus network/ACK margin, or another worker can
+reclaim a still-active batch. Keep `worker.terminationGracePeriodSeconds` (default
+60) above `worker.writeTimeoutSeconds` (default 30) plus the Redis acknowledgement
+deadline (3-second socket timeout by default) and cleanup margin. SIGTERM stops new work
+and permits an in-flight write to finish; a forced kill leaves pending work for
+reclaim. Each worker reads **one producer batch of 1–500 events** at a time.
+Scale via `worker.replicaCount`; all replicas must share the stream/group.
+Increasing replicas does not guarantee ordering or exactly-once delivery.
+
+Bundled Redis AOF uses `always` to fsync each write without waiting for an
+every-second flush. The collector retains `WAITAOF` to confirm **local** fsync
+before acknowledging each batch. External AOF `everysec` can work with the
+2000 ms AOF timeout and 3-second socket timeout, but normally adds up to a second
+to collector latency; a 1000 ms AOF timeout can race the flush schedule.
+Disk/fsync delays can still cause timeouts with either policy.
+Preserve its data volume/PVC across restarts, monitor
+disk space/AOF rewrite headroom and fsync latency, and test AOF recovery/backups.
+Redis maxmemory must stay below its container limit with headroom for AOF buffers,
+rewrites and fragmentation; the development 192 MiB/256 MiB defaults are not
+production sizing. Capacity limits include unprocessed/pending entries.
+No `MAXLEN`/`XTRIM` or eviction may remove pending work. When the batch or memory
+bound is reached, uploads fail explicitly with `503` until capacity recovers.
+
+Monitor stream length, consumer-group lag and pending counts/oldest idle time,
+worker progress/retry logs, API `503` rates, Redis memory, AOF write status,
+fsync latency and disk saturation. For the unauthenticated local stack:
+
+```bash
+docker compose --project-directory . --env-file .env -f docker/docker-compose.yml exec redis redis-cli XLEN traffic-log-batches
+docker compose --project-directory . --env-file .env -f docker/docker-compose.yml exec redis redis-cli XINFO GROUPS traffic-log-batches
+docker compose --project-directory . --env-file .env -f docker/docker-compose.yml exec redis redis-cli XPENDING traffic-log-batches mongo-writers
+docker compose --project-directory . --env-file .env -f docker/docker-compose.yml exec redis redis-cli INFO persistence
+```
+
+These commands inspect metadata, not batch contents. Avoid printing Redis URLs,
+payloads, tokens or decrypted fields. Use secret-safe authenticated tooling in production.
+
+Workers ACK/delete **only after majority MongoDB bulk insertion**. If MongoDB is
+unavailable, fix connectivity/credentials, restore workers and let pending entries
+be retried/reclaimed; do not delete the queue or switch to direct API writes.
+Poison/version-invalid messages are logged and remain pending for operator
+investigation, without automatic discard/dead-lettering. Retain the original
+durable entry, diagnose without exposing payload data, deploy a compatible fix
+and retry. Any exceptional manual deletion requires explicit authorization and
+an audit/recovery plan; it forfeits delivery.
+
+After a worker crash or ambiguous MongoDB response, stable `(batch_id, _id)` pairs permit best-effort
+duplicate avoidance, but time-series unique indexes cannot enforce it. A record
+may be inserted twice even if the worker later ACKs successfully. After Redis
+failure, restore its original persistent AOF and consumer-group state; do not
+recreate an empty queue and assume acknowledged batches were processed. Analysis
+may lag both the queue and MongoDB replication; `queued` is not a read-after-write
+guarantee.
 
 ## Troubleshooting
 - For local MongoDB, inspect `docker compose -f docker/docker-compose.yml ps` and

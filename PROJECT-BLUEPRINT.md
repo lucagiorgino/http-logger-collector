@@ -80,7 +80,9 @@ Rules:
 - `app/services` contains domain logic and orchestrates calls into persistence or security utilities.
 - `app/db` is the only layer that talks to MongoDB.
 - Batch ingestion hands normalized, minimized records to `IngestionPublisher`;
-  the MVP adapter writes directly, while a future adapter can publish to a durable queue.
+  Redis Streams durably accepts them before HTTP 200. A separate worker batch-inserts
+  into MongoDB and acknowledges only after majority persistence, with pending-message
+  recovery and best-effort replay deduplication, not exactly-once delivery.
 - Deployment analysis uses strict secondary routing without fallback. The single-node
   local profile explicitly selects primary reads, guarded to development only.
 - Device policy enforcement uses primary/majority reads, not analysis replicas.

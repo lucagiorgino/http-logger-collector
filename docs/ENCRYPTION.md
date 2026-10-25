@@ -169,7 +169,12 @@ record ID, device ID, batch ID, field categories and format purpose/version.
 Ciphertext swapping or context changes fail authentication.
 
 MongoDB stores `storage_encryption` with format version, field categories and a
-versioned `vault:vN:...` ciphertext; selected header values are `[ENCRYPTED]`.
+versioned `vault:vN:...` ciphertext at the document root; selected header values
+are `[ENCRYPTED]` under `logdata.request_headers`/`logdata.response_headers`.
+Retained plaintext bodies use `logdata.body`; body length/digest stay in `logdata`
+regardless of retention. The authenticated batch ID comes from `ingestion.batch_id`.
+The canonical authenticated context is unchanged, so historical flat encrypted
+records still decrypt without rewriting ciphertext.
 Analysis collection reads stay on replicas, exclude bodies and ciphertext at the
 database query layer, and redact credentials without KMS access. Large retained
 body payloads therefore do not inflate list queries. After device authorization,
@@ -493,14 +498,19 @@ Authentication, envelope integrity, decompression bounds, trusted attribution, a
 the JWT-bound device's effective encryption policy are checked before publishing any log.
 Malformed/tampered/unknown-key envelopes return generic `400`; wrong media encoding
 returns `415`; size overflow returns `413`; policy violations return `403`; storage
-or policy/key-management unavailability returns `503`. Successful receipts remain `202` with
-`status=stored` for MongoDB or `queued` for a replacement publisher.
+or policy/key-management unavailability returns `503`. Successful receipts return `200` with
+`status=queued` after Redis confirms local AOF durability. Storage protection/discard
+happens before enqueueing; the worker does not need OpenBao keys or credentials.
+MongoDB persistence is asynchronous. Queue outages or capacity limits return `503`,
+never a success-shaped fallback to synchronous writes.
 
 Control-plane policy reads use primary with majority read concern, never a stale
 analysis replica. Analysis retains its existing secondary-only deployment routing.
 Policy is checked during each request; changes do not retroactively cancel a
 request already being accepted. Envelopes do not provide replay deduplication:
-the MVP's existing retry/partial-write duplicate limitations still apply.
+client retries and ambiguous partial MongoDB writes may still create duplicates.
+The worker reuses record IDs and checks already-persisted records on replay, but
+time-series collections cannot enforce unique IDs, so delivery is at-least-once.
 
 ## Key rotation
 
