@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-ARG APP_PORT=8000
+ARG APP_PORT=9090
 
 WORKDIR /app
 

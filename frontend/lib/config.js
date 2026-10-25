@@ -12,7 +12,7 @@ export function missingAuthSettings(env = process.env) {
 }
 
 export function backendSettings(env = process.env) {
-  const url = new URL(env.BACKEND_API_URL || "http://127.0.0.1:8001");
+  const url = new URL(env.BACKEND_API_URL || "http://127.0.0.1:9090");
   if (
     url.username ||
     url.password ||
@@ -26,6 +26,11 @@ export function backendSettings(env = process.env) {
   ) {
     throw new Error(
       "BACKEND_API_URL must use HTTPS, except for local loopback development.",
+    );
+  }
+  if (url.pathname !== "/") {
+    throw new Error(
+      "BACKEND_API_URL must be an origin without a path. API requests already include /api/v1; do not append /api or /api/v1.",
     );
   }
   const timeout = Number(env.BACKEND_API_TIMEOUT_MS || "10000");

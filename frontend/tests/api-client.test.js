@@ -234,7 +234,7 @@ test("device detail links encode IDs and reject path traversal or controls", () 
 });
 
 test("backend config prevents credential-bearing, redirected, or insecure remote origins", () => {
-  assert.equal(backendSettings({}).baseUrl, "http://127.0.0.1:8001");
+  assert.equal(backendSettings({}).baseUrl, "http://127.0.0.1:9090");
   for (const url of [
     "http://remote.example",
     "https://user:password@example.test",
@@ -245,6 +245,20 @@ test("backend config prevents credential-bearing, redirected, or insecure remote
   }
   assert.throws(() => backendSettings({ BACKEND_API_TIMEOUT_MS: "NaN" }));
   assert.ok(missingAuthSettings({}).includes("AUTH0_SECRET"));
+});
+
+test("backend config rejects API path prefixes instead of duplicating versioned paths", () => {
+  for (const path of ["/api", "/api/", "/api/v1", "/prefix"]) {
+    assert.throws(
+      () =>
+        backendSettings({ BACKEND_API_URL: `https://backend.example${path}` }),
+      /origin.*without a path/,
+    );
+  }
+  assert.equal(
+    backendSettings({ BACKEND_API_URL: "https://backend.example/" }).baseUrl,
+    "https://backend.example",
+  );
 });
 
 test("registration sends only device fields and validates identity, name and policy", () => {

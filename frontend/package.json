@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "next dev --hostname 127.0.0.1 --port ${PORT:-3000}",
     "build": "next build",
-    "start": "next start --hostname 127.0.0.1 --port ${PORT:-3001}",
+    "start": "next start --hostname 127.0.0.1 --port ${PORT:-3000}",
     "lint": "eslint . --max-warnings 0",
     "format:check": "prettier --check .",
     "test": "node --test tests/*.test.js",

@@ -1,6 +1,30 @@
 name: ${COMPOSE_PROJECT:-amazing-http-logger-dev}
 
 services:
+  proxy:
+    image: nginxinc/nginx-unprivileged:1.28-alpine
+    network_mode: bridge
+    ports:
+      - "${PROXY_BIND_HOST:-127.0.0.1}:${PROXY_PORT:-8080}:${PROXY_PORT:-8080}"
+    restart: unless-stopped
+    mem_limit: 128m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      PROXY_BIND_HOST: 0.0.0.0
+      PROXY_PORT: ${PROXY_PORT:-8080}
+      PROXY_EXTERNAL_SCHEME: ${PROXY_EXTERNAL_SCHEME:-http}
+      APP_PORT: ${APP_PORT:-9090}
+      FRONTEND_PORT: ${FRONTEND_PORT:-3000}
+      PROXY_UPSTREAM_HOST: host.docker.internal
+      NGINX_ENVSUBST_FILTER: "^(PROXY_BIND_HOST|PROXY_PORT|PROXY_EXTERNAL_SCHEME|PROXY_UPSTREAM_HOST|APP_PORT|FRONTEND_PORT)$$"
+    volumes:
+      - ./docker/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://$${PROXY_BIND_HOST}:$${PROXY_PORT}/proxy-health"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
   redis:
     image: redis:7.4
     command: ["redis-server", "--bind", "0.0.0.0", "--protected-mode", "no", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory", "192mb", "--maxmemory-policy", "noeviction"]

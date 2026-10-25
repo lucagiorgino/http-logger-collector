@@ -29,7 +29,7 @@ def isolated_stack_environment(monkeypatch):
 @pytest.fixture
 def stack_settings():
     return StackSettings(
-        base_url="http://127.0.0.1:8001",
+        base_url="http://127.0.0.1:8080",
         token_url="https://auth.example.test/oauth/token",
         audience="https://test-api",
         plaintext={
@@ -299,7 +299,7 @@ def test_successful_receipts_do_not_hide_persisted_data_failures(stack_settings,
 def test_profile_requires_distinct_clients_and_hides_secrets(tmp_path, monkeypatch):
     profile = tmp_path / "stack.env"
     profile.write_text(
-        "STACK_TEST_ENABLED=true\nSTACK_TEST_BASE_URL=http://127.0.0.1:8001\n"
+        "STACK_TEST_ENABLED=true\nSTACK_TEST_BASE_URL=http://127.0.0.1:8080\n"
         "STACK_TEST_TOKEN_URL=https://auth.example.test/oauth/token\nSTACK_TEST_AUDIENCE=api\n"
         "STACK_TEST_PLAINTEXT_CLIENT_ID=first\nSTACK_TEST_PLAINTEXT_CLIENT_SECRET=private-one\n"
         "STACK_TEST_ENCRYPTED_CLIENT_ID=second\nSTACK_TEST_ENCRYPTED_CLIENT_SECRET=private-two\n"

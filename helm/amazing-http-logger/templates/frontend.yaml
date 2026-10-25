@@ -1,0 +1,105 @@
+{{- if .Values.frontend.enabled }}
+{{- $origin := required "frontend.appBaseUrl is required when frontend.enabled=true" .Values.frontend.appBaseUrl }}
+{{- $secret := required "frontend.auth0.existingSecret is required when frontend.enabled=true" .Values.frontend.auth0.existingSecret }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "logger.fullname" . }}-frontend
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.frontend.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: frontend
+  template:
+    metadata:
+      labels:
+        {{- include "logger.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: frontend
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.frontend.podSecurityContext | nindent 8 }}
+      containers:
+        - name: frontend
+          image: "{{ .Values.frontend.image.repository }}:{{ .Values.frontend.image.tag }}"
+          imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: NEXT_TELEMETRY_DISABLED
+              value: "1"
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: PORT
+              value: {{ .Values.frontend.port | quote }}
+            - name: APP_BASE_URL
+              value: {{ $origin | quote }}
+            - name: BACKEND_API_URL
+              value: {{ default $origin .Values.frontend.backendApiUrl | quote }}
+            - name: BACKEND_API_TIMEOUT_MS
+              value: {{ .Values.frontend.backendApiTimeoutMs | quote }}
+            - name: AUTH0_DOMAIN
+              value: {{ required "auth0.domain is required" .Values.auth0.domain | quote }}
+            - name: AUTH0_AUDIENCE
+              value: {{ required "auth0.audience is required" .Values.auth0.audience | quote }}
+            {{- range $key := list "AUTH0_CLIENT_ID" "AUTH0_CLIENT_SECRET" "AUTH0_SECRET" }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret | quote }}
+                  key: {{ $key }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.frontend.port }}
+          securityContext:
+            {{- toYaml .Values.frontend.securityContext | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.frontend.resources | nindent 12 }}
+          volumeMounts:
+            - name: cache
+              mountPath: /app/.next/cache
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "logger.fullname" . }}-frontend
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "logger.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+  ports:
+    - name: http
+      port: {{ .Values.frontend.service.port }}
+      targetPort: http
+{{- end }}

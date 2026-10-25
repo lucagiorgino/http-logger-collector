@@ -7,4 +7,11 @@
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-frontend/
+**/.git
+**/.env
+**/.env.*
+**/.secrets
+**/node_modules
+**/.next
+frontend/playwright-report/
+frontend/test-results/

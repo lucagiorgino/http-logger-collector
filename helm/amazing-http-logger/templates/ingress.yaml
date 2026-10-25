@@ -1,0 +1,42 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "logger.fullname" . }}
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ required "ingress.host is required when ingress.enabled=true" .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- range $route := list (dict "path" "/api/v1" "type" "Prefix") (dict "path" "/docs" "type" "Prefix") (dict "path" "/redoc" "type" "Exact") (dict "path" "/openapi.json" "type" "Exact") (dict "path" "/health" "type" "Exact") }}
+          - path: {{ $route.path }}
+            pathType: {{ $route.type }}
+            backend:
+              service:
+                name: {{ include "logger.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.port }}
+          {{- end }}
+          {{- if .Values.frontend.enabled }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "logger.fullname" . }}-frontend
+                port:
+                  number: {{ .Values.frontend.service.port }}
+          {{- end }}
+{{- end }}

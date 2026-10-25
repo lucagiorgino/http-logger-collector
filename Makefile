@@ -7,13 +7,15 @@ STACK_TEST_ENV_FILE ?= .env.stack-test
 OPENBAO_UID ?= $(shell id -u)
 OPENBAO_GID ?= $(shell id -g)
 export OPENBAO_UID OPENBAO_GID
-DEV_COMPOSE := docker compose --project-directory . --env-file "$(ENV_FILE)" -f docker/docker-compose.yml
+DEV_COMPOSE_OVERRIDE ?=
+DEV_COMPOSE = docker compose --project-directory . --env-file "$(ENV_FILE)" -f docker/docker-compose.yml $(if $(DEV_COMPOSE_OVERRIDE),-f "$(DEV_COMPOSE_OVERRIDE)",)
 IMAGE_REPOSITORY ?= amazing-http-logger
+FRONTEND_IMAGE_REPOSITORY ?= amazing-http-logger-dashboard
 IMAGE_TAG ?= dev
 HELM_RELEASE ?= logger
 KUBE_NAMESPACE ?= logger
 KUBE_CONTEXT ?=
-KUBE_LOCAL_PORT ?= 18000
+KUBE_LOCAL_PORT ?= 9090
 KUBE_SERVICE ?= $(HELM_RELEASE)-amazing-http-logger
 HELM_CHART := helm/amazing-http-logger
 HELM_VALUES ?= $(HELM_CHART)/values-development.yaml
@@ -46,7 +48,7 @@ frontend-dev:
 frontend-build:
 	npm --prefix frontend run build
 
-frontend-start: FRONTEND_PORT ?= 3001
+frontend-start: FRONTEND_PORT ?= 3000
 frontend-start:
 	PORT="$(FRONTEND_PORT)" npm --prefix frontend run start
 
@@ -64,6 +66,12 @@ run:
 
 worker:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.worker
+
+proxy-up:
+	$(DEV_COMPOSE) up -d --wait proxy
+
+proxy-down:
+	$(DEV_COMPOSE) stop proxy
 
 redis-up:
 	$(DEV_COMPOSE) up -d --wait redis
@@ -85,7 +93,7 @@ openbao-up:
 openbao-down:
 	$(DEV_COMPOSE) stop openbao
 
-dev-up: mongo-up openbao-up redis-up
+dev-up: mongo-up openbao-up redis-up proxy-up
 
 dev-down:
 	$(DEV_COMPOSE) down
@@ -96,14 +104,17 @@ dev: dev-up
 image:
 	docker build -f docker/Dockerfile -t "$(IMAGE_REPOSITORY):$(IMAGE_TAG)" .
 
+frontend-image:
+	docker build -f docker/frontend.Dockerfile -t "$(FRONTEND_IMAGE_REPOSITORY):$(IMAGE_TAG)" .
+
 helm-lint:
 	helm lint --strict $(HELM_CHART) -f "$(HELM_VALUES)" $(HELM_ARGS)
 
 helm-template:
-	helm template "$(HELM_RELEASE)" $(HELM_CHART) --namespace "$(KUBE_NAMESPACE)" -f "$(HELM_VALUES)" --set-string image.repository="$(IMAGE_REPOSITORY)" --set-string image.tag="$(IMAGE_TAG)" $(HELM_ARGS)
+	helm template "$(HELM_RELEASE)" $(HELM_CHART) --namespace "$(KUBE_NAMESPACE)" -f "$(HELM_VALUES)" --set-string image.repository="$(IMAGE_REPOSITORY)" --set-string image.tag="$(IMAGE_TAG)" --set-string frontend.image.repository="$(FRONTEND_IMAGE_REPOSITORY)" --set-string frontend.image.tag="$(IMAGE_TAG)" $(HELM_ARGS)
 
 helm-up:
-	helm upgrade --install "$(HELM_RELEASE)" $(HELM_CHART) $(HELM_CONTEXT) --namespace "$(KUBE_NAMESPACE)" --create-namespace -f "$(HELM_VALUES)" --set-string image.repository="$(IMAGE_REPOSITORY)" --set-string image.tag="$(IMAGE_TAG)" $(HELM_ARGS) --wait --wait-for-jobs --timeout 10m
+	helm upgrade --install "$(HELM_RELEASE)" $(HELM_CHART) $(HELM_CONTEXT) --namespace "$(KUBE_NAMESPACE)" --create-namespace -f "$(HELM_VALUES)" --set-string image.repository="$(IMAGE_REPOSITORY)" --set-string image.tag="$(IMAGE_TAG)" --set-string frontend.image.repository="$(FRONTEND_IMAGE_REPOSITORY)" --set-string frontend.image.tag="$(IMAGE_TAG)" $(HELM_ARGS) --wait --wait-for-jobs --timeout 10m
 
 helm-test:
 	helm test "$(HELM_RELEASE)" $(HELM_CONTEXT) --namespace "$(KUBE_NAMESPACE)" --logs --timeout 2m
@@ -114,4 +125,4 @@ helm-down:
 helm-port-forward:
 	kubectl $(KUBECTL_CONTEXT) --namespace "$(KUBE_NAMESPACE)" port-forward "service/$(KUBE_SERVICE)" "$(KUBE_LOCAL_PORT):http"
 
-.PHONY: install test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run worker redis-up redis-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image helm-lint helm-template helm-up helm-test helm-down helm-port-forward
+.PHONY: install test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run worker proxy-up proxy-down redis-up redis-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image frontend-image helm-lint helm-template helm-up helm-test helm-down helm-port-forward

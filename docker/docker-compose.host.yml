@@ -1,0 +1,7 @@
+services:
+  proxy:
+    network_mode: host
+    ports: !reset []
+    environment:
+      PROXY_BIND_HOST: ${PROXY_BIND_HOST:-127.0.0.1}
+      PROXY_UPSTREAM_HOST: 127.0.0.1

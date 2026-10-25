@@ -6,8 +6,23 @@ auth0:
   audience: https://example.test/api
 
 app:
+  port: 9090
   environment: development
   requireHttps: false
+
+service:
+  port: 9090
+
+frontend:
+  image:
+    tag: dev
+  port: 3000
+  service:
+    port: 3000
+  # Illustrative only: supply an externally reachable HTTPS origin for live SSR.
+  appBaseUrl: https://logger.example.test
+  auth0:
+    existingSecret: logger-frontend-auth0
 
 mongodb:
   enabled: true

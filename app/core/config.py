@@ -41,7 +41,7 @@ class Settings:
     auth0_audience: str = os.getenv("AUTH0_AUDIENCE", "")
     app_env: str = os.getenv("APP_ENV", "development")
     app_host: str = os.getenv("APP_HOST", "127.0.0.1")
-    app_port: int = int(os.getenv("APP_PORT", "8001"))
+    app_port: int = int(os.getenv("APP_PORT", "9090"))
     app_reload: bool = _env_bool("APP_RELOAD")
     require_https: bool = _env_bool("REQUIRE_HTTPS", app_env != "development")
     openbao_addr: str = os.getenv("OPENBAO_ADDR", "http://localhost:28200")

@@ -1,6 +1,6 @@
 apiVersion: v2
 name: amazing-http-logger
-description: HTTP traffic ingestion API with optional development MongoDB replica set
+description: HTTP traffic ingestion API and SSR dashboard with optional Ingress and development dependencies
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

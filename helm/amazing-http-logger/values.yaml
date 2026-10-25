@@ -11,7 +11,7 @@ auth0:
   audience: ""
 
 app:
-  port: 8000
+  port: 9090
   environment: production
   mongoDatabase: amazing_http_logger
   mongoServerSelectionTimeoutMs: 5000
@@ -99,7 +99,56 @@ redis:
       memory: 256Mi
 
 service:
-  port: 80
+  port: 9090
+
+frontend:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: amazing-http-logger-frontend
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  port: 3000
+  service:
+    port: 3000
+  # Public browser origin; production must use HTTPS.
+  appBaseUrl: ""
+  # Defaults to appBaseUrl: SSR API requests traverse the same public ingress.
+  # Origin only; do not append /api or /api/v1.
+  # Non-loopback HTTP URLs are rejected by the frontend.
+  backendApiUrl: ""
+  backendApiTimeoutMs: 10000
+  auth0:
+    # Namespace-local Secret with AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET, AUTH0_SECRET.
+    existingSecret: ""
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+ingress:
+  # Requires an independently installed Ingress controller; no proxy is bundled.
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  # Example: [{secretName: logger-tls, hosts: [logger.example.com]}]
+  tls: []
 
 resources:
   requests:

@@ -40,6 +40,12 @@ spec:
           assert "/api/v1/devices/{device_id}/configuration" in paths
           assert "/api/v1/devices/{device_id}/configuration-status" in paths
           print("API health and REST schema verified")
+          {{- if .Values.frontend.enabled }}
+          frontend = "http://{{ include "logger.fullname" . }}-frontend:{{ .Values.frontend.service.port }}"
+          with urllib.request.urlopen(frontend + "/", timeout=10) as response:
+              assert response.status == 200
+          print("Frontend public landing page verified")
+          {{- end }}
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
