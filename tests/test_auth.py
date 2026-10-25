@@ -10,10 +10,11 @@ from joserfc import jwt
 from joserfc.jwk import OctKey, RSAKey
 
 from app.core import auth
-from app.core.encryption import EncryptionKeys, get_encryption_keys
+from app.core.encryption import EncryptionKeys
 from app.core.storage_encryption import get_storage_encryption
-from app.deps import get_mongo_repository
+from app.deps import get_ingestion_publisher, get_mongo_repository, get_request_encryption_keys
 from app.main import app
+from app.services.ingestion import MongoIngestionPublisher
 from app.services.traffic_service import DEVICE_ID_CLAIM
 
 client = TestClient(app)
@@ -125,7 +126,14 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
         | {DEVICE_ID_CLAIM: "issuer-bound-device", client_claim: "issuer-bound-client"}
     )
     monkeypatch.setitem(app.dependency_overrides, get_mongo_repository, lambda: repository)
-    monkeypatch.setitem(app.dependency_overrides, get_encryption_keys, lambda: EncryptionKeys({}))
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_ingestion_publisher,
+        lambda: MongoIngestionPublisher(repository),
+    )
+    monkeypatch.setitem(
+        app.dependency_overrides, get_request_encryption_keys, lambda: EncryptionKeys({})
+    )
     monkeypatch.setitem(
         app.dependency_overrides, get_storage_encryption, lambda: storage_encryption
     )
@@ -140,7 +148,7 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
             "X-Forwarded-For": "198.51.100.1",
         },
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
     stored = repository.insert_traffic_logs.call_args.args[0][0]
     assert stored["metadata"] == {
         "device_id": "issuer-bound-device",

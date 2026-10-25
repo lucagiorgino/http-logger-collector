@@ -1,3 +1,4 @@
+import asyncio
 import json
 import zlib
 from typing import Annotated, Any
@@ -5,7 +6,6 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from app.core.auth import AuthenticatedClaims
 from app.core.encryption import MAX_ENCRYPTED_BYTES, InvalidEnvelope
@@ -67,10 +67,14 @@ async def read_compressed_batch(
     compressed = bytes(wire)
     if encrypted:
         try:
-            compressed = await run_in_threadpool(keys.decrypt, compressed)
+            compressed = await asyncio.to_thread(keys.decrypt, compressed)
         except InvalidEnvelope as exc:
             raise HTTPException(status_code=400, detail="Invalid encrypted batch") from exc
     request.state.batch_encrypted = encrypted
+    return await asyncio.to_thread(parse_compressed_batch, compressed)
+
+
+def parse_compressed_batch(compressed: bytes) -> TrafficLogBatch:
     if len(compressed) > MAX_COMPRESSED_BYTES:
         raise HTTPException(status_code=413, detail="Compressed batch exceeds 1 MiB")
     decompressor = zlib.decompressobj(wbits=31)
@@ -98,7 +102,7 @@ async def read_compressed_batch(
 
 @router.post(
     "",
-    status_code=202,
+    status_code=200,
     response_model=BatchReceipt,
     summary="Accept a gzip JSON or JWE-encrypted batch of traffic logs",
     responses={400: {}, 401: {}, 403: {}, 413: {}, 415: {}, 422: {}, 503: {}},
@@ -169,8 +173,10 @@ async def create_traffic_log_batch(
     gzip or encrypt it. Send compressed bytes with `Content-Encoding: gzip`, or generate
     a compact JWE over those bytes with no Content-Encoding header.
 
-    HTTP 202 with `status=stored` means the complete validated batch was persisted.
-    Workspace storage/discard rules apply before publishing; storage failures return 503.
+    HTTP 200 with `status=queued` means Redis confirmed local AOF durability, not that
+    MongoDB has stored the events. A worker persists them asynchronously and retries
+    unacknowledged batches. Workspace storage/discard rules apply before publishing.
+    Queue outages, overload or missing durability confirmation return 503, never success.
     """
     context = ingestion_context(claims, request)
     configuration = await repository.get_device_configuration(context.identity.device_id)

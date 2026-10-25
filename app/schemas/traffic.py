@@ -207,7 +207,7 @@ class BatchReceipt(BaseModel):
                 {
                     "batch_id": "2cc6199a-08e5-4aae-8ab3-60c7c96d1141",
                     "accepted_count": 1,
-                    "status": "stored",
+                    "status": "queued",
                 },
             ]
         }

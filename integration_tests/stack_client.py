@@ -274,11 +274,11 @@ def run_device(
             client,
             "POST",
             "api/v1/traffic-log-batches",
-            expected=202,
+            expected=200,
             content=body,
             headers=headers,
         )
-        if receipt["accepted_count"] != len(logs) or receipt["status"] not in {"stored", "queued"}:
+        if receipt["accepted_count"] != len(logs) or receipt["status"] != "queued":
             raise StackTestFailure("Ingestion did not acknowledge the complete batch")
         deadline = monotonic() + settings.visibility_timeout
         while True:

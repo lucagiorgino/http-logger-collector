@@ -12,5 +12,8 @@ app:
 mongodb:
   enabled: true
 
+redis:
+  enabled: true
+
 openbao:
   enabled: true

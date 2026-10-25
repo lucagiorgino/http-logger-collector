@@ -17,7 +17,7 @@ from app.core.auth import require_bearer_token
 from app.core.config import settings
 from app.core.encryption import get_encryption_keys
 from app.db.mongo import MongoRepository, PersistenceError
-from app.deps import get_mongo_repository
+from app.deps import get_ingestion_publisher, get_mongo_repository, get_request_encryption_keys
 from app.main import app
 from app.schemas.traffic import TrafficLogRequest
 from app.services.ingestion import MongoIngestionPublisher
@@ -70,7 +70,10 @@ def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
         original_overrides = app.dependency_overrides.copy()
         app.dependency_overrides[require_bearer_token] = lambda: claims.copy()
         app.dependency_overrides[get_mongo_repository] = lambda: repository
-        app.dependency_overrides[get_encryption_keys] = lambda: encryption_keys
+        app.dependency_overrides[get_ingestion_publisher] = lambda: MongoIngestionPublisher(
+            repository
+        )
+        app.dependency_overrides[get_request_encryption_keys] = lambda: encryption_keys
         app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
         try:
             await repository.ensure_indexes()
@@ -119,7 +122,7 @@ def test_device_registration_uniqueness_policy_enforcement_and_device_isolation(
                     await client.post(
                         "/api/v1/traffic-log-batches", content=gzip_batch, headers=upload_headers
                     )
-                ).status_code == 202
+                ).status_code == 200
                 assert (
                     await client.post(
                         url, json={"device_id": "device-789", "name": "Second device"}
@@ -419,7 +422,10 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
         }
         app.dependency_overrides[require_bearer_token] = lambda: claims
         app.dependency_overrides[get_mongo_repository] = lambda: repository
-        app.dependency_overrides[get_encryption_keys] = lambda: encryption_keys
+        app.dependency_overrides[get_ingestion_publisher] = lambda: MongoIngestionPublisher(
+            repository
+        )
+        app.dependency_overrides[get_request_encryption_keys] = lambda: encryption_keys
         app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
         config_url = "/api/v1/devices/device-456/configuration"
         upload_url = "/api/v1/traffic-log-batches"
@@ -453,7 +459,7 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
                     content=body,
                     headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
                 )
-                assert response.status_code == 202
+                assert response.status_code == 200
                 results = await asyncio.gather(
                     *(
                         client.patch(
@@ -500,7 +506,7 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
                 response = await client.post(
                     upload_url, content=envelope, headers={"Content-Type": "application/jose"}
                 )
-                assert response.status_code == 202
+                assert response.status_code == 200
                 creations = await asyncio.gather(
                     *(
                         client.patch(
@@ -564,7 +570,10 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
             "permissions": ["manage:devices"],
         }
         app.dependency_overrides[get_mongo_repository] = lambda: repository
-        app.dependency_overrides[get_encryption_keys] = lambda: EncryptionKeys({})
+        app.dependency_overrides[get_ingestion_publisher] = lambda: MongoIngestionPublisher(
+            repository
+        )
+        app.dependency_overrides[get_request_encryption_keys] = lambda: EncryptionKeys({})
         app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
         url = "/api/v1/workspace/configuration"
         flags = ("encrypt_request_body", "encrypt_authorization_header", "encrypt_cookies")
@@ -578,7 +587,7 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 assert (await client.get(url)).json()["version"] == 0
                 assert (
                     await client.post("/api/v1/traffic-log-batches", content=wire, headers=headers)
-                ).status_code == 202
+                ).status_code == 200
                 encrypted = await repository.traffic_logs.find_one({})
                 assert traffic_payload["body"] not in repr(encrypted)
                 assert encrypted["request_headers"]["Authorization"] == "[ENCRYPTED]"
@@ -594,7 +603,7 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 assert (await client.get(url)).json()["version"] == 1
                 assert (
                     await client.post("/api/v1/traffic-log-batches", content=wire, headers=headers)
-                ).status_code == 202
+                ).status_code == 200
                 plain = await repository.traffic_logs.find_one(
                     {"storage_encryption": {"$exists": False}}
                 )
@@ -633,7 +642,7 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 uploaded = await client.post(
                     "/api/v1/traffic-log-batches", content=wire, headers=headers
                 )
-                assert uploaded.status_code == 202
+                assert uploaded.status_code == 200
                 discarded = await repository.traffic_logs.find_one(
                     {"batch_id": uploaded.json()["batch_id"]}
                 )

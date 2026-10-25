@@ -1,13 +1,16 @@
+import asyncio
 import base64
 import json
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
+from fastapi import Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
-from app.core.openbao import KMSUnavailable, OpenBaoClient
+from app.core.openbao import AsyncOpenBaoClient, KMSUnavailable, OpenBaoClient
 from app.schemas.traffic import TrafficLogRequest
 from app.schemas.workspace import StoragePolicy
 
@@ -21,6 +24,10 @@ def validate_storage_key(client: OpenBaoClient) -> None:
     response = client.request(
         "GET", f"{settings.openbao_transit_mount}/keys/{settings.openbao_storage_key}"
     )
+    check_storage_key(response)
+
+
+def check_storage_key(response: dict[str, Any] | None) -> None:
     key = (response or {}).get("data", {})
     if (
         not isinstance(key, dict)
@@ -42,8 +49,19 @@ class SensitiveFields(BaseModel):
 
 
 class StorageEncryption:
+    def __init__(self, client: AsyncOpenBaoClient | None = None) -> None:
+        self._async_client = client
+
     def client(self) -> OpenBaoClient:
         return OpenBaoClient()
+
+    @asynccontextmanager
+    async def async_client(self) -> AsyncIterator[AsyncOpenBaoClient]:
+        if self._async_client is not None:
+            yield self._async_client
+        else:
+            async with AsyncOpenBaoClient() as client:
+                yield client
 
     def validate(self) -> None:
         with self.client() as client:
@@ -62,10 +80,15 @@ class StorageEncryption:
             json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         ).decode()
 
-    def encrypt(self, entries: list[dict[str, str]]) -> list[str]:
-        with self.client() as client:
-            validate_storage_key(client)
-            response = client.request(
+    async def encrypt(self, entries: list[dict[str, str]]) -> list[str]:
+        async with self.async_client() as client:
+            await client.authenticate()
+            check_storage_key(
+                await client.request(
+                    "GET", f"{settings.openbao_transit_mount}/keys/{settings.openbao_storage_key}"
+                )
+            )
+            response = await client.request(
                 "POST",
                 f"{settings.openbao_transit_mount}/encrypt/{settings.openbao_storage_key}",
                 {"batch_input": entries},
@@ -89,12 +112,12 @@ class StorageEncryption:
         except (KeyError, TypeError, ValueError):
             raise KMSUnavailable("Invalid OpenBao storage encryption response") from None
 
-    async def protect(
+    def prepare(
         self,
         documents: list[dict[str, Any]],
         payloads: list[TrafficLogRequest],
         policy: StoragePolicy,
-    ) -> None:
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
         entries = []
         protected = []
         for document, payload in zip(documents, payloads, strict=True):
@@ -154,8 +177,17 @@ class StorageEncryption:
                     }
                 )
                 protected.append(document)
+        return entries, protected
+
+    async def protect(
+        self,
+        documents: list[dict[str, Any]],
+        payloads: list[TrafficLogRequest],
+        policy: StoragePolicy,
+    ) -> None:
+        entries, protected = await asyncio.to_thread(self.prepare, documents, payloads, policy)
         if entries:
-            ciphertexts = await run_in_threadpool(self.encrypt, entries)
+            ciphertexts = await self.encrypt(entries)
             for document, ciphertext in zip(protected, ciphertexts, strict=True):
                 document["storage_encryption"]["ciphertext"] = ciphertext
 
@@ -205,5 +237,5 @@ class StorageEncryption:
             raise KMSUnavailable("Invalid OpenBao storage plaintext") from None
 
 
-def get_storage_encryption() -> StorageEncryption:
-    return StorageEncryption()
+async def get_storage_encryption(request: Request) -> StorageEncryption:
+    return request.app.state.storage_encryption

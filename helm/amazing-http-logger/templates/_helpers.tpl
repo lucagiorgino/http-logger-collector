@@ -60,3 +60,25 @@ app.kubernetes.io/instance: {{ .Release.Name }}
       key: {{ .Values.externalMongo.uriKey }}
   {{- end }}
 {{- end -}}
+
+{{- define "logger.redisEnv" -}}
+- name: REDIS_URL
+  {{- if .Values.redis.enabled }}
+  value: {{ printf "redis://%s-redis:%d/0" (include "logger.fullname" .) (int .Values.redis.port) | quote }}
+  {{- else }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ required "externalRedis.existingSecret is required" .Values.externalRedis.existingSecret }}
+      key: {{ .Values.externalRedis.urlKey }}
+  {{- end }}
+- name: REDIS_STREAM
+  value: {{ .Values.queue.stream | quote }}
+- name: REDIS_GROUP
+  value: {{ .Values.queue.group | quote }}
+- name: REDIS_MAX_BATCHES
+  value: {{ .Values.queue.maxBatches | quote }}
+- name: REDIS_SOCKET_TIMEOUT_SECONDS
+  value: {{ .Values.queue.socketTimeoutSeconds | quote }}
+- name: REDIS_AOF_TIMEOUT_MS
+  value: {{ .Values.queue.aofTimeoutMs | quote }}
+{{- end -}}

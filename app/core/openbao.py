@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import re
@@ -28,35 +29,55 @@ def read_credential(path: str) -> str:
         raise KMSUnavailable("OpenBao credential is missing or invalid") from None
 
 
+def validate_configuration() -> None:
+    address = urlsplit(settings.openbao_addr)
+    if (
+        address.scheme not in {"http", "https"}
+        or not address.hostname
+        or address.username
+        or address.password
+        or address.query
+        or address.fragment
+        or (settings.app_env != "development" and address.scheme != "https")
+    ):
+        raise ValueError("OPENBAO_ADDR must use HTTPS outside development")
+    for value in (
+        settings.openbao_transit_mount,
+        settings.openbao_transit_key,
+        settings.openbao_storage_key,
+        settings.openbao_kv_mount,
+        settings.openbao_kv_path,
+        settings.openbao_auth_mount,
+    ):
+        if not PATH_COMPONENT.fullmatch(value) or value in {".", ".."}:
+            raise ValueError("OpenBao mount and key names must be single safe path components")
+    if settings.openbao_storage_key == settings.openbao_transit_key:
+        raise ValueError("Storage encryption must use a dedicated OpenBao key")
+    if settings.openbao_timeout_seconds <= 0:
+        raise ValueError("OPENBAO_TIMEOUT_SECONDS must be positive")
+
+
+def response_document(
+    response: httpx.Response, missing_ok: bool, max_response_bytes: int
+) -> dict[str, Any] | None:
+    if response.status_code == 404 and missing_ok:
+        return None
+    response.raise_for_status()
+    if not response.content:
+        return {}
+    if len(response.content) > max_response_bytes:
+        raise ValueError()
+    document = response.json()
+    if not isinstance(document, dict):
+        raise TypeError()
+    return document
+
+
 class OpenBaoClient:
     def __init__(
         self, token: str | None = None, *, transport: httpx.BaseTransport | None = None
     ) -> None:
-        address = urlsplit(settings.openbao_addr)
-        if (
-            address.scheme not in {"http", "https"}
-            or not address.hostname
-            or address.username
-            or address.password
-            or address.query
-            or address.fragment
-            or (settings.app_env != "development" and address.scheme != "https")
-        ):
-            raise ValueError("OPENBAO_ADDR must use HTTPS outside development")
-        for value in (
-            settings.openbao_transit_mount,
-            settings.openbao_transit_key,
-            settings.openbao_storage_key,
-            settings.openbao_kv_mount,
-            settings.openbao_kv_path,
-            settings.openbao_auth_mount,
-        ):
-            if not PATH_COMPONENT.fullmatch(value) or value in {".", ".."}:
-                raise ValueError("OpenBao mount and key names must be single safe path components")
-        if settings.openbao_storage_key == settings.openbao_transit_key:
-            raise ValueError("Storage encryption must use a dedicated OpenBao key")
-        if settings.openbao_timeout_seconds <= 0:
-            raise ValueError("OPENBAO_TIMEOUT_SECONDS must be positive")
+        validate_configuration()
         self.http = httpx.Client(
             base_url=settings.openbao_addr.rstrip("/") + "/v1/",
             timeout=settings.openbao_timeout_seconds,
@@ -89,17 +110,7 @@ class OpenBaoClient:
                 json=payload,
                 headers={"X-Vault-Token": self.token} if self.token else {},
             )
-            if response.status_code == 404 and missing_ok:
-                return None
-            response.raise_for_status()
-            if not response.content:
-                return {}
-            if len(response.content) > max_response_bytes:
-                raise ValueError()
-            document = response.json()
-            if not isinstance(document, dict):
-                raise TypeError()
-            return document
+            return response_document(response, missing_ok, max_response_bytes)
         except (httpx.HTTPError, TypeError, ValueError):
             raise KMSUnavailable("OpenBao operation failed") from None
 
@@ -188,3 +199,68 @@ class OpenBaoClient:
             self.kv_path,
             {"options": {"cas": version}, "data": {"ciphertext": ciphertext}},
         )
+
+
+class AsyncOpenBaoClient:
+    def __init__(
+        self, token: str | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+    ) -> None:
+        validate_configuration()
+        self.http = httpx.AsyncClient(
+            base_url=settings.openbao_addr.rstrip("/") + "/v1/",
+            timeout=settings.openbao_timeout_seconds,
+            verify=ssl.create_default_context(cafile=settings.openbao_ca_cert or None),
+            trust_env=False,
+            follow_redirects=False,
+            transport=transport,
+        )
+        self.token = token
+        self._provided_token = bool(token)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.http.aclose()
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        missing_ok: bool = False,
+        max_response_bytes: int = 1_048_576,
+        anonymous: bool = False,
+    ) -> dict[str, Any] | None:
+        try:
+            response = await self.http.request(
+                method,
+                path,
+                json=payload,
+                headers={"X-Vault-Token": self.token} if self.token and not anonymous else {},
+            )
+            return response_document(response, missing_ok, max_response_bytes)
+        except (httpx.HTTPError, TypeError, ValueError):
+            raise KMSUnavailable("OpenBao operation failed") from None
+
+    async def authenticate(self) -> None:
+        if self._provided_token:
+            return
+        if settings.openbao_kubernetes_role:
+            response = await self.request(
+                "POST",
+                f"auth/{settings.openbao_auth_mount}/login",
+                {
+                    "role": settings.openbao_kubernetes_role,
+                    "jwt": await asyncio.to_thread(read_credential, settings.openbao_jwt_file),
+                },
+                anonymous=True,
+            )
+            auth = (response or {}).get("auth")
+            token = auth.get("client_token") if isinstance(auth, dict) else None
+            if not isinstance(token, str) or not token:
+                raise KMSUnavailable("OpenBao authentication failed")
+            self.token = token
+        else:
+            self.token = await asyncio.to_thread(read_credential, settings.openbao_token_file)

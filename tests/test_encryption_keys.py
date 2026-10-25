@@ -13,6 +13,7 @@ from app.core import encryption as encryption_module
 from app.core.config import settings
 from app.core.encryption import EncryptionKeys, InvalidEnvelope, get_encryption_keys
 from app.core.openbao import KMSUnavailable
+from app.deps import get_request_encryption_keys
 from app.kms import generate_key, write_credential
 from app.main import app
 
@@ -89,7 +90,7 @@ def test_configured_suite_drives_keys_client_configuration_and_ingestion(
     monkeypatch.setattr(settings, "encryption_content_algorithm", encryption)
     key_document["keys"] = [generate_key("current")]
     keys = get_encryption_keys()
-    app.dependency_overrides[get_encryption_keys] = lambda: keys
+    app.dependency_overrides[get_request_encryption_keys] = lambda: keys
     repository.get_device_configuration.return_value = {"version": 1, "encryption_mode": "required"}
     response = encrypted_client.get("/api/v1/devices/device-456/configuration")
     parameters = response.json()["encryption"]
@@ -108,7 +109,7 @@ def test_configured_suite_drives_keys_client_configuration_and_ingestion(
         content=body,
         headers={"Content-Type": "application/jose"},
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
     repository.insert_traffic_logs.assert_awaited_once()
     wrong_encryption = "A256GCM" if encryption != "A256GCM" else "A128GCM"
     wrong = jwe.JWERegistry(algorithms=[algorithm, wrong_encryption])

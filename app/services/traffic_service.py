@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -92,9 +93,15 @@ async def ingest_traffic_logs(
     storage: StorageEncryption,
 ) -> BatchReceipt:
     batch_id = str(uuid4())
-    documents = [normalize_traffic_log(payload, batch_id, context) for payload in payloads]
+    documents = await asyncio.to_thread(normalize_batch, payloads, batch_id, context)
     await storage.protect(documents, payloads, policy)
     return await publisher.publish(batch_id, documents)
+
+
+def normalize_batch(
+    payloads: list[TrafficLogRequest], batch_id: str, context: IngestionContext
+) -> list[dict[str, Any]]:
+    return [normalize_traffic_log(payload, batch_id, context) for payload in payloads]
 
 
 def normalize_traffic_log(

@@ -100,3 +100,18 @@ def test_explicit_missing_environment_file_fails(tmp_path):
     )
     assert result.returncode != 0
     assert "ENV_FILE does not exist" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("redis_max_batches", 0),
+        ("redis_socket_timeout_seconds", float("nan")),
+        ("redis_aof_timeout_ms", 3000),
+        ("worker_reclaim_idle_ms", 30000),
+    ],
+)
+def test_invalid_ingestion_limits_fail_before_accepting_batches(monkeypatch, name, value):
+    monkeypatch.setattr(settings, name, value)
+    with pytest.raises(ValueError):
+        settings.validate_ingestion()

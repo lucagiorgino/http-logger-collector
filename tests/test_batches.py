@@ -29,7 +29,7 @@ def test_compressed_batch_is_normalized_before_durable_acceptance(
     response = authorized_client.post(
         URL, content=batch_body(traffic_payload, traffic_payload), headers=HEADERS
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
     receipt = response.json()
     assert receipt["accepted_count"] == 2
     assert receipt["status"] == "stored"
@@ -60,7 +60,7 @@ def test_complete_http_event_is_stored_and_read_back(
     response = authorized_client.post(
         URL, content=batch_body(rich_traffic_payload), headers=HEADERS
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
     document = repository.insert_traffic_logs.call_args.args[0][0]
     repository.get_traffic_log.return_value = document
     repository.list_traffic_logs.return_value = [document]
@@ -202,7 +202,7 @@ def test_large_valid_url_and_zero_metrics_are_not_silently_dropped(
         "process_id": 0,
     }
     response = authorized_client.post(URL, content=batch_body(payload), headers=HEADERS)
-    assert response.status_code == 202
+    assert response.status_code == 200
     document = repository.insert_traffic_logs.call_args.args[0][0]
     for field in ("url", "request_size_bytes", "response_size_bytes", "duration_ms", "process_id"):
         assert document[field] == payload[field]
@@ -240,7 +240,7 @@ def test_missing_device_claim_uses_subject_and_ignores_untrusted_forwarding_head
             "X-Client-ID": "forged-client",
         },
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
     document = repository.insert_traffic_logs.call_args.args[0][0]
     assert document["metadata"] == {
         "device_id": "oauth-client@clients",
@@ -267,7 +267,7 @@ def test_forwarded_ip_requires_a_trusted_proxy(
         content=batch_body(traffic_payload),
         headers={**HEADERS, "X-Forwarded-For": "198.51.100.9, 10.0.0.20"},
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
     document = repository.insert_traffic_logs.call_args.args[0][0]
     assert document["source_ip"] == expected_ip
 
@@ -282,7 +282,7 @@ def test_network_addresses_are_validated_without_inventing_an_ip(
         assert response.status_code == 400
         repository.insert_traffic_logs.assert_not_awaited()
     else:
-        assert response.status_code == 202
+        assert response.status_code == 200
         assert repository.insert_traffic_logs.call_args.args[0][0]["source_ip"] == peer
 
 
@@ -375,7 +375,7 @@ def test_publisher_can_be_replaced_without_changing_api(
     )
     app.dependency_overrides[get_ingestion_publisher] = lambda: publisher
     response = authorized_client.post(URL, content=batch_body(traffic_payload), headers=HEADERS)
-    assert response.status_code == 202
+    assert response.status_code == 200
     assert response.json()["status"] == "queued"
     publisher.publish.assert_awaited_once()
     assert (
@@ -397,7 +397,7 @@ def test_streaming_gzip_chunks_are_supported(authorized_client, traffic_payload)
     response = authorized_client.post(
         URL, content=(body[index : index + 7] for index in range(0, len(body), 7)), headers=HEADERS
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
 
 
 def test_openapi_references_resolve_without_other_upload_routes():

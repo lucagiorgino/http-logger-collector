@@ -7,11 +7,12 @@ from joserfc.jwk import ECKey
 
 from app.core.auth import require_bearer_token
 from app.core.config import settings
-from app.core.encryption import EncryptionKeys, get_encryption_keys
+from app.core.encryption import EncryptionKeys
 from app.core.storage_encryption import get_storage_encryption
-from app.deps import get_mongo_repository
+from app.deps import get_ingestion_publisher, get_mongo_repository, get_request_encryption_keys
 from app.main import app
 from app.schemas.workspace import WorkspaceConfiguration
+from app.services.ingestion import MongoIngestionPublisher
 from app.services.traffic_service import DEVICE_ID_CLAIM, ClientIdentity, IngestionContext
 
 
@@ -40,7 +41,8 @@ def authorized_client(repository, storage_encryption):
         "azp": "oauth-client-123",
     }
     app.dependency_overrides[get_mongo_repository] = lambda: repository
-    app.dependency_overrides[get_encryption_keys] = lambda: EncryptionKeys({})
+    app.dependency_overrides[get_ingestion_publisher] = lambda: MongoIngestionPublisher(repository)
+    app.dependency_overrides[get_request_encryption_keys] = lambda: EncryptionKeys({})
     app.dependency_overrides[get_storage_encryption] = lambda: storage_encryption
     try:
         yield TestClient(app, client=("203.0.113.10", 50000))
@@ -106,5 +108,5 @@ def encryption_keys():
 
 @pytest.fixture
 def encrypted_client(authorized_client, encryption_keys):
-    app.dependency_overrides[get_encryption_keys] = lambda: encryption_keys
+    app.dependency_overrides[get_request_encryption_keys] = lambda: encryption_keys
     return authorized_client

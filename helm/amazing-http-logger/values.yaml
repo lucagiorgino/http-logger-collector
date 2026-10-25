@@ -56,6 +56,48 @@ externalMongo:
   existingSecret: ""
   uriKey: MONGO_URI
 
+externalRedis:
+  existingSecret: ""
+  urlKey: REDIS_URL
+
+queue:
+  stream: traffic-log-batches
+  group: mongo-writers
+  maxBatches: 10000
+  socketTimeoutSeconds: 3
+  aofTimeoutMs: 2000
+
+worker:
+  replicaCount: 1
+  reclaimIdleMs: 60000
+  writeTimeoutSeconds: 30
+  retrySeconds: 1
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+redis:
+  # Development only: unauthenticated, no TLS. Production uses externalRedis.
+  enabled: false
+  image: redis:7.4
+  port: 6379
+  maxmemory: 192mb
+  persistence:
+    size: 2Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
 service:
   port: 80
 

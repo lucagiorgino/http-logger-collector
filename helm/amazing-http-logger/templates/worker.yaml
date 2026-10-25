@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "logger.fullname" . }}-worker
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "logger.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      annotations:
+        checksum/worker-config: {{ toJson (dict "queue" .Values.queue "worker" .Values.worker "app" .Values.app "externalMongo" .Values.externalMongo "externalRedis" .Values.externalRedis "redis" .Values.redis "mongodb" .Values.mongodb) | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "app.worker"]
+          env:
+            {{- include "logger.mongoEnv" . | nindent 12 }}
+            {{- include "logger.redisEnv" . | nindent 12 }}
+            - name: APP_ENV
+              value: {{ .Values.app.environment | quote }}
+            - name: MONGO_DB_NAME
+              value: {{ .Values.app.mongoDatabase | quote }}
+            - name: MONGO_SERVER_SELECTION_TIMEOUT_MS
+              value: {{ .Values.app.mongoServerSelectionTimeoutMs | quote }}
+            - name: WORKER_RECLAIM_IDLE_MS
+              value: {{ .Values.worker.reclaimIdleMs | quote }}
+            - name: WORKER_WRITE_TIMEOUT_SECONDS
+              value: {{ .Values.worker.writeTimeoutSeconds | quote }}
+            - name: WORKER_RETRY_SECONDS
+              value: {{ .Values.worker.retrySeconds | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}

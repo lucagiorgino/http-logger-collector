@@ -17,6 +17,7 @@ spec:
         app.kubernetes.io/component: api
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/queue: {{ toJson (dict "queue" .Values.queue "redis" .Values.redis "externalRedis" .Values.externalRedis) | sha256sum }}
     spec:
       serviceAccountName: {{ include "logger.fullname" . }}-api
       automountServiceAccountToken: false
@@ -110,6 +111,7 @@ spec:
                 name: {{ include "logger.fullname" . }}
           env:
             {{- include "logger.mongoEnv" . | nindent 12 }}
+            {{- include "logger.redisEnv" . | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ .Values.app.port }}

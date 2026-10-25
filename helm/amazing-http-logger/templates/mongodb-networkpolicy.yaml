@@ -19,7 +19,7 @@ spec:
             matchExpressions:
               - key: app.kubernetes.io/component
                 operator: In
-                values: ["api", "mongodb", "mongodb-init"]
+                values: ["api", "worker", "mongodb", "mongodb-init"]
       ports:
         - protocol: TCP
           port: {{ .Values.mongodb.port }}

@@ -1,0 +1,132 @@
+{{- if .Values.redis.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "logger.fullname" . }}-redis
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "logger.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+  ports:
+    - name: redis
+      port: {{ .Values.redis.port }}
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "logger.fullname" . }}-redis
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "logger.fullname" . }}-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        {{- include "logger.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image | quote }}
+          command: ["redis-server"]
+          args:
+            - "--bind"
+            - "0.0.0.0"
+            - "--protected-mode"
+            - "no"
+            - "--port"
+            - {{ .Values.redis.port | quote }}
+            - "--dir"
+            - "/data"
+            - "--appendonly"
+            - "yes"
+            - "--appendfsync"
+            - "always"
+            - "--maxmemory"
+            - {{ .Values.redis.maxmemory | quote }}
+            - "--maxmemory-policy"
+            - "noeviction"
+          ports:
+            - name: redis
+              containerPort: {{ .Values.redis.port }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "-p", {{ .Values.redis.port | quote }}, "ping"]
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.redis.persistence.storageClass }}
+        storageClassName: {{ .Values.redis.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size | quote }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "logger.fullname" . }}-redis
+  labels:
+    {{- include "logger.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "logger.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "logger.selectorLabels" . | nindent 14 }}
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values: ["api", "worker"]
+      ports:
+        - protocol: TCP
+          port: {{ .Values.redis.port }}
+{{- end }}

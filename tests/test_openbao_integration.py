@@ -10,7 +10,7 @@ from joserfc.jwk import ECKey
 
 from app.core.config import settings
 from app.core.encryption import InvalidEnvelope, parse_keyset
-from app.core.openbao import KMSUnavailable, OpenBaoClient, read_credential
+from app.core.openbao import AsyncOpenBaoClient, KMSUnavailable, OpenBaoClient, read_credential
 from app.core.storage_encryption import StorageEncryption
 from app.kms import configure_runtime_policy, initialize, main
 from app.schemas.traffic import TrafficLogRequest
@@ -74,6 +74,9 @@ def test_real_transit_envelope_rotation_cas_and_runtime_permissions(monkeypatch)
             with OpenBaoClient(runtime_token) as runtime:
                 storage = StorageEncryption()
                 monkeypatch.setattr(storage, "client", lambda: OpenBaoClient(runtime_token))
+                monkeypatch.setattr(
+                    storage, "async_client", lambda: AsyncOpenBaoClient(runtime_token)
+                )
                 payload = TrafficLogRequest(
                     timestamp="2026-01-15T10:00:00Z",
                     method="POST",

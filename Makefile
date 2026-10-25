@@ -62,6 +62,15 @@ frontend-test-browser:
 run:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app
 
+worker:
+	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.worker
+
+redis-up:
+	$(DEV_COMPOSE) up -d --wait redis
+
+redis-down:
+	$(DEV_COMPOSE) stop redis
+
 mongo-up:
 	$(DEV_COMPOSE) up -d --wait mongo
 
@@ -76,7 +85,7 @@ openbao-up:
 openbao-down:
 	$(DEV_COMPOSE) stop openbao
 
-dev-up: mongo-up openbao-up
+dev-up: mongo-up openbao-up redis-up
 
 dev-down:
 	$(DEV_COMPOSE) down
@@ -105,4 +114,4 @@ helm-down:
 helm-port-forward:
 	kubectl $(KUBECTL_CONTEXT) --namespace "$(KUBE_NAMESPACE)" port-forward "service/$(KUBE_SERVICE)" "$(KUBE_LOCAL_PORT):http"
 
-.PHONY: install test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image helm-lint helm-template helm-up helm-test helm-down helm-port-forward
+.PHONY: install test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run worker redis-up redis-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev image helm-lint helm-template helm-up helm-test helm-down helm-port-forward

@@ -14,24 +14,35 @@ from app.api.workspace import router as workspace_router
 from app.core.auth import AuthenticationUnavailable
 from app.core.config import settings
 from app.core.encryption import get_encryption_keys
-from app.core.openbao import KMSUnavailable
-from app.core.storage_encryption import get_storage_encryption
+from app.core.openbao import AsyncOpenBaoClient, KMSUnavailable
+from app.core.storage_encryption import StorageEncryption
 from app.db.mongo import MongoRepository, PersistenceError
+from app.services.redis_queue import RedisStreamQueue
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    get_encryption_keys()
-    get_storage_encryption().validate()
+    app.state.encryption_keys = get_encryption_keys()
+    queue = RedisStreamQueue()
     repository = MongoRepository()
     app.state.mongo_repository = repository
+    app.state.ingestion_queue = queue
     try:
-        await repository.ensure_indexes()
-        yield
+        async with AsyncOpenBaoClient() as kms:
+            storage = StorageEncryption(kms)
+            storage.validate()
+            await kms.authenticate()
+            app.state.storage_encryption = storage
+            await repository.ensure_indexes()
+            await queue.initialize()
+            yield
     finally:
-        await repository.close()
+        try:
+            await queue.close()
+        finally:
+            await repository.close()
 
 
 app = FastAPI(

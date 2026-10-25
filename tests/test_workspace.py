@@ -169,7 +169,7 @@ def test_discarded_categories_do_not_require_encryption_and_omitted_choices_are_
         content=gzip.compress(json.dumps({"logs": [traffic_payload]}).encode()),
         headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
     document = repository.insert_traffic_logs.call_args.args[0][0]
     assert "body" not in document
     assert "storage_encryption" not in document
@@ -301,7 +301,7 @@ def test_ingestion_fails_without_accepting_plaintext_when_configuration_or_kms_f
     wire = gzip.compress(json.dumps({"logs": [traffic_payload]}).encode())
     headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
 
-    def unavailable(entries):
+    async def unavailable(entries):
         raise KMSUnavailable("private storage details")
 
     monkeypatch.setattr(storage_encryption, "encrypt", unavailable)

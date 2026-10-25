@@ -177,8 +177,8 @@ def fake_stack(
                 state["uploads"].add((client_id, encrypted))
                 state["upload_count"] += 1
                 return httpx.Response(
-                    202,
-                    json={"batch_id": batch_id, "accepted_count": len(logs), "status": "stored"},
+                    200,
+                    json={"batch_id": batch_id, "accepted_count": len(logs), "status": "queued"},
                 )
             if path == "/api/v1/traffic-logs":
                 device = request.url.params["device_id"]

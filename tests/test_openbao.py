@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 
@@ -5,8 +6,8 @@ import httpx2 as httpx
 import pytest
 
 from app.core.config import settings
-from app.core.encryption import get_encryption_keys
-from app.core.openbao import KMSUnavailable, OpenBaoClient
+from app.core.openbao import AsyncOpenBaoClient, KMSUnavailable, OpenBaoClient
+from app.deps import get_request_encryption_keys
 from app.kms import ensure_engines
 from app.main import app
 
@@ -77,6 +78,84 @@ def test_kubernetes_login_uses_bound_jwt_then_runtime_token(tmp_path, monkeypatc
     assert len(requests) == 2
 
 
+def test_async_kms_requests_allow_progress_while_another_request_is_slow():
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def respond(request):
+            assert request.headers["X-Vault-Token"] == "test-runtime-token"
+            if request.url.path.endswith("/slow"):
+                entered.set()
+                await release.wait()
+            return httpx.Response(200, json={"data": {}})
+
+        async with AsyncOpenBaoClient(
+            "test-runtime-token", transport=httpx.MockTransport(respond)
+        ) as client:
+            slow = asyncio.create_task(client.request("GET", "slow"))
+            try:
+                async with asyncio.timeout(2):
+                    await entered.wait()
+                    assert await client.request("GET", "ready") == {"data": {}}
+                assert not slow.done()
+            finally:
+                release.set()
+                await slow
+        assert client.http.is_closed
+
+    asyncio.run(scenario())
+
+
+def test_async_kubernetes_authentication_refreshes_projected_credentials(tmp_path, monkeypatch):
+    jwt_file = tmp_path / "projected-token"
+    monkeypatch.setattr(settings, "openbao_kubernetes_role", "test-role")
+    monkeypatch.setattr(settings, "openbao_jwt_file", str(jwt_file))
+
+    async def respond(request):
+        if request.url.path.endswith("/login"):
+            assert "X-Vault-Token" not in request.headers
+            payload = json.loads(request.content)
+            assert payload["role"] == "test-role"
+            assert payload["jwt"] in {"first-jwt", "rotated-jwt"}
+            return httpx.Response(200, json={"auth": {"client_token": payload["jwt"] + "-token"}})
+        assert request.headers["X-Vault-Token"] == "rotated-jwt-token"
+        return httpx.Response(200, json={})
+
+    async def scenario():
+        async with AsyncOpenBaoClient(transport=httpx.MockTransport(respond)) as client:
+            jwt_file.write_text("first-jwt")
+            await client.authenticate()
+            assert client.token == "first-jwt-token"
+            jwt_file.write_text("rotated-jwt")
+            await client.authenticate()
+            await client.request("GET", "keys")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["forbidden", "timeout", "malformed", "oversized"])
+def test_async_kms_failures_are_explicit_without_secret_echo(failure):
+    async def respond(request):
+        if failure == "timeout":
+            raise httpx.ReadTimeout("private-service-details")
+        if failure == "forbidden":
+            return httpx.Response(403, json={"errors": ["private-service-details"]})
+        if failure == "malformed":
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={"private-service-details": "x" * 100})
+
+    async def scenario():
+        async with AsyncOpenBaoClient(
+            "test-token", transport=httpx.MockTransport(respond)
+        ) as client:
+            with pytest.raises(KMSUnavailable) as exc:
+                await client.request("GET", "keys", max_response_bytes=80)
+            assert "private-service-details" not in str(exc.value)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure", ["forbidden", "timeout", "malformed", "bad-plaintext"])
 def test_kms_failures_are_explicit_without_secret_echo(failure):
     def respond(request):
@@ -107,7 +186,7 @@ def test_kms_failure_cannot_fall_back_to_local_material(authorized_client):
     def unavailable():
         raise KMSUnavailable("private-service-details")
 
-    app.dependency_overrides[get_encryption_keys] = unavailable
+    app.dependency_overrides[get_request_encryption_keys] = unavailable
     response = authorized_client.get("/api/v1/devices/device-456/configuration")
     assert response.status_code == 503
     assert "private-service-details" not in response.text

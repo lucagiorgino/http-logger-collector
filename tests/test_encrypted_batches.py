@@ -39,7 +39,7 @@ def test_encrypted_single_log_is_decrypted_validated_and_redacted(
     response = encrypted_client.post(
         URL, content=encrypt(encryption_keys, body, kid), headers=HEADERS
     )
-    assert response.status_code == 202
+    assert response.status_code == 200
     assert response.json()["accepted_count"] == 1
     stored = repository.insert_traffic_logs.call_args.args[0][0]
     assert stored["request_headers"]["Authorization"] == "[ENCRYPTED]"
@@ -70,12 +70,12 @@ def test_optional_policy_allows_both_formats(
 ):
     repository.get_device_configuration.return_value = {"version": 1, "encryption_mode": "optional"}
     body = gzip.compress(json.dumps({"logs": [traffic_payload]}).encode())
-    assert encrypted_client.post(URL, content=body, headers=GZIP_HEADERS).status_code == 202
+    assert encrypted_client.post(URL, content=body, headers=GZIP_HEADERS).status_code == 200
     assert (
         encrypted_client.post(
             URL, content=encrypt(encryption_keys, body), headers=HEADERS
         ).status_code
-        == 202
+        == 200
     )
 
 

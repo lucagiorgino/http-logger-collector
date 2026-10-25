@@ -1,6 +1,20 @@
 name: ${COMPOSE_PROJECT:-amazing-http-logger-dev}
 
 services:
+  redis:
+    image: redis:7.4
+    command: ["redis-server", "--bind", "0.0.0.0", "--protected-mode", "no", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory", "192mb", "--maxmemory-policy", "noeviction"]
+    restart: unless-stopped
+    mem_limit: 256m
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-28379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
   openbao:
     image: ${OPENBAO_IMAGE:-ghcr.io/openbao/openbao:2.7.1}
     user: "${OPENBAO_UID:-1000}:${OPENBAO_GID:-1000}"
@@ -60,6 +74,7 @@ services:
 
 volumes:
   mongo-data:
+  redis-data:
 
 secrets:
   openbao-dev-root-token:

@@ -92,6 +92,26 @@ def test_startup_creates_and_validates_time_series_collection(mongo, creation_er
     mongo.ensure_retention_indexes.assert_awaited_once()
 
 
+@pytest.mark.parametrize("already_stored", [1, 2])
+def test_queued_batch_retry_skips_records_already_majority_persisted(mongo, already_stored):
+    documents = [{"_id": ObjectId(), "batch_id": "batch-123"} for _ in range(2)]
+    mongo.traffic_logs = Mock()
+    cursor = Mock()
+    cursor.to_list = AsyncMock(return_value=documents[:already_stored])
+    collection = mongo.traffic_logs.with_options.return_value
+    collection.find.return_value = cursor
+    mongo.insert_traffic_logs = AsyncMock()
+    asyncio.run(mongo.insert_queued_traffic_logs(documents))
+    assert collection.find.call_args.args[0] == {
+        "batch_id": "batch-123",
+        "_id": {"$in": [document["_id"] for document in documents]},
+    }
+    if already_stored == 1:
+        mongo.insert_traffic_logs.assert_awaited_once_with(documents[1:])
+    else:
+        mongo.insert_traffic_logs.assert_not_awaited()
+
+
 def test_retention_indexes_separate_ordinary_legacy_and_suspicious_logs(mongo):
     mongo.traffic_logs = AsyncMock()
     cursor = Mock()

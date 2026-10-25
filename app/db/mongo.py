@@ -176,6 +176,7 @@ class MongoRepository:
             ),
             IndexModel([("timestamp", DESCENDING), ("_id", DESCENDING)], name="timestamp_id"),
             IndexModel([("received_at", DESCENDING)], name="received_at"),
+            IndexModel([("batch_id", ASCENDING), ("_id", ASCENDING)], name="batch_record"),
         ]
         try:
             try:
@@ -219,6 +220,24 @@ class MongoRepository:
             await self.traffic_logs.insert_many(documents, ordered=False)
         except PyMongoError as exc:
             raise PersistenceError("Failed to persist traffic log batch") from exc
+
+    async def insert_queued_traffic_logs(self, documents: list[dict[str, Any]]) -> None:
+        try:
+            cursor = self.traffic_logs.with_options(read_concern=ReadConcern("majority")).find(
+                {
+                    "batch_id": documents[0]["batch_id"],
+                    "_id": {"$in": [document["_id"] for document in documents]},
+                },
+                {"_id": 1},
+            )
+            existing = {document["_id"] for document in await cursor.to_list(length=None)}
+            missing = [document for document in documents if document["_id"] not in existing]
+            if missing:
+                await self.insert_traffic_logs(missing)
+        except PyMongoError as exc:
+            raise PersistenceError(
+                "Failed to check previously persisted traffic log batch"
+            ) from exc
 
     async def list_traffic_logs(
         self,

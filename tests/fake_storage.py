@@ -9,7 +9,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.core.config import settings
-from app.core.openbao import OpenBaoClient
+from app.core.openbao import AsyncOpenBaoClient, OpenBaoClient
 from app.core.storage_encryption import StorageEncryption
 
 
@@ -19,6 +19,9 @@ class FakeStorageEncryption(StorageEncryption):
 
     def client(self):
         return OpenBaoClient("test-storage-token", transport=httpx.MockTransport(self.respond))
+
+    def async_client(self):
+        return AsyncOpenBaoClient("test-storage-token", transport=httpx.MockTransport(self.respond))
 
     def respond(self, request):
         assert request.headers["X-Vault-Token"] == "test-storage-token"
