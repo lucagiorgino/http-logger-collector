@@ -1,5 +1,6 @@
+import json
 import zlib
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -8,13 +9,26 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.auth import AuthenticatedClaims
 from app.core.encryption import MAX_ENCRYPTED_BYTES, InvalidEnvelope
-from app.deps import EncryptionKeysDep, IngestionPublisherDep, MongoRepositoryDep
+from app.deps import (
+    EncryptionKeysDep,
+    IngestionPublisherDep,
+    MongoRepositoryDep,
+)
 from app.schemas.traffic import BatchReceipt, TrafficLogBatch, TrafficLogRequest
-from app.services.traffic_service import authenticated_subject, ingest_traffic_logs
+from app.services.traffic_service import ingest_traffic_logs, ingestion_context
 
 router = APIRouter(prefix="/api/v1/traffic-log-batches", tags=["traffic logs"])
 MAX_COMPRESSED_BYTES = 1_048_576
 MAX_DECOMPRESSED_BYTES = 8_388_608
+
+
+def unique_json_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("Duplicate JSON field")
+        result[name] = value
+    return result
 
 
 async def read_compressed_batch(
@@ -64,7 +78,11 @@ async def read_compressed_batch(
     if not decompressor.eof:
         raise HTTPException(status_code=400, detail="Incomplete gzip batch")
     try:
-        return TrafficLogBatch.model_validate_json(body)
+        decoded = json.loads(body.decode("utf-8"), object_pairs_hook=unique_json_fields)
+    except (ValueError, RecursionError):
+        raise HTTPException(status_code=422, detail="Invalid JSON batch") from None
+    try:
+        return TrafficLogBatch.model_validate(decoded)
     except ValidationError as exc:
         raise RequestValidationError(
             exc.errors(include_input=False, include_context=False)
@@ -84,6 +102,11 @@ async def read_compressed_batch(
                 "JSON: Content-Encoding gzip. JWE: configured ECDH/AES suite, "
                 "protected kid, public epk and cty=application/gzip; no Content-Encoding. "
                 "At most 1 MiB gzip and 8 MiB expanded; JWE wire limit 1,500,000 bytes."
+                " Identity fields are server-derived from the verified JWT; source_ip "
+                "comes from the trusted connection. Do not include attribution in logs. "
+                "Captured endpoints, HTTP metrics and process fields are agent-reported observations. "
+                "Unexpected/duplicate fields, unsafe header keys and invalid types reject the whole batch. "
+                "Each batch belongs to the single authenticated device returned by /api/v1/me."
             ),
             "content": {
                 "application/json": {
@@ -113,16 +136,11 @@ async def create_traffic_log_batch(
     repository: MongoRepositoryDep,
     payload: Annotated[TrafficLogBatch, Depends(read_compressed_batch)],
 ) -> BatchReceipt:
-    subject = authenticated_subject(claims)
-    if any(log.user_id != subject for log in payload.logs):
-        raise HTTPException(
-            status_code=403, detail="Authenticated subject cannot submit these logs"
-        )
-    for device_id in {log.device_id for log in payload.logs}:
-        configuration = await repository.get_device_configuration(subject, device_id)
-        mode = configuration["encryption_mode"]
-        if mode == "required" and not request.state.batch_encrypted:
-            raise HTTPException(status_code=403, detail="Device requires application encryption")
-        if mode == "tls_only" and request.state.batch_encrypted:
-            raise HTTPException(status_code=403, detail="Application encryption is not enabled")
-    return await ingest_traffic_logs(payload.logs, subject, publisher)
+    context = ingestion_context(claims, request)
+    configuration = await repository.get_device_configuration(context.identity.device_id)
+    mode = configuration["encryption_mode"]
+    if mode == "required" and not request.state.batch_encrypted:
+        raise HTTPException(status_code=403, detail="Device requires application encryption")
+    if mode == "tls_only" and request.state.batch_encrypted:
+        raise HTTPException(status_code=403, detail="Application encryption is not enabled")
+    return await ingest_traffic_logs(payload.logs, context, publisher)

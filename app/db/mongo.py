@@ -69,18 +69,14 @@ class MongoRepository:
     async def ensure_indexes(self) -> None:
         indexes = [
             IndexModel(
-                [("metadata.user_id", ASCENDING), ("timestamp", DESCENDING), ("_id", DESCENDING)],
-                name="user_timestamp",
-            ),
-            IndexModel(
                 [
-                    ("metadata.user_id", ASCENDING),
                     ("metadata.device_id", ASCENDING),
                     ("timestamp", DESCENDING),
                     ("_id", DESCENDING),
                 ],
-                name="user_device_timestamp",
+                name="device_timestamp",
             ),
+            IndexModel([("timestamp", DESCENDING), ("_id", DESCENDING)], name="timestamp_id"),
             IndexModel([("received_at", DESCENDING)], name="received_at"),
         ]
         try:
@@ -99,14 +95,15 @@ class MongoRepository:
                 # Another instance may have created the collection during startup.
             cursor = await self.database.list_collections(filter={"name": self.collection_name})
             collections = await cursor.to_list(length=1)
-            options = collections[0].get("options", {}).get("timeseries", {}) if collections else {}
+            collection_options = collections[0].get("options", {}) if collections else {}
+            options = collection_options.get("timeseries", {})
             if options.get("timeField") != "timestamp" or options.get("metaField") != "metadata":
                 raise PersistenceError(
                     "traffic_logs must use timestamp and metadata as its time-series fields"
                 )
             await self.traffic_logs.create_indexes(indexes)
         except PyMongoError as exc:
-            raise PersistenceError("Failed to initialize MongoDB time-series storage") from exc
+            raise PersistenceError("Failed to initialize MongoDB storage") from exc
 
     async def insert_traffic_logs(self, documents: list[dict[str, Any]]) -> None:
         try:
@@ -116,7 +113,6 @@ class MongoRepository:
 
     async def list_traffic_logs(
         self,
-        subject: str,
         *,
         device_id: str | None,
         start_time: datetime | None,
@@ -124,7 +120,7 @@ class MongoRepository:
         before: tuple[datetime, ObjectId] | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        query: dict[str, Any] = {"metadata.user_id": subject}
+        query: dict[str, Any] = {}
         if device_id is not None:
             query["metadata.device_id"] = device_id
         if start_time is not None or end_time is not None:
@@ -149,30 +145,31 @@ class MongoRepository:
         except PyMongoError as exc:
             raise PersistenceError("Failed to read traffic logs from a replica") from exc
 
-    async def get_traffic_log(self, subject: str, record_id: ObjectId) -> dict[str, Any] | None:
+    async def get_traffic_log(
+        self, record_id: ObjectId, *, device_id: str | None
+    ) -> dict[str, Any] | None:
+        query: dict[str, Any] = {"_id": record_id}
+        if device_id is not None:
+            query["metadata.device_id"] = device_id
         try:
-            return await self.analysis_logs.find_one(
-                {"metadata.user_id": subject, "_id": record_id}
-            )
+            return await self.analysis_logs.find_one(query)
         except PyMongoError as exc:
             raise PersistenceError("Failed to read traffic log from a replica") from exc
 
-    async def get_device_configuration(self, subject: str, device_id: str) -> dict[str, Any]:
+    async def get_device_configuration(self, device_id: str) -> dict[str, Any]:
         try:
-            document = await self.device_configurations.find_one(
-                {"_id": {"user_id": subject, "device_id": device_id}}
-            )
+            document = await self.device_configurations.find_one({"_id": device_id})
             return document or {"version": 0, "encryption_mode": "tls_only"}
         except PyMongoError as exc:
             raise PersistenceError("Failed to read device configuration") from exc
 
     async def update_device_configuration(
-        self, subject: str, device_id: str, expected_version: int, mode: str
+        self, device_id: str, expected_version: int, mode: str
     ) -> dict[str, Any] | None:
         try:
             return await self.device_configurations.find_one_and_update(
                 {
-                    "_id": {"user_id": subject, "device_id": device_id},
+                    "_id": device_id,
                     "version": expected_version,
                 },
                 {
@@ -187,13 +184,11 @@ class MongoRepository:
         except PyMongoError as exc:
             raise PersistenceError("Failed to update device configuration") from exc
 
-    async def report_device_configuration(
-        self, subject: str, device_id: str, report: dict[str, Any]
-    ) -> bool:
+    async def report_device_configuration(self, device_id: str, report: dict[str, Any]) -> bool:
         try:
             result = await self.device_configurations.update_one(
                 {
-                    "_id": {"user_id": subject, "device_id": device_id},
+                    "_id": device_id,
                     "version": report["version"],
                 },
                 {

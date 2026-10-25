@@ -31,7 +31,7 @@ class DeviceCredentials(BaseModel):
 
     client_id: str = Field(min_length=1)
     client_secret: SecretStr = Field(min_length=1)
-    device_id: str = Field(min_length=1, max_length=255)
+    device_id: str | None = Field(default=None, min_length=1, max_length=255)
     encrypted: bool
 
 
@@ -78,7 +78,6 @@ class StackSettings(BaseModel):
 
 @dataclass
 class DeviceResult:
-    subject: str
     device_id: str
     record_ids: list[str]
     token: SecretStr = field(repr=False)
@@ -105,7 +104,7 @@ def load_settings() -> StackSettings | None:
         return DeviceCredentials(
             client_id=required(name + "_CLIENT_ID"),
             client_secret=SecretStr(required(name + "_CLIENT_SECRET")),
-            device_id=values.get(f"STACK_TEST_{name}_DEVICE_ID", f"stack-test-{name.lower()}"),
+            device_id=values.get(f"STACK_TEST_{name}_DEVICE_ID") or None,
             encrypted=encrypted,
         )
 
@@ -121,7 +120,10 @@ def load_settings() -> StackSettings | None:
     )
     if settings.plaintext.client_id == settings.encrypted.client_id:
         raise ValueError("Each device must have a different client ID")
-    if settings.plaintext.device_id == settings.encrypted.device_id:
+    if (
+        settings.plaintext.device_id is not None
+        and settings.plaintext.device_id == settings.encrypted.device_id
+    ):
         raise ValueError("Each test device must have a different device ID")
     return settings
 
@@ -183,7 +185,6 @@ def run_device(
 ) -> DeviceResult:
     barrier.wait(timeout=settings.http_timeout)
     mode = "encrypted" if credentials.encrypted else "plaintext"
-    device_id = credentials.device_id
     with httpx.Client(
         base_url=settings.base_url + "/",
         timeout=settings.http_timeout,
@@ -194,16 +195,21 @@ def run_device(
     ) as client:
         token = retrieve_token(client, settings, credentials)
         client.headers["Authorization"] = "Bearer " + token.get_secret_value()
-        subject = call(client, "GET", "api/v1/me").get("user_id")
-        if not isinstance(subject, str) or not subject:
-            raise StackTestFailure("Identity endpoint did not return an authenticated subject")
+        identity = call(client, "GET", "api/v1/me")
+        device_id = identity.get("device_id")
+        if not isinstance(device_id, str) or not device_id or len(device_id) > 255:
+            raise StackTestFailure("Identity endpoint did not return an authenticated device")
+        if credentials.device_id is not None and credentials.device_id != device_id:
+            raise StackTestFailure(
+                "Configured test device ID does not match the JWT-bound identity from /me"
+            )
         config_path = f"api/v1/devices/{quote(device_id, safe='')}/configuration"
         configuration = call(client, "GET", config_path)
         allowed_modes = {"optional", "required"} if credentials.encrypted else {"tls_only"}
         if configuration["encryption_mode"] not in allowed_modes:
             raise StackTestFailure(
                 f"The {mode} test device {device_id!r} has an incompatible policy. "
-                "Configure its policy for the authenticated owner before running the test; "
+                "Configure its JWT-bound device policy before running the test; "
                 "the test never changes device policies."
             )
         suite = configuration["encryption"]
@@ -222,13 +228,17 @@ def run_device(
         started_at = datetime.now(UTC)
         logs = [
             {
-                "user_id": subject,
-                "device_id": device_id,
                 "timestamp": datetime.now(UTC).isoformat(),
                 "method": "get",
                 "url": f"https://example.test/stack/{run_id}/{mode}/{index}",
                 "status_code": 200,
                 "headers": {"Authorization": "test-placeholder", "Cookie": "test-cookie"},
+                "destination_ip": "203.0.113.50",
+                "destination_port": 443,
+                "http_version": "2",
+                "response_size_bytes": 1024,
+                "duration_ms": 12.5,
+                "process_name": "stack-test-agent",
                 "body": f"synthetic-{run_id}-{mode}-{index}",
             }
             for index in range(LOGS_PER_DEVICE)
@@ -298,15 +308,25 @@ def run_device(
         assert len({record["id"] for record in records}) == len(logs)
         for record in records:
             original = expected[record["url"]]
-            assert record["user_id"] == subject and record["device_id"] == device_id
+            assert record["device_id"] == device_id
+            assert "user_id" not in record
             assert record["batch_id"] == receipt["batch_id"]
             assert record["method"] == "GET"
+            for field in (
+                "destination_ip",
+                "destination_port",
+                "http_version",
+                "response_size_bytes",
+                "duration_ms",
+                "process_name",
+            ):
+                assert record[field] == original[field]
             assert record["headers"]["Authorization"] == "[REDACTED]"
             assert record["headers"]["Cookie"] == "[REDACTED]"
             assert "body" not in record
             assert record["body_length"] == len(original["body"].encode())
             assert record["body_sha256"] == sha256(original["body"].encode()).hexdigest()
-        return DeviceResult(subject, device_id, [record["id"] for record in records], token)
+        return DeviceResult(device_id, [record["id"] for record in records], token)
 
 
 def run_stack(settings: StackSettings, *, transport: httpx.BaseTransport | None = None) -> None:
@@ -318,25 +338,29 @@ def run_stack(settings: StackSettings, *, transport: httpx.BaseTransport | None 
             for credentials in (settings.plaintext, settings.encrypted)
         ]
         first, second = [future.result() for future in as_completed(futures)]
-    if first.subject == second.subject:
-        raise StackTestFailure("Dedicated OAuth clients must resolve to distinct owners")
-    for owner, other in ((first, second), (second, first)):
+    if first.device_id == second.device_id:
+        raise StackTestFailure("Dedicated OAuth clients must resolve to distinct devices")
+    for device, other in ((first, second), (second, first)):
         with httpx.Client(
             base_url=settings.base_url + "/",
-            headers={"Authorization": "Bearer " + owner.token.get_secret_value()},
+            headers={"Authorization": "Bearer " + device.token.get_secret_value()},
             timeout=settings.http_timeout,
             verify=settings.tls_context(),
             trust_env=False,
             follow_redirects=False,
             transport=transport,
         ) as client:
-            assert (
-                call(
-                    client,
-                    "GET",
-                    "api/v1/traffic-logs",
-                    params={"device_id": other.device_id},
-                )["items"]
-                == []
+            call(
+                client,
+                "GET",
+                "api/v1/traffic-logs",
+                params={"device_id": other.device_id},
+                expected=403,
+            )
+            call(
+                client,
+                "GET",
+                f"api/v1/devices/{quote(other.device_id, safe='')}/configuration",
+                expected=403,
             )
             call(client, "GET", f"api/v1/traffic-logs/{other.record_ids[0]}", expected=404)

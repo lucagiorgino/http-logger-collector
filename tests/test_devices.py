@@ -6,20 +6,21 @@ from app.db.mongo import PersistenceError
 from app.main import app
 
 URL = "/api/v1/devices/device-456/configuration"
+REGISTRY = "/api/v1/devices"
 
 
 def admin():
     return {"sub": "user-123", "permissions": ["manage:devices"]}
 
 
-def test_default_policy_is_owner_scoped_and_not_cached(authorized_client, repository):
+def test_default_policy_is_device_scoped_and_not_cached(authorized_client, repository):
     response = authorized_client.get(URL)
     assert response.status_code == 200
     assert response.json()["encryption_mode"] == "tls_only"
     assert response.json()["version"] == 0
     assert response.json()["encryption"] is None
     assert response.headers["cache-control"] == "no-store"
-    repository.get_device_configuration.assert_awaited_once_with("user-123", "device-456")
+    repository.get_device_configuration.assert_awaited_once_with("device-456")
 
 
 def test_policy_changes_require_permission(authorized_client, repository):
@@ -55,9 +56,7 @@ def test_policy_patch_exposes_only_public_key_and_uses_compare_and_swap(
     key = response.json()["encryption"]["public_key"]
     assert set(key) == {"kty", "crv", "x", "y", "kid", "use", "alg"}
     assert key["kid"] == "current"
-    repository.update_device_configuration.assert_awaited_once_with(
-        "user-123", "device-456", 0, "required"
-    )
+    repository.update_device_configuration.assert_awaited_once_with("device-456", 0, "required")
     repository.update_device_configuration.return_value = None
     assert (
         encrypted_client.patch(
@@ -122,3 +121,32 @@ def test_https_is_required_and_untrusted_forwarded_header_cannot_bypass(
     assert authorized_client.get(URL, headers={"X-Forwarded-Proto": "https"}).status_code == 400
     assert authorized_client.get("https://testserver" + URL).status_code == 200
     assert authorized_client.get("/health").status_code == 200
+
+
+def test_agent_cannot_read_or_acknowledge_another_device(authorized_client, repository):
+    for suffix in ("/configuration",):
+        assert authorized_client.get(REGISTRY + "/another-device" + suffix).status_code == 403
+    report = {"version": 0, "status": "applied", "supports_encryption": False}
+    assert (
+        authorized_client.put(
+            REGISTRY + "/another-device/configuration-status", json=report
+        ).status_code
+        == 403
+    )
+    repository.get_device_configuration.assert_not_awaited()
+    repository.report_device_configuration.assert_not_awaited()
+
+
+def test_operator_can_read_any_device_but_cannot_impersonate_its_acknowledgement(
+    authorized_client, repository
+):
+    app.dependency_overrides[require_bearer_token] = admin
+    assert authorized_client.get(REGISTRY + "/another-device/configuration").status_code == 200
+    repository.get_device_configuration.assert_awaited_once_with("another-device")
+    report = {"version": 0, "status": "applied", "supports_encryption": False}
+    assert (
+        authorized_client.put(
+            REGISTRY + "/another-device/configuration-status", json=report
+        ).status_code
+        == 403
+    )

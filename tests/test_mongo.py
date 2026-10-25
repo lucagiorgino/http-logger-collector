@@ -68,6 +68,7 @@ def test_standalone_and_direct_connections_cannot_bypass_replica_routing(uri):
 def test_startup_creates_and_validates_time_series_collection(mongo, creation_error):
     mongo.database = AsyncMock()
     mongo.traffic_logs = AsyncMock()
+    mongo.device_configurations = AsyncMock()
     mongo.database.create_collection.side_effect = creation_error
     cursor = Mock()
     cursor.to_list = AsyncMock(
@@ -104,7 +105,7 @@ def test_startup_does_not_swallow_database_permission_errors(mongo):
     mongo.database.list_collections.assert_not_awaited()
 
 
-def test_analysis_query_always_contains_owner_and_stable_cursor(mongo):
+def test_analysis_query_contains_device_and_stable_cursor(mongo):
     mongo.analysis_logs = Mock()
     cursor = mongo.analysis_logs.find.return_value
     cursor.sort.return_value = cursor
@@ -115,30 +116,29 @@ def test_analysis_query_always_contains_owner_and_stable_cursor(mongo):
     end = datetime(2026, 2, 1, tzinfo=UTC)
     asyncio.run(
         mongo.list_traffic_logs(
-            "owner", device_id="device", start_time=start, end_time=end, before=position, limit=11
+            device_id="device", start_time=start, end_time=end, before=position, limit=11
         )
     )
     mongo.analysis_logs.find.assert_called_once_with(
         {
-            "metadata.user_id": "owner",
             "metadata.device_id": "device",
             "timestamp": {"$gte": start, "$lt": end},
             "$or": [
                 {"timestamp": {"$lt": position[0]}},
                 {"timestamp": position[0], "_id": {"$lt": position[1]}},
             ],
-        }
+        },
     )
     cursor.sort.assert_called_once_with([("timestamp", -1), ("_id", -1)])
     cursor.limit.assert_called_once_with(11)
 
 
-def test_record_query_always_contains_owner(mongo):
+def test_record_query_contains_device_when_restricted(mongo):
     mongo.analysis_logs = AsyncMock()
     record_id = ObjectId()
-    asyncio.run(mongo.get_traffic_log("owner", record_id))
+    asyncio.run(mongo.get_traffic_log(record_id, device_id="device"))
     mongo.analysis_logs.find_one.assert_awaited_once_with(
-        {"metadata.user_id": "owner", "_id": record_id}
+        {"metadata.device_id": "device", "_id": record_id}
     )
 
 
@@ -150,23 +150,21 @@ def test_database_errors_are_explicit_and_never_fall_back(mongo):
     with pytest.raises(PersistenceError, match="persist"):
         asyncio.run(mongo.insert_traffic_logs([{"timestamp": datetime.now(UTC)}]))
     with pytest.raises(PersistenceError, match="replica"):
-        asyncio.run(mongo.get_traffic_log("owner", ObjectId()))
+        asyncio.run(mongo.get_traffic_log(ObjectId(), device_id="device"))
     mongo.traffic_logs.find_one.assert_not_awaited()
 
 
-def test_device_configuration_lookup_and_cas_are_owner_scoped(mongo):
+def test_device_configuration_lookup_and_cas_are_device_scoped(mongo):
     mongo.device_configurations = AsyncMock()
     mongo.device_configurations.find_one.return_value = None
-    document = asyncio.run(mongo.get_device_configuration("owner", "device"))
+    document = asyncio.run(mongo.get_device_configuration("device"))
     assert document == {"version": 0, "encryption_mode": "tls_only"}
-    mongo.device_configurations.find_one.assert_awaited_once_with(
-        {"_id": {"user_id": "owner", "device_id": "device"}}
-    )
-    asyncio.run(mongo.update_device_configuration("owner", "device", 3, "required"))
+    mongo.device_configurations.find_one.assert_awaited_once_with({"_id": "device"})
+    asyncio.run(mongo.update_device_configuration("device", 3, "required"))
     args, kwargs = mongo.device_configurations.find_one_and_update.call_args
-    assert args[0] == {"_id": {"user_id": "owner", "device_id": "device"}, "version": 3}
+    assert args[0] == {"_id": "device", "version": 3}
     assert args[1]["$inc"] == {"version": 1}
     assert kwargs["upsert"] is False
     mongo.device_configurations.find_one.side_effect = ServerSelectionTimeoutError("no primary")
     with pytest.raises(PersistenceError, match="configuration"):
-        asyncio.run(mongo.get_device_configuration("owner", "device"))
+        asyncio.run(mongo.get_device_configuration("device"))

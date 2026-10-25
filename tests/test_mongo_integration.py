@@ -2,6 +2,7 @@ import asyncio
 import gzip
 import json
 import os
+from datetime import UTC, datetime
 from time import monotonic
 from uuid import uuid4
 
@@ -19,7 +20,12 @@ from app.deps import get_mongo_repository
 from app.main import app
 from app.schemas.traffic import TrafficLogRequest
 from app.services.ingestion import MongoIngestionPublisher
-from app.services.traffic_service import ingest_traffic_logs
+from app.services.traffic_service import (
+    DEVICE_ID_CLAIM,
+    ClientIdentity,
+    IngestionContext,
+    ingest_traffic_logs,
+)
 
 
 class RoutingListener(CommandListener):
@@ -27,7 +33,10 @@ class RoutingListener(CommandListener):
         self.operations = []
 
     def started(self, event):
-        if event.command_name in {"insert", "find"}:
+        if (
+            event.command_name in {"insert", "find"}
+            and event.command[event.command_name] == "traffic_logs"
+        ):
             self.operations.append((event.command_name, event.connection_id))
 
     def succeeded(self, event):
@@ -60,6 +69,7 @@ class RoutingListener(CommandListener):
     ],
 )
 def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, uri):
+
     monkeypatch.setattr(settings, "mongo_server_selection_timeout_ms", 1000)
     monkeypatch.setattr(settings, "mongo_allow_primary_reads", allow_primary)
     monkeypatch.setattr(settings, "app_env", "development" if allow_primary else "production")
@@ -84,6 +94,12 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
             read_preference=repository.analysis_logs.read_preference,
             read_concern=repository.analysis_logs.read_concern,
         )
+        repository.device_configurations = repository.database.get_collection(
+            "device_configurations",
+            read_preference=repository.device_configurations.read_preference,
+            read_concern=repository.device_configurations.read_concern,
+            write_concern=repository.device_configurations.write_concern,
+        )
         try:
             await repository.ensure_indexes()
             await repository.ensure_indexes()
@@ -93,23 +109,27 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
             collection = (await collection_cursor.to_list(length=1))[0]
             assert collection["type"] == "timeseries"
             payload = TrafficLogRequest(
-                user_id="owner",
-                device_id="device",
-                timestamp="2026-01-15T10:00:00Z",
+                timestamp=datetime.now(UTC),
                 method="GET",
                 url="https://example.com",
                 status_code=200,
                 headers={"Authorization": "secret"},
+                captured_source_ip="192.0.2.10",
+                destination_ip="203.0.113.50",
+                response_size_bytes=1024,
+                process_name="chrome.exe",
                 body="private body",
             )
+            context = IngestionContext(ClientIdentity("device", "oauth-client"), "127.0.0.1")
             receipt = await ingest_traffic_logs(
-                [payload, payload], "owner", MongoIngestionPublisher(repository)
+                [payload, payload],
+                context,
+                MongoIngestionPublisher(repository),
             )
             assert receipt.status == "stored"
             deadline = monotonic() + 15
             while True:
                 documents = await repository.list_traffic_logs(
-                    "owner",
                     device_id="device",
                     start_time=None,
                     end_time=None,
@@ -123,12 +143,25 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
                 await asyncio.sleep(0.1)
             assert len({document["_id"] for document in documents}) == 2
             assert all(document["batch_id"] == receipt.batch_id for document in documents)
-            assert documents[0]["headers"]["Authorization"] == "[REDACTED]"
+            assert documents[0]["metadata"] == {"device_id": "device"}
+            assert documents[0]["client_id"] == "oauth-client"
+            assert documents[0]["source_ip"] == "127.0.0.1"
+            assert documents[0]["captured_source_ip"] == "192.0.2.10"
+            assert documents[0]["destination_ip"] == "203.0.113.50"
+            assert documents[0]["response_size_bytes"] == 1024
+            assert documents[0]["process_name"] == "chrome.exe"
+            assert documents[0]["request_headers"]["Authorization"] == "[REDACTED]"
             assert "body" not in documents[0]
-            assert await repository.get_traffic_log("other-owner", documents[0]["_id"]) is None
-            assert await repository.get_traffic_log("owner", documents[0]["_id"]) is not None
+            assert (
+                await repository.get_traffic_log(documents[0]["_id"], device_id="other-device")
+                is None
+            )
+            assert (
+                await repository.get_traffic_log(documents[0]["_id"], device_id="device")
+                is not None
+            )
+            assert await repository.get_traffic_log(documents[0]["_id"], device_id=None) is not None
             next_page = await repository.list_traffic_logs(
-                "owner",
                 device_id=None,
                 start_time=None,
                 end_time=None,
@@ -152,8 +185,12 @@ def test_time_series_ingestion_and_analysis_routing(monkeypatch, allow_primary, 
                 read_preference=Secondary(tag_sets=[{"unavailable": "true"}])
             )
             with pytest.raises(PersistenceError, match="replica"):
-                await repository.get_traffic_log("owner", documents[0]["_id"])
-            await ingest_traffic_logs([payload], "owner", MongoIngestionPublisher(repository))
+                await repository.get_traffic_log(documents[0]["_id"], device_id="device")
+            await ingest_traffic_logs(
+                [payload],
+                context,
+                MongoIngestionPublisher(repository),
+            )
         finally:
             await repository.client.drop_database(database_name)
             await repository.close()
@@ -181,6 +218,7 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
     from joserfc import jwe
     from joserfc.jwk import ECKey
 
+    traffic_payload["timestamp"] = datetime.now(UTC).isoformat()
     monkeypatch.setattr(settings, "mongo_allow_primary_reads", True)
     monkeypatch.setattr(settings, "app_env", "development")
     if key_source == "openbao":
@@ -193,7 +231,11 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
         repository = MongoRepository(
             uri=os.environ["MONGO_TEST_URI"], db_name="traffic_test_" + uuid4().hex
         )
-        claims = {"sub": "user-123", "permissions": ["manage:devices"]}
+        claims = {
+            "sub": "user-123",
+            DEVICE_ID_CLAIM: "device-456",
+            "permissions": ["manage:devices"],
+        }
         app.dependency_overrides[require_bearer_token] = lambda: claims
         app.dependency_overrides[get_mongo_repository] = lambda: repository
         app.dependency_overrides[get_encryption_keys] = lambda: encryption_keys
@@ -287,15 +329,17 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
                     )
                 )
                 assert sorted(response.status_code for response in creations) == [200, 409]
-                claims["sub"] = "another-owner"
+                claims["sub"] = "another-subject"
                 response = await client.get(config_url)
-                assert response.json()["version"] == 0
+                assert response.json()["version"] == 2
+                claims[DEVICE_ID_CLAIM] = "another-device"
+                claims["permissions"] = []
+                assert (await client.get(config_url)).status_code == 403
                 response = await client.post(
                     upload_url, content=envelope, headers={"Content-Type": "application/jose"}
                 )
                 assert response.status_code == 403
                 documents = await repository.list_traffic_logs(
-                    "user-123",
                     device_id="device-456",
                     start_time=None,
                     end_time=None,
@@ -304,7 +348,8 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
                 )
                 assert len(documents) == 2
                 assert all(
-                    document["headers"]["Authorization"] == "[REDACTED]" for document in documents
+                    document["request_headers"]["Authorization"] == "[REDACTED]"
+                    for document in documents
                 )
         finally:
             app.dependency_overrides.clear()

@@ -58,17 +58,21 @@ def fake_stack(
     plaintext_mode="tls_only",
     pagination=False,
 ):
+    devices = {
+        "plain-client": settings.plaintext.device_id or "plain-client",
+        "jwe-client": settings.encrypted.device_id or "jwe-client",
+    }
     key = ECKey.generate_key(
         "P-256", parameters={"kid": "server-key", "alg": algorithm, "use": "enc"}
     )
     registry = jwe.JWERegistry(algorithms=[algorithm, encryption])
     configurations = {
-        ("plain-client", settings.plaintext.device_id): {
+        devices["plain-client"]: {
             "version": 2,
             "encryption_mode": plaintext_mode,
             "encryption": None,
         },
-        ("jwe-client", settings.encrypted.device_id): {
+        devices["jwe-client"]: {
             "version": 4,
             "encryption_mode": encrypted_mode,
             "encryption": {
@@ -108,24 +112,34 @@ def fake_stack(
                 if failure == "token":
                     return httpx.Response(401, json={"error": "sensitive-response"})
                 return httpx.Response(200, json={"access_token": identity, "token_type": "Bearer"})
-            owner = request.headers["Authorization"].removeprefix("Bearer ")
+            client_id = request.headers["Authorization"].removeprefix("Bearer ")
             path = request.url.path
             if path == "/api/v1/me":
-                return httpx.Response(200, json={"user_id": owner})
+                return httpx.Response(
+                    200,
+                    json={
+                        "device_id": "mismatched-device"
+                        if failure == "identity"
+                        else devices[client_id],
+                        "client_id": client_id,
+                    },
+                )
             if path.startswith("/api/v1/devices/"):
                 device = path.split("/")[4]
-                configuration = configurations[(owner, device)]
+                if device != devices[client_id]:
+                    return httpx.Response(403, json={"detail": "Device access denied"})
+                configuration = configurations[device]
                 assert request.method in {"GET", "PUT"}, "Agents must not change device policies"
                 state["configuration_methods"].add(request.method)
                 if request.method == "PUT":
                     report = json.loads(request.content)
                     assert report["version"] == configuration["version"]
-                    assert report["supports_encryption"] is (owner == "jwe-client")
-                    assert report["key_id"] == ("server-key" if owner == "jwe-client" else None)
+                    assert report["supports_encryption"] is (client_id == "jwe-client")
+                    assert report["key_id"] == ("server-key" if client_id == "jwe-client" else None)
                 return httpx.Response(200, json=configuration)
             if path == "/api/v1/traffic-log-batches":
                 encrypted = request.headers["Content-Type"] == "application/jose"
-                if owner == "jwe-client" and encrypted_mode == "required" and not encrypted:
+                if client_id == "jwe-client" and encrypted_mode == "required" and not encrypted:
                     state["rejections"] += 1
                     return httpx.Response(403, json={"detail": "Encryption required"})
                 if failure == "storage":
@@ -141,9 +155,15 @@ def fake_stack(
                 logs = json.loads(gzip.decompress(compressed))["logs"]
                 batch_id = uuid4().hex
                 for log in logs:
-                    assert log["user_id"] == owner
+                    assert (
+                        not {"user_id", "device_id", "client_id", "source_ip", "metadata"}
+                        & log.keys()
+                    )
                     body = log.pop("body").encode()
                     log.update(
+                        device_id=devices[client_id],
+                        client_id=client_id,
+                        source_ip="203.0.113.10",
                         id=uuid4().hex[:24],
                         batch_id=batch_id,
                         method="GET",
@@ -153,8 +173,8 @@ def fake_stack(
                     )
                     if failure == "redaction":
                         log["headers"]["Authorization"] = "unredacted-placeholder"
-                    records.setdefault((owner, log["device_id"]), []).append(log)
-                state["uploads"].add((owner, encrypted))
+                    records.setdefault(log["device_id"], []).append(log)
+                state["uploads"].add((client_id, encrypted))
                 state["upload_count"] += 1
                 return httpx.Response(
                     202,
@@ -162,14 +182,16 @@ def fake_stack(
                 )
             if path == "/api/v1/traffic-logs":
                 device = request.url.params["device_id"]
-                lookup = (owner, device)
+                if device != devices[client_id] and failure != "isolation":
+                    return httpx.Response(403, json={"detail": "Device access denied"})
+                lookup = device
                 attempt = state["reads"].get(lookup, 0)
                 state["reads"][lookup] = attempt + 1
                 visible = records.get(lookup, [])
                 if failure == "isolation":
                     visible = [
                         record
-                        for (_, candidate), documents in records.items()
+                        for candidate, documents in records.items()
                         if candidate == device
                         for record in documents
                     ]
@@ -242,6 +264,22 @@ def test_readback_follows_cursors_to_find_its_own_batch(stack_settings):
     assert state["paged_reads"] == 2
 
 
+def test_device_identity_is_discovered_from_the_server(stack_settings):
+    stack_settings.plaintext.device_id = None
+    stack_settings.encrypted.device_id = None
+    transport, state = fake_stack(stack_settings)
+    run_stack(stack_settings, transport=transport)
+    assert state["upload_count"] == 2
+
+
+def test_configured_device_cannot_override_the_authenticated_identity(stack_settings):
+    transport, state = fake_stack(stack_settings, failure="identity")
+    with pytest.raises(StackTestFailure, match="does not match the JWT-bound identity"):
+        run_stack(stack_settings, transport=transport)
+    assert state["upload_count"] == 0
+    assert state["configuration_methods"] == set()
+
+
 @pytest.mark.parametrize("failure", ["token", "storage", "visibility"])
 def test_stack_errors_fail_without_echoing_credentials(stack_settings, failure):
     transport, _ = fake_stack(stack_settings, failure=failure)
@@ -270,8 +308,9 @@ def test_profile_requires_distinct_clients_and_hides_secrets(tmp_path, monkeypat
     loaded = load_settings()
     assert "private-one" not in repr(loaded)
     assert "private-two" not in repr(loaded)
-    assert loaded.plaintext.device_id == "stack-test-plaintext"
-    assert loaded.encrypted.device_id == "stack-test-encrypted"
+    assert loaded.plaintext.device_id is None
+    assert loaded.encrypted.device_id is None
+    monkeypatch.setenv("STACK_TEST_PLAINTEXT_DEVICE_ID", "stack-test-plaintext")
     monkeypatch.setenv("STACK_TEST_ENCRYPTED_DEVICE_ID", "stack-test-plaintext")
     with pytest.raises(ValueError, match="different device ID"):
         load_settings()

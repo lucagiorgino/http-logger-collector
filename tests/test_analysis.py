@@ -15,10 +15,11 @@ URL = "/api/v1/traffic-logs"
 
 
 def test_paginated_analysis_returns_an_opaque_cursor(
-    authorized_client, repository, traffic_payload
+    authorized_client, repository, traffic_payload, trusted_context
 ):
     documents = [
-        normalize_traffic_log(TrafficLogRequest(**traffic_payload), "batch-123") for _ in range(3)
+        normalize_traffic_log(TrafficLogRequest(**traffic_payload), "batch-123", trusted_context)
+        for _ in range(3)
     ]
     documents.sort(key=lambda document: document["_id"], reverse=True)
     repository.list_traffic_logs.return_value = documents
@@ -26,12 +27,15 @@ def test_paginated_analysis_returns_an_opaque_cursor(
     assert response.status_code == 200
     page = response.json()
     assert [item["id"] for item in page["items"]] == [str(item["_id"]) for item in documents[:2]]
-    assert page["items"][0]["user_id"] == "user-123"
+    assert page["items"][0]["device_id"] == "device-456"
+    assert "user_id" not in page["items"][0]
+    assert page["items"][0]["client_id"] == "oauth-client-123"
+    assert page["items"][0]["source_ip"] == "203.0.113.10"
     assert "_id" not in page["items"][0]
     assert "body" not in page["items"][0]
     assert decode_cursor(page["next_cursor"]) == (documents[1]["timestamp"], documents[1]["_id"])
     repository.list_traffic_logs.assert_awaited_once_with(
-        "user-123", device_id="device-456", start_time=None, end_time=None, before=None, limit=3
+        device_id="device-456", start_time=None, end_time=None, before=None, limit=3
     )
 
     repository.list_traffic_logs.return_value = [documents[2]]
@@ -71,16 +75,42 @@ def test_invalid_queries_do_not_reach_storage(authorized_client, repository, par
     repository.list_traffic_logs.assert_not_awaited()
 
 
-def test_record_lookup_is_owner_scoped(authorized_client, repository, traffic_payload):
-    document = normalize_traffic_log(TrafficLogRequest(**traffic_payload), "batch-123")
+def test_record_lookup_is_device_scoped(
+    authorized_client, repository, traffic_payload, trusted_context
+):
+    document = normalize_traffic_log(
+        TrafficLogRequest(**traffic_payload), "batch-123", trusted_context
+    )
+    del document["client_id"]
+    document["headers"] = document.pop("request_headers")
+    for field in (
+        "response_headers",
+        "captured_source_ip",
+        "destination_ip",
+        "source_port",
+        "destination_port",
+        "http_version",
+        "request_size_bytes",
+        "response_size_bytes",
+        "duration_ms",
+        "process_name",
+        "process_id",
+        "request_id",
+    ):
+        del document[field]
     repository.get_traffic_log.return_value = document
     response = authorized_client.get(f"{URL}/{document['_id']}")
     assert response.status_code == 200
     assert response.json()["id"] == str(document["_id"])
-    repository.get_traffic_log.assert_awaited_once_with("user-123", document["_id"])
+    assert response.json()["client_id"] is None
+    assert response.json()["request_headers"] == response.json()["headers"] == document["headers"]
+    assert response.json()["response_headers"] == {}
+    assert response.json()["destination_ip"] is None
+    assert response.json()["process_name"] is None
+    repository.get_traffic_log.assert_awaited_once_with(document["_id"], device_id="device-456")
 
 
-def test_missing_or_other_users_record_is_not_disclosed(authorized_client, repository):
+def test_missing_or_other_devices_record_is_not_disclosed(authorized_client, repository):
     response = authorized_client.get(f"{URL}/{ObjectId()}")
     assert response.status_code == 404
     response = authorized_client.get(f"{URL}/invalid-id")
@@ -101,8 +131,31 @@ def test_analysis_and_identity_require_authentication(path):
     assert TestClient(app).get(path).status_code == 401
 
 
-def test_current_identity_comes_from_verified_subject(authorized_client):
-    assert authorized_client.get("/api/v1/me").json() == {"user_id": "user-123"}
+def test_current_identity_comes_from_verified_device_claim(authorized_client):
+    assert authorized_client.get("/api/v1/me").json() == {
+        "device_id": "device-456",
+        "client_id": "oauth-client-123",
+    }
     app.dependency_overrides[require_bearer_token] = lambda: {"unrelated": "claim"}
     assert authorized_client.get("/api/v1/me").status_code == 401
     assert authorized_client.get(URL).status_code == 401
+
+
+def test_agent_analysis_cannot_select_another_device(authorized_client, repository):
+    assert authorized_client.get(URL, params={"device_id": "another-device"}).status_code == 403
+    repository.list_traffic_logs.assert_not_awaited()
+    assert authorized_client.get(URL).status_code == 200
+    assert repository.list_traffic_logs.call_args.kwargs["device_id"] == "device-456"
+
+
+def test_operator_can_analyze_fleet_or_filter_by_device(authorized_client, repository):
+    app.dependency_overrides[require_bearer_token] = lambda: {
+        "sub": "operator",
+        "scope": "manage:devices",
+    }
+    assert authorized_client.get(URL).status_code == 200
+    assert repository.list_traffic_logs.call_args.kwargs["device_id"] is None
+    assert authorized_client.get(URL, params={"device_id": "another-device"}).status_code == 200
+    assert repository.list_traffic_logs.call_args.kwargs["device_id"] == "another-device"
+    assert authorized_client.get(f"{URL}/{ObjectId()}").status_code == 404
+    assert repository.get_traffic_log.call_args.kwargs["device_id"] is None

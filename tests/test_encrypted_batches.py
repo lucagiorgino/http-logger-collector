@@ -32,35 +32,36 @@ def encrypt(keys, compressed, kid="current", **headers):
 
 @pytest.mark.parametrize("kid", ["current", "previous"])
 def test_encrypted_single_log_is_decrypted_validated_and_redacted(
-    encrypted_client, repository, traffic_payload, encryption_keys, kid
+    encrypted_client, repository, rich_traffic_payload, encryption_keys, kid
 ):
     repository.get_device_configuration.return_value = {"version": 1, "encryption_mode": "required"}
-    body = gzip.compress(json.dumps({"logs": [traffic_payload]}).encode())
+    body = gzip.compress(json.dumps({"logs": [rich_traffic_payload]}).encode())
     response = encrypted_client.post(
         URL, content=encrypt(encryption_keys, body, kid), headers=HEADERS
     )
     assert response.status_code == 202
     assert response.json()["accepted_count"] == 1
     stored = repository.insert_traffic_logs.call_args.args[0][0]
-    assert stored["headers"]["Authorization"] == "[REDACTED]"
+    assert stored["request_headers"]["Authorization"] == "[REDACTED]"
+    assert stored["response_headers"]["Set-Cookie"] == "[REDACTED]"
+    assert stored["destination_ip"] == rich_traffic_payload["destination_ip"]
+    assert stored["response_size_bytes"] == rich_traffic_payload["response_size_bytes"]
+    assert stored["process_name"] == rich_traffic_payload["process_name"]
     assert "body" not in stored
     assert "ciphertext" not in stored
 
 
-def test_required_encryption_cannot_be_downgraded_for_any_device_in_batch(
+def test_required_encryption_uses_the_authenticated_device_for_the_whole_batch(
     encrypted_client, repository, traffic_payload
 ):
-    repository.get_device_configuration.side_effect = lambda subject, device: {
+    repository.get_device_configuration.side_effect = lambda device: {
         "version": 1,
-        "encryption_mode": "required" if device == "required" else "optional",
+        "encryption_mode": "required" if device == "device-456" else "optional",
     }
-    body = gzip.compress(
-        json.dumps(
-            {"logs": [traffic_payload, {**traffic_payload, "device_id": "required"}]}
-        ).encode()
-    )
+    body = gzip.compress(json.dumps({"logs": [traffic_payload, traffic_payload]}).encode())
     response = encrypted_client.post(URL, content=body, headers=GZIP_HEADERS)
     assert response.status_code == 403
+    repository.get_device_configuration.assert_awaited_once_with("device-456")
     repository.insert_traffic_logs.assert_not_awaited()
 
 
@@ -144,17 +145,17 @@ def test_encrypted_limits_are_enforced(
     repository.insert_traffic_logs.assert_not_awaited()
 
 
-def test_encrypted_batches_still_enforce_owner_and_gzip_contract(
+def test_encrypted_batches_reject_client_attribution_and_enforce_gzip_contract(
     encrypted_client, repository, traffic_payload, encryption_keys
 ):
     repository.get_device_configuration.return_value = {"version": 1, "encryption_mode": "required"}
-    wrong_owner = {**traffic_payload, "user_id": "other"}
-    body = gzip.compress(json.dumps({"logs": [wrong_owner]}).encode())
+    forged_attribution = {**traffic_payload, "user_id": "other"}
+    body = gzip.compress(json.dumps({"logs": [forged_attribution]}).encode())
     assert (
         encrypted_client.post(
             URL, content=encrypt(encryption_keys, body), headers=HEADERS
         ).status_code
-        == 403
+        == 422
     )
     for body in [b"not gzip", gzip.compress(b"{}") + gzip.compress(b"{}")]:
         assert (

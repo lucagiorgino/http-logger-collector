@@ -8,6 +8,7 @@ from bson import ObjectId
 from fastapi import HTTPException
 from pydantic import AwareDatetime, BaseModel, Field, ValidationError
 
+from app.core.security import redact_sensitive_headers
 from app.schemas.traffic import StoredTrafficLog
 
 
@@ -35,10 +36,33 @@ def encode_cursor(document: dict[str, Any]) -> str:
 
 
 def stored_log(document: dict[str, Any]) -> StoredTrafficLog:
+    request_headers = redact_sensitive_headers(
+        document.get("request_headers", document.get("headers", {}))
+    )
     return StoredTrafficLog(
         id=str(document["_id"]),
-        user_id=document["metadata"]["user_id"],
         device_id=document["metadata"]["device_id"],
+        client_id=document.get("client_id"),
+        headers=request_headers,
+        request_headers=request_headers,
+        response_headers=redact_sensitive_headers(document.get("response_headers", {})),
+        **{
+            key: document[key]
+            for key in (
+                "captured_source_ip",
+                "destination_ip",
+                "source_port",
+                "destination_port",
+                "http_version",
+                "request_size_bytes",
+                "response_size_bytes",
+                "duration_ms",
+                "process_name",
+                "process_id",
+                "request_id",
+            )
+            if key in document
+        },
         **{
             key: document[key]
             for key in (
@@ -48,7 +72,6 @@ def stored_log(document: dict[str, Any]) -> StoredTrafficLog:
                 "method",
                 "url",
                 "status_code",
-                "headers",
                 "source_ip",
                 "body_length",
                 "body_sha256",

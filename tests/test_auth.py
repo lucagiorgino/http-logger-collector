@@ -1,3 +1,5 @@
+import gzip
+import json
 import time
 from unittest.mock import AsyncMock
 
@@ -8,7 +10,10 @@ from joserfc import jwt
 from joserfc.jwk import OctKey, RSAKey
 
 from app.core import auth
+from app.core.encryption import EncryptionKeys, get_encryption_keys
+from app.deps import get_mongo_repository
 from app.main import app
+from app.services.traffic_service import DEVICE_ID_CLAIM
 
 client = TestClient(app)
 
@@ -98,11 +103,48 @@ def test_auth0_sdk_verifies_signed_tokens_and_caches_discovery_and_keys(signed_t
     for _ in range(2):
         response = client.get("/api/v1/me", headers={"Authorization": f"Bearer {mint()}"})
         assert response.status_code == 200
-        assert response.json()["user_id"] == "device-client@clients"
+        assert response.json()["device_id"] == "device-client@clients"
+        assert "user_id" not in response.json()
     assert state["requests"] == [
         "https://issuer.example/.well-known/openid-configuration",
         "https://issuer.example/.well-known/jwks.json",
     ]
+
+
+@pytest.mark.parametrize("client_claim", ["azp", "client_id"])
+def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
+    signed_tokens, repository, traffic_payload, monkeypatch, client_claim
+):
+    mint, state = signed_tokens
+    token = mint(
+        state["claims"]
+        | {DEVICE_ID_CLAIM: "issuer-bound-device", client_claim: "issuer-bound-client"}
+    )
+    monkeypatch.setitem(app.dependency_overrides, get_mongo_repository, lambda: repository)
+    monkeypatch.setitem(app.dependency_overrides, get_encryption_keys, lambda: EncryptionKeys({}))
+    signed_client = TestClient(app, base_url="https://testserver", client=("2001:db8::1", 50000))
+    response = signed_client.post(
+        "/api/v1/traffic-log-batches",
+        content=gzip.compress(json.dumps({"logs": [traffic_payload]}).encode()),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Content-Encoding": "gzip",
+            "X-Forwarded-For": "198.51.100.1",
+        },
+    )
+    assert response.status_code == 202
+    stored = repository.insert_traffic_logs.call_args.args[0][0]
+    assert stored["metadata"] == {
+        "device_id": "issuer-bound-device",
+    }
+    assert stored["client_id"] == "issuer-bound-client"
+    assert stored["source_ip"] == "2001:db8::1"
+    repository.get_device_configuration.assert_awaited_once_with("issuer-bound-device")
+    assert signed_client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"}).json() == {
+        "device_id": "issuer-bound-device",
+        "client_id": "issuer-bound-client",
+    }
 
 
 @pytest.mark.parametrize(
@@ -113,6 +155,9 @@ def test_auth0_sdk_verifies_signed_tokens_and_caches_discovery_and_keys(signed_t
         {"exp": 1},
         {"sub": ""},
         {"sub": 123},
+        {DEVICE_ID_CLAIM: ""},
+        {"azp": None},
+        {"client_id": ["invalid"]},
         {"cnf": {"jkt": "proof-bound-token"}},
     ],
 )

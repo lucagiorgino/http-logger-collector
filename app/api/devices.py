@@ -13,7 +13,11 @@ from app.schemas.devices import (
     EncryptionParameters,
     ReportedConfigurationStatus,
 )
-from app.services.traffic_service import authenticated_subject
+from app.services.traffic_service import (
+    authenticated_identity,
+    authorized_device_id,
+    can_manage_devices,
+)
 
 router = APIRouter(prefix="/api/v1/devices", tags=["device configuration"])
 DeviceID = Annotated[str, Path(min_length=1, max_length=255)]
@@ -41,18 +45,33 @@ def configuration_response(
     )
 
 
-@router.get("/{device_id}/configuration", response_model=DeviceConfiguration)
+def require_device_management(claims: dict) -> None:
+    authenticated_identity(claims)
+    if not can_manage_devices(claims):
+        raise HTTPException(status_code=403, detail="manage:devices permission is required")
+
+
+@router.get(
+    "/{device_id}/configuration",
+    response_model=DeviceConfiguration,
+    responses={401: {}, 403: {}, 503: {}},
+)
 async def get_configuration(
     device_id: DeviceID,
     claims: AuthenticatedClaims,
     repository: MongoRepositoryDep,
     keys: EncryptionKeysDep,
 ) -> DeviceConfiguration:
-    document = await repository.get_device_configuration(authenticated_subject(claims), device_id)
+    authorized_device_id(claims, device_id)
+    document = await repository.get_device_configuration(device_id)
     return configuration_response(device_id, document, keys)
 
 
-@router.patch("/{device_id}/configuration", response_model=DeviceConfiguration)
+@router.patch(
+    "/{device_id}/configuration",
+    response_model=DeviceConfiguration,
+    responses={401: {}, 403: {}, 409: {}, 503: {}},
+)
 async def patch_configuration(
     device_id: DeviceID,
     payload: ConfigurationPatch,
@@ -60,27 +79,22 @@ async def patch_configuration(
     repository: MongoRepositoryDep,
     keys: EncryptionKeysDep,
 ) -> DeviceConfiguration:
-    subject = authenticated_subject(claims)
-    permissions = claims.get("permissions", [])
-    scope = claims.get("scope", "")
-    if not (
-        isinstance(permissions, list)
-        and "manage:devices" in permissions
-        or isinstance(scope, str)
-        and "manage:devices" in scope.split()
-    ):
-        raise HTTPException(status_code=403, detail="manage:devices permission is required")
+    require_device_management(claims)
     if payload.encryption_mode != "tls_only" and keys.public_key is None:
         raise HTTPException(status_code=503, detail="Application encryption is unavailable")
     document = await repository.update_device_configuration(
-        subject, device_id, payload.expected_version, payload.encryption_mode
+        device_id, payload.expected_version, payload.encryption_mode
     )
     if document is None:
         raise HTTPException(status_code=409, detail="Device configuration version has changed")
     return configuration_response(device_id, document, keys)
 
 
-@router.put("/{device_id}/configuration-status", response_model=ReportedConfigurationStatus)
+@router.put(
+    "/{device_id}/configuration-status",
+    response_model=ReportedConfigurationStatus,
+    responses={401: {}, 403: {}, 409: {}, 503: {}},
+)
 async def put_configuration_status(
     device_id: DeviceID,
     payload: ConfigurationStatus,
@@ -88,8 +102,11 @@ async def put_configuration_status(
     repository: MongoRepositoryDep,
     keys: EncryptionKeysDep,
 ) -> ReportedConfigurationStatus:
-    subject = authenticated_subject(claims)
-    document = await repository.get_device_configuration(subject, device_id)
+    if authenticated_identity(claims).device_id != device_id:
+        raise HTTPException(
+            status_code=403, detail="Only the authenticated device can report status"
+        )
+    document = await repository.get_device_configuration(device_id)
     if payload.version != document["version"]:
         raise HTTPException(status_code=409, detail="Device configuration version has changed")
     if (
@@ -99,6 +116,6 @@ async def put_configuration_status(
     ):
         raise HTTPException(status_code=422, detail="Applied encryption capability/key mismatch")
     report = ReportedConfigurationStatus(**payload.model_dump(), reported_at=datetime.now(UTC))
-    if not await repository.report_device_configuration(subject, device_id, report.model_dump()):
+    if not await repository.report_device_configuration(device_id, report.model_dump()):
         raise HTTPException(status_code=409, detail="Device configuration version has changed")
     return report
