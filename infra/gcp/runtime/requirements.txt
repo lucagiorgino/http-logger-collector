@@ -1,0 +1,4 @@
+google-cloud-kms>=3.5,<4
+google-cloud-secret-manager>=2.20,<3
+google-crc32c>=1.6,<2
+cryptography>=44,<47

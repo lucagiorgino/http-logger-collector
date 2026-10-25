@@ -1,0 +1,26 @@
+project_id      = "your-gcp-project"
+region          = "europe-west1"
+environment     = "production"
+domain          = "logs.example.com"
+auth0_domain    = "your-tenant.eu.auth0.com"
+auth0_audience  = "https://logs.example.com/api"
+auth0_client_id = "your-regular-web-application-client-id"
+
+# First apply false. Publish images and populate secrets before setting true.
+deploy_services    = false
+backend_image_tag  = "release-1"
+frontend_image_tag = "release-1"
+mongo_db_name      = "http_logger_production"
+
+secret_versions = {
+  mongo_uri           = "1"
+  redis_url           = "1"
+  ec_keyset           = "1"
+  auth0_client_secret = "1"
+  auth0_session       = "1"
+}
+
+worker_instances         = 2
+max_instances            = 10
+deletion_protection      = true
+enable_memorystore_cache = false # Not a compatible ingestion queue; see README.
