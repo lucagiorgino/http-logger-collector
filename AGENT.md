@@ -20,6 +20,26 @@ Read the relevant file before starting a task and update it when the design chan
 - [Runbook](docs/RUNBOOK.md): setup, tests and operations.
 - [Plan](docs/PLAN.md): remaining verification gates, not duplicated design.
 
+## Optional agent skills
+
+Skills are local coding-assistant tooling, not application dependencies; building,
+running and testing the product does not require them. The only project skill is
+**`auth0`** from [Auth0's official agent-skills repository](https://github.com/auth0/agent-skills).
+It covers both FastAPI and Next.js through framework-specific references.
+
+To restore it from the repository root, use Node.js 22.20+ and npm:
+
+```bash
+DO_NOT_TRACK=1 npx --yes skills add auth0/agent-skills --skill auth0 --agent github-copilot --yes
+```
+
+This installs the current upstream skill at `.agents/skills/auth0/SKILL.md` and
+generates `skills-lock.json`. Both are intentionally ignored, as is the alternate
+`skill-lock.json` filename; do not commit downloaded skills or their lock files.
+No upstream skill version is pinned by this repository. See the
+[Skills CLI reference](https://github.com/vercel-labs/skills/blob/main/docs/commands.md#skills-add)
+for other agents or a global installation.
+
 ## Always keep in mind
 - Secrets belong in git-ignored `.env` files or externally provisioned Kubernetes Secrets, never in source files or logs.
 - Authentication and authorization are mandatory for every sensitive route.

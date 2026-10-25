@@ -16,6 +16,9 @@ venv/
 .secrets/
 
 # Local tooling and outputs
+/.agents/
+/skills-lock.json
+/skill-lock.json
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
