@@ -111,7 +111,7 @@ export default async function Devices({ searchParams }) {
               <TableHeader>
                 <TableRow className="bg-muted/50">
                   <TableHead className="pl-6">Device / identity</TableHead>
-                  <TableHead>Encryption policy</TableHead>
+                  <TableHead>Transfer Encryption policy</TableHead>
                   <TableHead>Version</TableHead>
                   <TableHead>Registration</TableHead>
                   <TableHead className="pr-6 text-right">
