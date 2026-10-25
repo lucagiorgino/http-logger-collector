@@ -113,6 +113,8 @@ def test_record_lookup_is_device_scoped(
     document = normalize_traffic_log(
         TrafficLogRequest(**traffic_payload), "batch-123", trusted_context
     )
+    document.update(document.pop("ingestion"))
+    document.update(document.pop("logdata"))
     del document["client_id"]
     document["headers"] = document.pop("request_headers")
     for field in (

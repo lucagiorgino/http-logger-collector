@@ -96,16 +96,22 @@ def test_real_transit_envelope_rotation_cas_and_runtime_permissions(monkeypatch)
                 ]
                 assert first.startswith("vault:v1:") and second.startswith("vault:v1:")
                 assert first != second
-                assert storage.decrypt(documents[0])["body"] == payload.body
-                tampered = {**documents[0], "batch_id": "different-batch"}
+                assert storage.decrypt(documents[0])["logdata"]["body"] == payload.body
+                tampered = {
+                    **documents[0],
+                    "ingestion": {**documents[0]["ingestion"], "batch_id": "different-batch"},
+                }
                 with pytest.raises(KMSUnavailable):
                     storage.decrypt(tampered)
                 command("rotate-storage")
-                assert storage.decrypt(documents[0])["body"] == payload.body
+                assert storage.decrypt(documents[0])["logdata"]["body"] == payload.body
                 current = normalize_traffic_log(payload, "storage-batch", context)
                 asyncio.run(storage.protect([current], [payload], StoragePolicy()))
                 assert current["storage_encryption"]["ciphertext"].startswith("vault:v2:")
-                assert storage.decrypt(current)["request_headers"]["Authorization"] == "test-secret"
+                assert (
+                    storage.decrypt(current)["logdata"]["request_headers"]["Authorization"]
+                    == "test-secret"
+                )
                 keys = parse_keyset(runtime.load_keyset())
                 compressed = gzip.compress(b'{"logs": []}')
                 envelope = jwe.encrypt_compact(

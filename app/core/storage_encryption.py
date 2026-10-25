@@ -73,7 +73,7 @@ class StorageEncryption:
             "purpose": "traffic-sensitive-fields-v1",
             "record_id": str(document["_id"]),
             "device_id": document["metadata"]["device_id"],
-            "batch_id": document["batch_id"],
+            "batch_id": document.get("ingestion", document)["batch_id"],
             "fields": document["storage_encryption"]["fields"],
         }
         return base64.b64encode(
@@ -121,16 +121,17 @@ class StorageEncryption:
         entries = []
         protected = []
         for document, payload in zip(documents, payloads, strict=True):
+            logdata = document["logdata"]
             values: dict[str, Any] = {}
             fields = []
             if not policy.retain_request_body:
-                document.pop("body", None)
+                logdata.pop("body", None)
             elif payload.body is not None:
                 if policy.encrypt_request_body:
                     values["body"] = payload.body
                     fields.append("body")
                 else:
-                    document["body"] = payload.body
+                    logdata["body"] = payload.body
             for name, source in (
                 ("request_headers", payload.request_headers),
                 ("response_headers", payload.response_headers),
@@ -152,7 +153,7 @@ class StorageEncryption:
                         else policy.retain_cookies
                     )
                     if not retain:
-                        document[name].pop(header, None)
+                        logdata[name].pop(header, None)
                         continue
                     enabled = (
                         policy.encrypt_authorization_header
@@ -161,11 +162,11 @@ class StorageEncryption:
                     )
                     if enabled:
                         values.setdefault(name, {})[header] = value
-                        document[name][header] = ENCRYPTED
+                        logdata[name][header] = ENCRYPTED
                         if category not in fields:
                             fields.append(category)
                     else:
-                        document[name][header] = value
+                        logdata[name][header] = value
             if values:
                 document["storage_encryption"] = {"version": 1, "fields": sorted(fields)}
                 entries.append(
@@ -228,10 +229,13 @@ class StorageEncryption:
                 raise ValueError()
             values = SensitiveFields.model_validate_json(base64.b64decode(encoded, validate=True))
             result = {**document}
+            logdata = result
+            if "logdata" in document:
+                logdata = result["logdata"] = {**document["logdata"]}
             if "body" in values.model_fields_set:
-                result["body"] = values.body
+                logdata["body"] = values.body
             for name in ("request_headers", "response_headers"):
-                result[name] = {**document.get(name, {}), **getattr(values, name)}
+                logdata[name] = {**logdata.get(name, {}), **getattr(values, name)}
             return result
         except (KeyError, TypeError, ValueError, ValidationError):
             raise KMSUnavailable("Invalid OpenBao storage plaintext") from None

@@ -154,8 +154,8 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
         "device_id": "issuer-bound-device",
         "suspicious": False,
     }
-    assert stored["client_id"] == "issuer-bound-client"
-    assert stored["source_ip"] == "2001:db8::1"
+    assert stored["ingestion"]["client_id"] == "issuer-bound-client"
+    assert stored["ingestion"]["source_ip"] == "2001:db8::1"
     repository.get_device_configuration.assert_awaited_once_with("issuer-bound-device")
     assert signed_client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"}).json() == {
         "device_id": "issuer-bound-device",

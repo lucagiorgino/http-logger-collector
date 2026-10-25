@@ -175,8 +175,11 @@ class MongoRepository:
                 name="device_timestamp",
             ),
             IndexModel([("timestamp", DESCENDING), ("_id", DESCENDING)], name="timestamp_id"),
-            IndexModel([("received_at", DESCENDING)], name="received_at"),
-            IndexModel([("batch_id", ASCENDING), ("_id", ASCENDING)], name="batch_record"),
+            IndexModel([("ingestion.received_at", DESCENDING)], name="ingestion_received_at"),
+            IndexModel(
+                [("ingestion.batch_id", ASCENDING), ("_id", ASCENDING)],
+                name="ingestion_batch_record",
+            ),
         ]
         try:
             try:
@@ -222,10 +225,11 @@ class MongoRepository:
             raise PersistenceError("Failed to persist traffic log batch") from exc
 
     async def insert_queued_traffic_logs(self, documents: list[dict[str, Any]]) -> None:
+        batch_field = "ingestion.batch_id" if "ingestion" in documents[0] else "batch_id"
         try:
             cursor = self.traffic_logs.with_options(read_concern=ReadConcern("majority")).find(
                 {
-                    "batch_id": documents[0]["batch_id"],
+                    batch_field: documents[0].get("ingestion", documents[0])["batch_id"],
                     "_id": {"$in": [document["_id"] for document in documents]},
                 },
                 {"_id": 1},
@@ -265,7 +269,9 @@ class MongoRepository:
             ]
         try:
             return await (
-                self.analysis_logs.find(query, {"body": 0, "storage_encryption.ciphertext": 0})
+                self.analysis_logs.find(
+                    query, {"logdata.body": 0, "body": 0, "storage_encryption.ciphertext": 0}
+                )
                 .sort([("timestamp", DESCENDING), ("_id", DESCENDING)])
                 .limit(limit)
                 .to_list(length=limit)

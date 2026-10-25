@@ -36,21 +36,27 @@ def encode_cursor(document: dict[str, Any]) -> str:
 
 
 def stored_log(document: dict[str, Any], *, include_body: bool = False) -> StoredTrafficLog:
+    logdata = document.get("logdata", document)
+    ingestion = document.get("ingestion", document)
     request_headers = redact_sensitive_headers(
-        document.get("request_headers", document.get("headers", {}))
+        logdata.get("request_headers", logdata.get("headers", {}))
     )
     return StoredTrafficLog(
         id=str(document["_id"]),
         device_id=document["metadata"]["device_id"],
         suspicious=document["metadata"].get("suspicious", False),
-        client_id=document.get("client_id"),
+        client_id=ingestion.get("client_id"),
+        batch_id=ingestion["batch_id"],
+        received_at=ingestion["received_at"],
+        source_ip=ingestion["source_ip"],
+        timestamp=document["timestamp"],
         headers=request_headers,
         request_headers=request_headers,
-        response_headers=redact_sensitive_headers(document.get("response_headers", {})),
-        body=document.get("body") if include_body else None,
+        response_headers=redact_sensitive_headers(logdata.get("response_headers", {})),
+        body=logdata.get("body") if include_body else None,
         storage_encrypted_fields=document.get("storage_encryption", {}).get("fields", []),
         **{
-            key: document[key]
+            key: logdata[key]
             for key in (
                 "captured_source_ip",
                 "destination_ip",
@@ -64,18 +70,14 @@ def stored_log(document: dict[str, Any], *, include_body: bool = False) -> Store
                 "process_id",
                 "request_id",
             )
-            if key in document
+            if key in logdata
         },
         **{
-            key: document[key]
+            key: logdata[key]
             for key in (
-                "batch_id",
-                "timestamp",
-                "received_at",
                 "method",
                 "url",
                 "status_code",
-                "source_ip",
                 "body_length",
                 "body_sha256",
             )

@@ -73,7 +73,7 @@ class RedisStreamQueue:
 
     async def publish(self, batch_id: str, documents: list[dict[str, Any]]) -> BatchReceipt:
         payload = await asyncio.to_thread(
-            BSON.encode, {"version": 1, "batch_id": batch_id, "documents": documents}
+            BSON.encode, {"version": 2, "batch_id": batch_id, "documents": documents}
         )
         try:
             # Both commands must use the same connection: WAITAOF covers this XADD.
@@ -122,7 +122,7 @@ class RedisStreamQueue:
         batch_id = envelope.get("batch_id")
         version = envelope.get("version")
         if (
-            version != 1
+            version not in (1, 2)
             or not isinstance(batch_id, str)
             or not batch_id
             or not isinstance(documents, list)
@@ -130,7 +130,13 @@ class RedisStreamQueue:
             or any(
                 not isinstance(document, dict)
                 or not isinstance(document.get("_id"), ObjectId)
-                or document.get("batch_id") != batch_id
+                or (
+                    document.get("batch_id") != batch_id
+                    if version == 1
+                    else not isinstance(document.get("ingestion"), dict)
+                    or document["ingestion"].get("batch_id") != batch_id
+                    or not isinstance(document.get("logdata"), dict)
+                )
                 for document in documents
             )
         ):

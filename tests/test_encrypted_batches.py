@@ -42,12 +42,12 @@ def test_encrypted_single_log_is_decrypted_validated_and_redacted(
     assert response.status_code == 200
     assert response.json()["accepted_count"] == 1
     stored = repository.insert_traffic_logs.call_args.args[0][0]
-    assert stored["request_headers"]["Authorization"] == "[ENCRYPTED]"
-    assert stored["response_headers"]["Set-Cookie"] == "[ENCRYPTED]"
-    assert stored["destination_ip"] == rich_traffic_payload["destination_ip"]
-    assert stored["response_size_bytes"] == rich_traffic_payload["response_size_bytes"]
-    assert stored["process_name"] == rich_traffic_payload["process_name"]
-    assert "body" not in stored
+    assert stored["logdata"]["request_headers"]["Authorization"] == "[ENCRYPTED]"
+    assert stored["logdata"]["response_headers"]["Set-Cookie"] == "[ENCRYPTED]"
+    assert stored["logdata"]["destination_ip"] == rich_traffic_payload["destination_ip"]
+    assert stored["logdata"]["response_size_bytes"] == rich_traffic_payload["response_size_bytes"]
+    assert stored["logdata"]["process_name"] == rich_traffic_payload["process_name"]
+    assert "body" not in stored["logdata"]
     assert "ciphertext" not in stored
 
 

@@ -37,21 +37,29 @@ def test_compressed_batch_is_normalized_before_durable_acceptance(
     documents = repository.insert_traffic_logs.call_args.args[0]
     assert len({document["_id"] for document in documents}) == 2
     for document in documents:
-        assert document["batch_id"] == receipt["batch_id"]
+        assert set(document) == {
+            "_id",
+            "timestamp",
+            "metadata",
+            "ingestion",
+            "logdata",
+            "storage_encryption",
+        }
+        assert document["ingestion"]["batch_id"] == receipt["batch_id"]
         assert document["metadata"] == {"device_id": "device-456", "suspicious": False}
-        assert document["client_id"] == "oauth-client-123"
-        assert document["source_ip"] == "203.0.113.10"
+        assert document["ingestion"]["client_id"] == "oauth-client-123"
+        assert document["ingestion"]["source_ip"] == "203.0.113.10"
         assert document["timestamp"].isoformat() == "2026-01-15T08:00:00+00:00"
-        assert document["method"] == "GET"
-        assert document["request_headers"] == {
+        assert document["logdata"]["method"] == "GET"
+        assert document["logdata"]["request_headers"] == {
             "Authorization": "[ENCRYPTED]",
             "Cookie": "[ENCRYPTED]",
             "User-Agent": "TestAgent",
         }
-        assert "body" not in document
+        assert "body" not in document["logdata"]
         assert document["storage_encryption"]["ciphertext"].startswith("vault:v1:")
-        assert document["body_length"] == len(traffic_payload["body"].encode())
-        assert document["body_sha256"]
+        assert document["logdata"]["body_length"] == len(traffic_payload["body"].encode())
+        assert document["logdata"]["body_sha256"]
 
 
 def test_complete_http_event_is_stored_and_read_back(
@@ -81,7 +89,7 @@ def test_complete_http_event_is_stored_and_read_back(
             "process_id",
             "request_id",
         ):
-            assert document[field] == rich_traffic_payload[field]
+            assert document["logdata"][field] == rich_traffic_payload[field]
             assert record[field] == rich_traffic_payload[field]
         assert record["source_ip"] == "203.0.113.10"
         assert (
@@ -205,12 +213,23 @@ def test_large_valid_url_and_zero_metrics_are_not_silently_dropped(
     assert response.status_code == 200
     document = repository.insert_traffic_logs.call_args.args[0][0]
     for field in ("url", "request_size_bytes", "response_size_bytes", "duration_ms", "process_id"):
-        assert document[field] == payload[field]
+        assert document["logdata"][field] == payload[field]
 
 
 @pytest.mark.parametrize(
     "field",
-    ["user_id", "device_id", "client_id", "source_ip", "metadata", "received_at", "batch_id"],
+    [
+        "user_id",
+        "device_id",
+        "client_id",
+        "source_ip",
+        "metadata",
+        "received_at",
+        "batch_id",
+        "ingestion",
+        "logdata",
+        "storage_encryption",
+    ],
 )
 def test_client_attribution_is_rejected_before_any_write(
     authorized_client, repository, traffic_payload, field
@@ -246,8 +265,8 @@ def test_missing_device_claim_uses_subject_and_ignores_untrusted_forwarding_head
         "device_id": "oauth-client@clients",
         "suspicious": False,
     }
-    assert document["client_id"] is None
-    assert document["source_ip"] == "203.0.113.10"
+    assert document["ingestion"]["client_id"] is None
+    assert document["ingestion"]["source_ip"] == "203.0.113.10"
     repository.get_device_configuration.assert_awaited_once_with("oauth-client@clients")
 
 
@@ -269,7 +288,7 @@ def test_forwarded_ip_requires_a_trusted_proxy(
     )
     assert response.status_code == 200
     document = repository.insert_traffic_logs.call_args.args[0][0]
-    assert document["source_ip"] == expected_ip
+    assert document["ingestion"]["source_ip"] == expected_ip
 
 
 @pytest.mark.parametrize("peer", ["2001:db8::123", None, "invalid-network-address"])
@@ -283,7 +302,7 @@ def test_network_addresses_are_validated_without_inventing_an_ip(
         repository.insert_traffic_logs.assert_not_awaited()
     else:
         assert response.status_code == 200
-        assert repository.insert_traffic_logs.call_args.args[0][0]["source_ip"] == peer
+        assert repository.insert_traffic_logs.call_args.args[0][0]["ingestion"]["source_ip"] == peer
 
 
 @pytest.mark.parametrize("device_id", ["", " ", None, 123, ["forged"], "x" * 256])
@@ -379,7 +398,8 @@ def test_publisher_can_be_replaced_without_changing_api(
     assert response.json()["status"] == "queued"
     publisher.publish.assert_awaited_once()
     assert (
-        publisher.publish.call_args.args[1][0]["request_headers"]["Authorization"] == "[ENCRYPTED]"
+        publisher.publish.call_args.args[1][0]["logdata"]["request_headers"]["Authorization"]
+        == "[ENCRYPTED]"
     )
     queued = publisher.publish.call_args.args[1][0]
     assert queued["storage_encryption"]["ciphertext"].startswith("vault:v1:")

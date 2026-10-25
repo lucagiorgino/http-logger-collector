@@ -31,7 +31,9 @@ def document(traffic_payload, trusted_context):
     document = normalize_traffic_log(
         TrafficLogRequest.model_validate(traffic_payload), str(uuid4()), trusted_context
     )
-    document["received_at"] = document["received_at"].replace(microsecond=123000)
+    document["ingestion"]["received_at"] = document["ingestion"]["received_at"].replace(
+        microsecond=123000
+    )
     return document
 
 
@@ -58,7 +60,7 @@ def queue():
 
 def test_publisher_preserves_bson_and_waits_for_durability_on_the_same_connection(queue, document):
     publisher, client, pipeline = queue
-    receipt = asyncio.run(publisher.publish(document["batch_id"], [document]))
+    receipt = asyncio.run(publisher.publish(document["ingestion"]["batch_id"], [document]))
     assert receipt.status == "queued"
     assert receipt.accepted_count == 1
     client.pipeline.assert_called_once_with(transaction=False)
@@ -73,7 +75,7 @@ def test_full_or_unconfirmed_queue_is_not_acknowledged(queue, document, outcome)
     publisher, _, pipeline = queue
     pipeline.execute.return_value = outcome
     with pytest.raises(PersistenceError):
-        asyncio.run(publisher.publish(document["batch_id"], [document]))
+        asyncio.run(publisher.publish(document["ingestion"]["batch_id"], [document]))
 
 
 def test_collector_returns_queued_without_waiting_for_mongo_writes(
@@ -92,7 +94,7 @@ def test_collector_returns_queued_without_waiting_for_mongo_writes(
     repository.insert_traffic_logs.assert_not_awaited()
     payload = pipeline.eval.call_args.args[-1]
     queued = publisher.decode(b"1-0", {b"payload": payload}).documents[0]
-    assert "body" not in queued
+    assert "body" not in queued["logdata"]
     assert queued["storage_encryption"]["ciphertext"].startswith("vault:v1:")
     assert traffic_payload["body"].encode() not in payload
 
@@ -150,8 +152,8 @@ def test_concurrent_collectors_progress_with_stalled_mongo_and_full_fastapi_thre
                 {
                     b"payload": BSON.encode(
                         {
-                            "version": 1,
-                            "batch_id": document["batch_id"],
+                            "version": 2,
+                            "batch_id": document["ingestion"]["batch_id"],
                             "documents": [document],
                         }
                     )
@@ -230,7 +232,7 @@ def test_worker_does_not_acknowledge_failed_writes(queue, document):
     stream, client, pipeline = queue
     fields = {
         b"payload": BSON.encode(
-            {"version": 1, "batch_id": document["batch_id"], "documents": [document]}
+            {"version": 2, "batch_id": document["ingestion"]["batch_id"], "documents": [document]}
         )
     }
     client.xreadgroup.return_value = [(b"stream", [(b"1-0", fields)])]
@@ -246,7 +248,7 @@ def test_worker_acknowledges_only_after_successful_bulk_write(queue, document):
     stream, client, pipeline = queue
     fields = {
         b"payload": BSON.encode(
-            {"version": 1, "batch_id": document["batch_id"], "documents": [document]}
+            {"version": 2, "batch_id": document["ingestion"]["batch_id"], "documents": [document]}
         )
     }
     client.xautoclaim.return_value = [b"0-0", [(b"1-0", fields)], []]
@@ -306,8 +308,38 @@ def test_redis_rejects_policies_that_can_evict_accepted_logs(queue):
 
 def test_unknown_queue_envelope_version_is_rejected(document):
     payload = BSON.encode(
-        {"version": 999, "batch_id": document["batch_id"], "documents": [document]}
+        {"version": 999, "batch_id": document["ingestion"]["batch_id"], "documents": [document]}
     )
+    with pytest.raises(InvalidQueuedBatch):
+        RedisStreamQueue.decode(b"1-0", {b"payload": payload})
+
+
+def test_worker_can_recover_previously_queued_flat_records(queue, document):
+    document.update(document.pop("ingestion"))
+    document.update(document.pop("logdata"))
+    stream, client, pipeline = queue
+    fields = {
+        b"payload": BSON.encode(
+            {"version": 1, "batch_id": document["batch_id"], "documents": [document]}
+        )
+    }
+    client.xautoclaim.return_value = [b"0-0", [(b"1-0", fields)], []]
+    repository = AsyncMock()
+    assert asyncio.run(consume_once(stream, repository, "upgraded-worker"))
+    repository.insert_queued_traffic_logs.assert_awaited_once_with([document])
+    pipeline.xack.assert_called_once()
+
+
+@pytest.mark.parametrize("invalid", ["missing_ingestion", "wrong_batch", "missing_logdata"])
+def test_nested_queue_records_require_matching_batch_and_logdata(document, invalid):
+    batch_id = document["ingestion"]["batch_id"]
+    if invalid == "missing_ingestion":
+        document.pop("ingestion")
+    elif invalid == "wrong_batch":
+        document["ingestion"]["batch_id"] = "other-batch"
+    else:
+        document.pop("logdata")
+    payload = BSON.encode({"version": 2, "batch_id": batch_id, "documents": [document]})
     with pytest.raises(InvalidQueuedBatch):
         RedisStreamQueue.decode(b"1-0", {b"payload": payload})
 
@@ -338,10 +370,10 @@ def test_real_stream_reclaims_abandoned_messages_and_never_trims_pending(
 
     async def scenario():
         async with live_queue() as queue:
-            await queue.publish(document["batch_id"], [document])
+            await queue.publish(document["ingestion"]["batch_id"], [document])
             await queue.client.xreadgroup(queue.group, "crashed", {queue.stream: ">"}, count=1)
             with pytest.raises(PersistenceError, match="full"):
-                await queue.publish(document["batch_id"], [document])
+                await queue.publish(document["ingestion"]["batch_id"], [document])
             assert await queue.client.xlen(queue.stream) == 1
             monkeypatch.setattr(settings, "worker_reclaim_idle_ms", 1)
             await asyncio.sleep(0.02)
@@ -398,7 +430,7 @@ def test_real_collector_worker_and_recovery_after_mongo_write_before_ack(
                     assert await repository.traffic_logs.count_documents({}) == 1
                     assert await queue.client.xlen(queue.stream) == 0
                     stored = await repository.traffic_logs.find_one({})
-                    assert stored["batch_id"] == response.json()["batch_id"]
+                    assert stored["ingestion"]["batch_id"] == response.json()["batch_id"]
                     detail = await client.get(f"/api/v1/traffic-logs/{stored['_id']}")
                     assert detail.status_code == 200
                     assert detail.json()["body"] == traffic_payload["body"]
@@ -447,7 +479,7 @@ def test_standalone_worker_consumes_without_auth0_or_kms_and_stops_gracefully(
                     stderr=asyncio.subprocess.STDOUT,
                 )
                 try:
-                    await queue.publish(document["batch_id"], [document])
+                    await queue.publish(document["ingestion"]["batch_id"], [document])
                     async with asyncio.timeout(15):
                         while (
                             await repository.traffic_logs.count_documents({}) != 1

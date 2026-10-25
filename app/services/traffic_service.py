@@ -110,39 +110,43 @@ def normalize_traffic_log(
     body_bytes = payload.body.encode("utf-8") if payload.body is not None else None
     return {
         "_id": ObjectId(),
-        "batch_id": batch_id,
+        "timestamp": payload.timestamp,
         "metadata": {
             "device_id": context.identity.device_id,
             "suspicious": False,
         },
-        "client_id": context.identity.client_id,
-        "timestamp": payload.timestamp,
-        "received_at": datetime.now(UTC),
-        "method": payload.method,
-        "url": str(payload.url),
-        "status_code": payload.status_code,
-        "request_headers": redact_sensitive_headers(payload.request_headers),
-        "response_headers": redact_sensitive_headers(payload.response_headers),
-        "captured_source_ip": (
-            str(payload.captured_source_ip) if payload.captured_source_ip is not None else None
-        ),
-        "destination_ip": str(payload.destination_ip)
-        if payload.destination_ip is not None
-        else None,
-        **payload.model_dump(
-            include={
-                "source_port",
-                "destination_port",
-                "http_version",
-                "request_size_bytes",
-                "response_size_bytes",
-                "duration_ms",
-                "process_name",
-                "process_id",
-                "request_id",
-            }
-        ),
-        "source_ip": context.source_ip,
-        "body_length": len(body_bytes) if body_bytes is not None else 0,
-        "body_sha256": sha256(body_bytes).hexdigest() if body_bytes is not None else None,
+        "ingestion": {
+            "batch_id": batch_id,
+            "client_id": context.identity.client_id,
+            "source_ip": context.source_ip,
+            "received_at": datetime.now(UTC),
+        },
+        "logdata": {
+            "method": payload.method,
+            "url": str(payload.url),
+            "status_code": payload.status_code,
+            "request_headers": redact_sensitive_headers(payload.request_headers),
+            "response_headers": redact_sensitive_headers(payload.response_headers),
+            "captured_source_ip": (
+                str(payload.captured_source_ip) if payload.captured_source_ip is not None else None
+            ),
+            "destination_ip": str(payload.destination_ip)
+            if payload.destination_ip is not None
+            else None,
+            **payload.model_dump(
+                include={
+                    "source_port",
+                    "destination_port",
+                    "http_version",
+                    "request_size_bytes",
+                    "response_size_bytes",
+                    "duration_ms",
+                    "process_name",
+                    "process_id",
+                    "request_id",
+                }
+            ),
+            "body_length": len(body_bytes) if body_bytes is not None else 0,
+            "body_sha256": sha256(body_bytes).hexdigest() if body_bytes is not None else None,
+        },
     }

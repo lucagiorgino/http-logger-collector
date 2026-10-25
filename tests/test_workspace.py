@@ -171,12 +171,12 @@ def test_discarded_categories_do_not_require_encryption_and_omitted_choices_are_
     )
     assert response.status_code == 200
     document = repository.insert_traffic_logs.call_args.args[0][0]
-    assert "body" not in document
+    assert "body" not in document["logdata"]
     assert "storage_encryption" not in document
     body = traffic_payload["body"].encode("utf-8")
-    assert document["body_length"] == len(body)
-    assert document["body_sha256"] == sha256(body).hexdigest()
-    assert not document["request_headers"]
+    assert document["logdata"]["body_length"] == len(body)
+    assert document["logdata"]["body_sha256"] == sha256(body).hexdigest()
+    assert not document["logdata"]["request_headers"]
 
 
 @pytest.mark.parametrize(
@@ -196,10 +196,10 @@ def test_discard_removes_values_but_preserves_body_metadata_before_the_publisher
     asyncio.run(storage_encryption.protect([document], [payload], policy))
     restored = storage_encryption.decrypt(document)
     body_retained, auth_retained, cookies_retained = retained
-    assert restored.get("body") == (payload.body if body_retained else None)
+    assert restored["logdata"].get("body") == (payload.body if body_retained else None)
     body = payload.body.encode("utf-8")
-    assert document["body_length"] == len(body)
-    assert document["body_sha256"] == sha256(body).hexdigest()
+    assert document["logdata"]["body_length"] == len(body)
+    assert document["logdata"]["body_sha256"] == sha256(body).hexdigest()
     for name, headers in (
         ("request_headers", payload.request_headers),
         ("response_headers", payload.response_headers),
@@ -211,12 +211,12 @@ def test_discard_removes_values_but_preserves_body_metadata_before_the_publisher
                     if key.lower() in {"authorization", "proxy-authorization"}
                     else cookies_retained
                 )
-                assert (key in document[name]) is retain
+                assert (key in document["logdata"][name]) is retain
                 if retain:
-                    assert document[name][key] == "[ENCRYPTED]"
-                    assert restored[name][key] == value
+                    assert document["logdata"][name][key] == "[ENCRYPTED]"
+                    assert restored["logdata"][name][key] == value
                 else:
-                    assert key not in restored[name]
+                    assert key not in restored["logdata"][name]
     assert document.get("storage_encryption", {}).get("fields", []) == [
         name
         for name, retain in (
@@ -247,25 +247,27 @@ def test_each_storage_toggle_controls_only_its_fields_and_round_trips(
     policy = StoragePolicy(**dict(zip(FLAGS, enabled, strict=True)))
     asyncio.run(storage_encryption.protect([document], [payload], policy))
     body_enabled, auth_enabled, cookies_enabled = enabled
-    assert document.get("body") == (None if body_enabled else payload.body)
-    assert document["request_headers"]["Authorization"] == (
+    assert document["logdata"].get("body") == (None if body_enabled else payload.body)
+    assert document["logdata"]["request_headers"]["Authorization"] == (
         "[ENCRYPTED]" if auth_enabled else "private-credential"
     )
-    assert document["request_headers"]["Proxy-Authorization"] == (
+    assert document["logdata"]["request_headers"]["Proxy-Authorization"] == (
         "[ENCRYPTED]" if auth_enabled else "proxy-secret"
     )
-    assert document["request_headers"]["cOoKiE"] == (
+    assert document["logdata"]["request_headers"]["cOoKiE"] == (
         "[ENCRYPTED]" if cookies_enabled else "request-cookie"
     )
-    assert document["response_headers"]["Set-Cookie"] == (
+    assert document["logdata"]["response_headers"]["Set-Cookie"] == (
         "[ENCRYPTED]" if cookies_enabled else "private-cookie"
     )
-    assert document["request_headers"]["X-Api-Key"] == "[REDACTED]"
+    assert document["logdata"]["request_headers"]["X-Api-Key"] == "[REDACTED]"
     assert ("storage_encryption" in document) is any(enabled)
+    stored = deepcopy(document)
     restored = storage_encryption.decrypt(document)
-    assert restored["body"] == payload.body
-    assert restored["request_headers"]["Authorization"] == "private-credential"
-    assert restored["response_headers"]["Set-Cookie"] == "private-cookie"
+    assert restored["logdata"]["body"] == payload.body
+    assert restored["logdata"]["request_headers"]["Authorization"] == "private-credential"
+    assert restored["logdata"]["response_headers"]["Set-Cookie"] == "private-cookie"
+    assert document == stored
 
 
 @pytest.mark.parametrize("tampering", ["ciphertext", "device", "record", "batch", "fields"])
@@ -284,11 +286,27 @@ def test_ciphertext_is_authenticated_and_bound_to_its_record(
     elif tampering == "record":
         document["_id"] = "other-record"
     elif tampering == "batch":
-        document["batch_id"] = "other-batch"
+        document["ingestion"]["batch_id"] = "other-batch"
     else:
         document["storage_encryption"]["fields"] = ["body"]
     with pytest.raises(KMSUnavailable):
         storage_encryption.decrypt(document)
+
+
+def test_existing_flat_encrypted_records_remain_readable(
+    authorized_client, repository, traffic_payload, trusted_context, storage_encryption
+):
+    payload = TrafficLogRequest.model_validate(traffic_payload)
+    document = normalize_traffic_log(payload, "old-batch", trusted_context)
+    asyncio.run(storage_encryption.protect([document], [payload], StoragePolicy()))
+    document.update(document.pop("ingestion"))
+    document.update(document.pop("logdata"))
+    repository.get_traffic_log.return_value = document
+    response = authorized_client.get(f"/api/v1/traffic-logs/{document['_id']}")
+    assert response.status_code == 200
+    assert response.json()["batch_id"] == "old-batch"
+    assert response.json()["body"] == payload.body
+    assert response.json()["request_headers"]["Authorization"] == "[REDACTED]"
 
 
 def test_ingestion_fails_without_accepting_plaintext_when_configuration_or_kms_fails(

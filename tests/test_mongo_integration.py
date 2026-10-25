@@ -319,16 +319,26 @@ def test_time_series_ingestion_and_analysis_routing(
                     pytest.fail("Acknowledged logs did not reach the configured analysis node")
                 await asyncio.sleep(0.1)
             assert len({document["_id"] for document in documents}) == 2
-            assert all(document["batch_id"] == receipt.batch_id for document in documents)
+            assert all(
+                document["ingestion"]["batch_id"] == receipt.batch_id for document in documents
+            )
             assert documents[0]["metadata"] == {"device_id": "device", "suspicious": False}
-            assert documents[0]["client_id"] == "oauth-client"
-            assert documents[0]["source_ip"] == "127.0.0.1"
-            assert documents[0]["captured_source_ip"] == "192.0.2.10"
-            assert documents[0]["destination_ip"] == "203.0.113.50"
-            assert documents[0]["response_size_bytes"] == 1024
-            assert documents[0]["process_name"] == "chrome.exe"
-            assert documents[0]["request_headers"]["Authorization"] == "[ENCRYPTED]"
-            assert "body" not in documents[0]
+            assert documents[0]["ingestion"]["client_id"] == "oauth-client"
+            assert documents[0]["ingestion"]["source_ip"] == "127.0.0.1"
+            assert documents[0]["logdata"]["captured_source_ip"] == "192.0.2.10"
+            assert documents[0]["logdata"]["destination_ip"] == "203.0.113.50"
+            assert documents[0]["logdata"]["response_size_bytes"] == 1024
+            assert documents[0]["logdata"]["process_name"] == "chrome.exe"
+            assert documents[0]["logdata"]["request_headers"]["Authorization"] == "[ENCRYPTED]"
+            assert "body" not in documents[0]["logdata"]
+            batch_records = (
+                await repository.traffic_logs.find({"ingestion.batch_id": receipt.batch_id})
+                .hint("ingestion_batch_record")
+                .to_list(length=None)
+            )
+            assert {record["_id"] for record in batch_records} == {
+                document["_id"] for document in documents
+            }
             assert (
                 await repository.get_traffic_log(documents[0]["_id"], device_id="other-device")
                 is None
@@ -536,7 +546,7 @@ def test_device_policy_and_encrypted_ingestion_persist_end_to_end(
                 )
                 assert len(documents) == 2
                 assert all(
-                    document["request_headers"]["Authorization"] == "[ENCRYPTED]"
+                    document["logdata"]["request_headers"]["Authorization"] == "[ENCRYPTED]"
                     for document in documents
                 )
         finally:
@@ -590,7 +600,7 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 ).status_code == 200
                 encrypted = await repository.traffic_logs.find_one({})
                 assert traffic_payload["body"] not in repr(encrypted)
-                assert encrypted["request_headers"]["Authorization"] == "[ENCRYPTED]"
+                assert encrypted["logdata"]["request_headers"]["Authorization"] == "[ENCRYPTED]"
                 changes = await asyncio.gather(
                     *(
                         client.patch(
@@ -607,9 +617,9 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 plain = await repository.traffic_logs.find_one(
                     {"storage_encryption": {"$exists": False}}
                 )
-                assert plain["body"] == traffic_payload["body"]
-                assert plain["request_headers"]["Authorization"] == "secret"
-                assert plain["request_headers"]["Cookie"] == "session=secret"
+                assert plain["logdata"]["body"] == traffic_payload["body"]
+                assert plain["logdata"]["request_headers"]["Authorization"] == "secret"
+                assert plain["logdata"]["request_headers"]["Cookie"] == "session=secret"
                 for document in (encrypted, plain):
                     detail = await client.get(f"/api/v1/traffic-logs/{document['_id']}")
                     assert detail.status_code == 200
@@ -619,7 +629,7 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                     device_id="test-device", start_time=None, end_time=None, before=None, limit=10
                 )
                 assert len(summaries) == 2
-                assert all("body" not in document for document in summaries)
+                assert all("body" not in document["logdata"] for document in summaries)
                 assert all(
                     "ciphertext" not in document.get("storage_encryption", {})
                     for document in summaries
@@ -644,14 +654,14 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 )
                 assert uploaded.status_code == 200
                 discarded = await repository.traffic_logs.find_one(
-                    {"batch_id": uploaded.json()["batch_id"]}
+                    {"ingestion.batch_id": uploaded.json()["batch_id"]}
                 )
-                assert "body" not in discarded
+                assert "body" not in discarded["logdata"]
                 assert "storage_encryption" not in discarded
                 body = traffic_payload["body"].encode("utf-8")
-                assert discarded["body_length"] == len(body)
-                assert discarded["body_sha256"] == sha256(body).hexdigest()
-                assert not discarded["request_headers"]
+                assert discarded["logdata"]["body_length"] == len(body)
+                assert discarded["logdata"]["body_sha256"] == sha256(body).hexdigest()
+                assert not discarded["logdata"]["request_headers"]
                 detail = await client.get(f"/api/v1/traffic-logs/{discarded['_id']}")
                 assert detail.status_code == 200
                 assert detail.json()["body"] is None
