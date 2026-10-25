@@ -100,7 +100,9 @@ class StorageEncryption:
         for document, payload in zip(documents, payloads, strict=True):
             values: dict[str, Any] = {}
             fields = []
-            if payload.body is not None:
+            if not policy.retain_request_body:
+                document.pop("body", None)
+            elif payload.body is not None:
                 if policy.encrypt_request_body:
                     values["body"] = payload.body
                     fields.append("body")
@@ -120,6 +122,14 @@ class StorageEncryption:
                         else None
                     )
                     if category is None:
+                        continue
+                    retain = (
+                        policy.retain_authorization_header
+                        if category == "authorization"
+                        else policy.retain_cookies
+                    )
+                    if not retain:
+                        document[name].pop(header, None)
                         continue
                     enabled = (
                         policy.encrypt_authorization_header

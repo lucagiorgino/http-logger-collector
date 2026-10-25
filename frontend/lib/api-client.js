@@ -150,14 +150,12 @@ function expectedVersion(form) {
 
 export function workspaceUpdate(form) {
   const body = { expected_version: expectedVersion(form) };
-  for (const field of [
-    "encrypt_request_body",
-    "encrypt_authorization_header",
-    "encrypt_cookies",
-  ]) {
-    const value = form.get(field);
-    if (value !== null && value !== "on") throw new ApiError(422);
-    body[field] = value === "on";
+  for (const field of ["request_body", "authorization_header", "cookies"]) {
+    const mode = form.get(`${field}_storage`);
+    if (!["discard", "encrypted", "plaintext"].includes(mode))
+      throw new ApiError(422);
+    body[`retain_${field}`] = mode !== "discard";
+    body[`encrypt_${field}`] = mode !== "plaintext";
   }
   for (const field of ["retention_enabled", "suspicious_retention_enabled"]) {
     const value = form.get(field);

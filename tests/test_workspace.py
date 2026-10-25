@@ -3,6 +3,7 @@ import gzip
 import itertools
 import json
 from copy import deepcopy
+from hashlib import sha256
 
 import httpx2 as httpx
 import pytest
@@ -18,6 +19,7 @@ from app.services.traffic_service import normalize_traffic_log
 
 URL = "/api/v1/workspace/configuration"
 FLAGS = ("encrypt_request_body", "encrypt_authorization_header", "encrypt_cookies")
+RETAIN_FLAGS = ("retain_request_body", "retain_authorization_header", "retain_cookies")
 
 
 def operator():
@@ -110,6 +112,9 @@ def test_workspace_updates_are_versioned_strict_and_fail_closed(
     assert authorized_client.patch(URL, json={**policy, "expected_version": 0}).status_code == 409
     for invalid in (
         {**policy, "encrypt_cookies": "false"},
+        {**policy, "retain_request_body": "false"},
+        {**policy, "retain_authorization_header": 0},
+        {**policy, "retain_cookies": None},
         {**policy, "extra": True},
         {"encrypt_cookies": True},
     ):
@@ -136,6 +141,91 @@ def test_workspace_updates_are_versioned_strict_and_fail_closed(
         ).status_code
         == 200
     )
+
+
+def test_discarded_categories_do_not_require_encryption_and_omitted_choices_are_preserved(
+    authorized_client, repository, storage_encryption, monkeypatch, traffic_payload
+):
+    app.dependency_overrides[require_bearer_token] = operator
+    configuration = WorkspaceConfiguration(**dict.fromkeys(RETAIN_FLAGS, False)).model_dump()
+    repository.get_workspace_configuration.return_value = configuration
+    repository.update_workspace_configuration.return_value = {**configuration, "version": 1}
+
+    def unavailable(*args):
+        raise KMSUnavailable("KMS must not be called for discarded values")
+
+    monkeypatch.setattr(storage_encryption, "validate", unavailable)
+    monkeypatch.setattr(storage_encryption, "encrypt", unavailable)
+    response = authorized_client.patch(
+        URL, json={**dict.fromkeys(FLAGS, True), "expected_version": 0}
+    )
+    assert response.status_code == 200
+    assert all(response.json()[field] is False for field in RETAIN_FLAGS)
+    repository.update_workspace_configuration.assert_awaited_once_with(
+        0, dict.fromkeys(FLAGS, True)
+    )
+    response = authorized_client.post(
+        "/api/v1/traffic-log-batches",
+        content=gzip.compress(json.dumps({"logs": [traffic_payload]}).encode()),
+        headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
+    )
+    assert response.status_code == 202
+    document = repository.insert_traffic_logs.call_args.args[0][0]
+    assert "body" not in document
+    assert "storage_encryption" not in document
+    body = traffic_payload["body"].encode("utf-8")
+    assert document["body_length"] == len(body)
+    assert document["body_sha256"] == sha256(body).hexdigest()
+    assert not document["request_headers"]
+
+
+@pytest.mark.parametrize(
+    "retained",
+    [(False, True, True), (True, False, True), (True, True, False), (False, False, False)],
+)
+def test_discard_removes_values_but_preserves_body_metadata_before_the_publisher(
+    retained, rich_traffic_payload, trusted_context, storage_encryption
+):
+    rich_traffic_payload["request_headers"].update(
+        {"cOoKiE": "request-cookie", "Proxy-Authorization": "proxy-secret"}
+    )
+    rich_traffic_payload["response_headers"]["aUtHoRiZaTiOn"] = "response-secret"
+    payload = TrafficLogRequest.model_validate(rich_traffic_payload)
+    document = normalize_traffic_log(payload, "test-storage", trusted_context)
+    policy = StoragePolicy(**dict(zip(RETAIN_FLAGS, retained, strict=True)))
+    asyncio.run(storage_encryption.protect([document], [payload], policy))
+    restored = storage_encryption.decrypt(document)
+    body_retained, auth_retained, cookies_retained = retained
+    assert restored.get("body") == (payload.body if body_retained else None)
+    body = payload.body.encode("utf-8")
+    assert document["body_length"] == len(body)
+    assert document["body_sha256"] == sha256(body).hexdigest()
+    for name, headers in (
+        ("request_headers", payload.request_headers),
+        ("response_headers", payload.response_headers),
+    ):
+        for key, value in headers.items():
+            if key.lower() in {"authorization", "proxy-authorization", "cookie", "set-cookie"}:
+                retain = (
+                    auth_retained
+                    if key.lower() in {"authorization", "proxy-authorization"}
+                    else cookies_retained
+                )
+                assert (key in document[name]) is retain
+                if retain:
+                    assert document[name][key] == "[ENCRYPTED]"
+                    assert restored[name][key] == value
+                else:
+                    assert key not in restored[name]
+    assert document.get("storage_encryption", {}).get("fields", []) == [
+        name
+        for name, retain in (
+            ("authorization", auth_retained),
+            ("body", body_retained),
+            ("cookies", cookies_retained),
+        )
+        if retain
+    ]
 
 
 @pytest.mark.parametrize("enabled", list(itertools.product([False, True], repeat=3)))

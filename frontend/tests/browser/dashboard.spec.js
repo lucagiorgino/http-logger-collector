@@ -79,16 +79,12 @@ test("workspace encryption settings persist and reject stale edits without JavaS
   const page = await context.newPage();
   await page.goto("/settings");
   await expect(
-    page.getByRole("heading", { name: "Storage encryption", exact: true }),
+    page.getByRole("heading", { name: "Storage and encryption", exact: true }),
   ).toBeVisible();
-  for (const name of [
-    "Encrypt request body",
-    "Encrypt authorization header",
-    "Cookies",
-  ])
+  for (const name of ["Request body", "Authorization header", "Cookies"])
     await expect(
-      page.getByRole("checkbox", { name, exact: false }),
-    ).toBeChecked();
+      page.getByRole("combobox", { name: new RegExp(`^${name}`) }),
+    ).toHaveValue("encrypted");
   await expect(
     page.getByRole("heading", { name: "Retention policies", exact: true }),
   ).toBeVisible();
@@ -101,11 +97,11 @@ test("workspace encryption settings persist and reject stale edits without JavaS
   const stale = await context.newPage();
   await stale.goto("/settings");
   await page
-    .getByRole("checkbox", { name: "Encrypt request body", exact: false })
-    .uncheck();
+    .getByRole("combobox", { name: /^Request body/ })
+    .selectOption("discard");
   await page
-    .getByRole("checkbox", { name: "Encrypt cookies", exact: false })
-    .uncheck();
+    .getByRole("combobox", { name: /^Cookies/ })
+    .selectOption("plaintext");
   await page.getByLabel("Ordinary logs retention (days)").fill("14");
   await page.getByLabel("Suspicious logs retention (days)").fill("365");
   await page.getByLabel("Enable retention for suspicious logs").uncheck();
@@ -126,17 +122,14 @@ test("workspace encryption settings persist and reject stale edits without JavaS
     page.getByLabel("Enable retention for suspicious logs"),
   ).not.toBeChecked();
   await expect(
-    page.getByRole("checkbox", { name: "Encrypt request body", exact: false }),
-  ).not.toBeChecked();
+    page.getByRole("combobox", { name: /^Request body/ }),
+  ).toHaveValue("discard");
   await expect(
-    page.getByRole("checkbox", {
-      name: "Encrypt authorization header",
-      exact: false,
-    }),
-  ).toBeChecked();
-  await expect(
-    page.getByRole("checkbox", { name: "Encrypt cookies", exact: false }),
-  ).not.toBeChecked();
+    page.getByRole("combobox", { name: /^Authorization header/ }),
+  ).toHaveValue("encrypted");
+  await expect(page.getByRole("combobox", { name: /^Cookies/ })).toHaveValue(
+    "plaintext",
+  );
   await stale
     .getByRole("button", { name: "Save workspace configuration", exact: true })
     .click();
@@ -145,11 +138,11 @@ test("workspace encryption settings persist and reject stale edits without JavaS
     stale.getByText("Workspace configuration saved", { exact: true }),
   ).toHaveCount(0);
   await page
-    .getByRole("checkbox", { name: "Encrypt request body", exact: false })
-    .check();
+    .getByRole("combobox", { name: /^Request body/ })
+    .selectOption("encrypted");
   await page
-    .getByRole("checkbox", { name: "Encrypt cookies", exact: false })
-    .check();
+    .getByRole("combobox", { name: /^Cookies/ })
+    .selectOption("encrypted");
   await page.getByLabel("Ordinary logs retention (days)").fill("7");
   await page.getByLabel("Suspicious logs retention (days)").fill("30");
   await page.getByLabel("Enable retention for suspicious logs").check();

@@ -4,6 +4,9 @@ const configurations = new Map();
 let workspace = {
   version: 0,
   updated_at: null,
+  retain_request_body: true,
+  retain_authorization_header: true,
+  retain_cookies: true,
   encrypt_request_body: true,
   encrypt_authorization_header: true,
   encrypt_cookies: true,

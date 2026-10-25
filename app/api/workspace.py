@@ -29,18 +29,19 @@ async def patch_configuration(
     storage: StorageEncryptionDep,
 ) -> WorkspaceConfiguration:
     require_device_management(claims)
+    changes = payload.model_dump(exclude={"expected_version"}, exclude_unset=True)
+    policy = WorkspaceConfiguration.model_validate(
+        {**await repository.get_workspace_configuration(), **changes}
+    )
     if any(
         (
-            payload.encrypt_request_body,
-            payload.encrypt_authorization_header,
-            payload.encrypt_cookies,
+            policy.retain_request_body and policy.encrypt_request_body,
+            policy.retain_authorization_header and policy.encrypt_authorization_header,
+            policy.retain_cookies and policy.encrypt_cookies,
         )
     ):
         await run_in_threadpool(storage.validate)
-    document = await repository.update_workspace_configuration(
-        payload.expected_version,
-        payload.model_dump(exclude={"expected_version"}, exclude_unset=True),
-    )
+    document = await repository.update_workspace_configuration(payload.expected_version, changes)
     if document is None:
         raise HTTPException(status_code=409, detail="Workspace configuration version has changed")
     return WorkspaceConfiguration.model_validate(document)

@@ -7,6 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class StoragePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    retain_request_body: bool = Field(default=True, strict=True)
+    retain_authorization_header: bool = Field(default=True, strict=True)
+    retain_cookies: bool = Field(default=True, strict=True)
     encrypt_request_body: bool = Field(default=True, strict=True)
     encrypt_authorization_header: bool = Field(default=True, strict=True)
     encrypt_cookies: bool = Field(default=True, strict=True)

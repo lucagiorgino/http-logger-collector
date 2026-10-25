@@ -37,7 +37,7 @@ export default async function Workspace({ searchParams }) {
         <Alert>
           <AlertTitle>Workspace configuration saved</AlertTitle>
           <AlertDescription>
-            Storage encryption settings apply to future uploads. Retention
+            Storage and encryption settings apply to future uploads. Retention
             policies also apply to existing logs; expired logs are deleted
             automatically.
           </AlertDescription>
@@ -50,12 +50,13 @@ export default async function Workspace({ searchParams }) {
           <Card className="border shadow-none">
             <CardContent className="space-y-6 px-6">
               <div>
-                <h2 className="font-semibold">Storage encryption</h2>
+                <h2 className="font-semibold">Storage and encryption</h2>
                 <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                  Applies to all devices in this application. Enabled fields use
-                  a dedicated, non-exportable OpenBao AES-256-GCM storage key,
-                  separate from upload encryption. Authorization and cookie
-                  values remain redacted in API responses.
+                  Choose whether to retain each category for all devices.
+                  Retained values are encrypted by default using a dedicated,
+                  non-exportable OpenBao AES-256-GCM key, separate from upload
+                  encryption. Authorization and cookie values remain redacted in
+                  API responses.
                 </p>
               </div>
               <input
@@ -65,46 +66,58 @@ export default async function Workspace({ searchParams }) {
               />
               {[
                 [
-                  "encrypt_request_body",
-                  "Encrypt request body",
-                  "Retain the original body encrypted at rest; authorized request details can display it.",
+                  "request_body",
+                  "Request body",
+                  "Authorized request details can display retained bodies. Discarding removes only the body; its byte length and SHA-256 digest are kept.",
                 ],
                 [
-                  "encrypt_authorization_header",
-                  "Encrypt authorization header",
-                  "Protect Authorization and Proxy-Authorization header values.",
+                  "authorization_header",
+                  "Authorization header",
+                  "Controls Authorization and Proxy-Authorization in captured request and response headers.",
                 ],
                 [
-                  "encrypt_cookies",
-                  "Encrypt cookies",
-                  "Protect Cookie and Set-Cookie values in captured request and response headers.",
+                  "cookies",
+                  "Cookies",
+                  "Controls Cookie and Set-Cookie in captured request and response headers.",
                 ],
               ].map(([name, title, description]) => (
                 <label
                   key={name}
-                  className="flex cursor-pointer items-start gap-3 rounded-lg border p-4"
+                  className="block space-y-3 rounded-lg border p-4"
                 >
-                  <input
-                    type="checkbox"
-                    name={name}
-                    defaultChecked={configuration[name]}
-                    className="mt-1 size-4 accent-primary"
-                  />
                   <span>
                     <span className="block text-sm font-medium">{title}</span>
                     <span className="mt-1 block text-xs leading-5 text-muted-foreground">
                       {description}
                     </span>
+                    <select
+                      name={`${name}_storage`}
+                      defaultValue={
+                        configuration[`retain_${name}`] === false
+                          ? "discard"
+                          : configuration[`encrypt_${name}`] === false
+                            ? "plaintext"
+                            : "encrypted"
+                      }
+                      className="block w-full rounded-md border bg-background px-3 py-2 text-sm sm:max-w-64"
+                    >
+                      <option value="encrypted">
+                        Retain encrypted (default)
+                      </option>
+                      <option value="discard">Do not retain</option>
+                      <option value="plaintext">Retain plaintext</option>
+                    </select>
                   </span>
                 </label>
               ))}
               <Alert variant="destructive">
-                <AlertTitle>Disabling encryption stores plaintext</AlertTitle>
+                <AlertTitle>Storage choices affect future uploads</AlertTitle>
                 <AlertDescription>
-                  Unchecked categories are retained without field encryption for
-                  new uploads. Changes do not rewrite existing logs or recover
-                  previously discarded bodies. Only trusted operators with
-                  manage:devices can change these settings.
+                  Do not retain discards the selected information before
+                  storage. Retain plaintext deliberately stores it without
+                  encryption. Changes do not rewrite existing logs or recover
+                  discarded data. Only trusted operators with manage:devices can
+                  change these settings.
                 </AlertDescription>
               </Alert>
             </CardContent>

@@ -11,30 +11,60 @@ import {
 } from "../lib/api-client.js";
 import { backendSettings, missingAuthSettings } from "../lib/config.js";
 
-test("workspace updates parse encryption choices and the expected version", () => {
+test("workspace updates strictly parse storage modes and the expected version", () => {
   const form = new FormData();
   form.set("expected_version", "2");
-  form.set("encrypt_request_body", "on");
-  form.set("encrypt_cookies", "on");
+  form.set("request_body_storage", "encrypted");
+  form.set("authorization_header_storage", "plaintext");
+  form.set("cookies_storage", "discard");
+  form.set("retention_enabled", "on");
   form.set("retention_days", "7");
-  form.set("suspicious_retention_days", "30");
+  form.set("suspicious_retention_days", "90");
   assert.deepEqual(workspaceUpdate(form), {
     expected_version: 2,
+    retain_request_body: true,
+    retain_authorization_header: true,
+    retain_cookies: false,
     encrypt_request_body: true,
     encrypt_authorization_header: false,
     encrypt_cookies: true,
-    retention_enabled: false,
-    suspicious_retention_enabled: false,
+    retention_enabled: true,
     retention_days: 7,
-    suspicious_retention_days: 30,
+    suspicious_retention_enabled: false,
+    suspicious_retention_days: 90,
   });
-  form.set("encrypt_cookies", "false");
+  form.set("cookies_storage", "false");
   assert.throws(() => workspaceUpdate(form), ApiError);
+  form.set("cookies_storage", "encrypted");
+  form.set("expected_version", "-1");
+  assert.throws(() => workspaceUpdate(form), ApiError);
+});
+
+test("workspace requires an explicit valid storage choice for every category", () => {
+  const form = new FormData();
+  form.set("expected_version", "0");
+  form.set("retention_days", "7");
+  form.set("suspicious_retention_days", "30");
+  for (const field of ["request_body", "authorization_header", "cookies"])
+    form.set(`${field}_storage`, "encrypted");
+  for (const field of ["request_body", "authorization_header", "cookies"]) {
+    for (const value of ["", "on", "false", "unknown"]) {
+      form.set(`${field}_storage`, value);
+      assert.throws(() => workspaceUpdate(form), ApiError);
+    }
+    form.delete(`${field}_storage`);
+    assert.throws(() => workspaceUpdate(form), ApiError);
+    form.set(`${field}_storage`, "encrypted");
+  }
+  assert.equal(workspaceUpdate(form).encrypt_cookies, true);
 });
 
 test("workspace rejects invalid retention windows even when expiration is disabled", () => {
   const form = new FormData();
   form.set("expected_version", "0");
+  form.set("request_body_storage", "encrypted");
+  form.set("authorization_header_storage", "encrypted");
+  form.set("cookies_storage", "encrypted");
   form.set("retention_days", "7");
   form.set("suspicious_retention_days", "30");
   for (const field of ["retention_days", "suspicious_retention_days"]) {

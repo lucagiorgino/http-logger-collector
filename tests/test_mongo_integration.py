@@ -3,6 +3,7 @@ import gzip
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from time import monotonic
 from uuid import uuid4
 
@@ -619,6 +620,37 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 assert stored["version"] == 2
                 assert all(stored[flag] for flag in flags)
                 assert await repository.traffic_logs.count_documents({}) == 2
+                discard = {
+                    "retain_request_body": False,
+                    "retain_authorization_header": False,
+                    "retain_cookies": False,
+                }
+                saved = await client.patch(
+                    url, json={"expected_version": 2, **dict.fromkeys(flags, True), **discard}
+                )
+                assert saved.status_code == 200
+                assert all(saved.json()[field] is False for field in discard)
+                uploaded = await client.post(
+                    "/api/v1/traffic-log-batches", content=wire, headers=headers
+                )
+                assert uploaded.status_code == 202
+                discarded = await repository.traffic_logs.find_one(
+                    {"batch_id": uploaded.json()["batch_id"]}
+                )
+                assert "body" not in discarded
+                assert "storage_encryption" not in discarded
+                body = traffic_payload["body"].encode("utf-8")
+                assert discarded["body_length"] == len(body)
+                assert discarded["body_sha256"] == sha256(body).hexdigest()
+                assert not discarded["request_headers"]
+                detail = await client.get(f"/api/v1/traffic-logs/{discarded['_id']}")
+                assert detail.status_code == 200
+                assert detail.json()["body"] is None
+                assert detail.json()["body_length"] == len(body)
+                assert detail.json()["body_sha256"] == sha256(body).hexdigest()
+                assert detail.json()["request_headers"] == {}
+                historical = await client.get(f"/api/v1/traffic-logs/{encrypted['_id']}")
+                assert historical.json()["body"] == traffic_payload["body"]
         finally:
             app.dependency_overrides.clear()
             await repository.client.drop_database(repository.database.name)
