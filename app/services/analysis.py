@@ -42,6 +42,7 @@ def stored_log(document: dict[str, Any], *, include_body: bool = False) -> Store
     return StoredTrafficLog(
         id=str(document["_id"]),
         device_id=document["metadata"]["device_id"],
+        suspicious=document["metadata"].get("suspicious", False),
         client_id=document.get("client_id"),
         headers=request_headers,
         request_headers=request_headers,

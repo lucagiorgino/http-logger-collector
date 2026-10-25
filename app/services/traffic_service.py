@@ -106,6 +106,7 @@ def normalize_traffic_log(
         "batch_id": batch_id,
         "metadata": {
             "device_id": context.identity.device_id,
+            "suspicious": False,
         },
         "client_id": context.identity.client_id,
         "timestamp": payload.timestamp,

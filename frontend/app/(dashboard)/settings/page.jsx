@@ -107,6 +107,66 @@ export default async function Workspace({ searchParams }) {
                   manage:devices can change these settings.
                 </AlertDescription>
               </Alert>
+            </CardContent>
+          </Card>
+          <Card className="border shadow-none">
+            <CardContent className="space-y-6 px-6">
+              <div>
+                <h2 className="font-semibold">Retention policies</h2>
+                <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                  Automatically delete logs based on their event timestamp.
+                  Suspicious logs use their own window, not the ordinary window.
+                  Classification is reserved for a future analysis job; new logs
+                  are not suspicious by default.
+                </p>
+              </div>
+              {[
+                ["retention", "Ordinary logs", 7],
+                ["suspicious_retention", "Suspicious logs", 30],
+              ].map(([prefix, title, defaultDays]) => (
+                <div key={prefix} className="space-y-4 rounded-lg border p-4">
+                  <label className="flex cursor-pointer items-center gap-3 text-sm font-medium">
+                    <input
+                      type="checkbox"
+                      name={`${prefix}_enabled`}
+                      defaultChecked={configuration[`${prefix}_enabled`]}
+                      className="size-4 accent-primary"
+                    />
+                    Enable retention for {title.toLowerCase()}
+                  </label>
+                  <label className="block text-sm">
+                    {title} retention (days)
+                    <input
+                      type="number"
+                      name={`${prefix}_days`}
+                      min="1"
+                      max="24855"
+                      step="1"
+                      required
+                      defaultValue={
+                        configuration[`${prefix}_days`] ?? defaultDays
+                      }
+                      className="mt-2 block w-full rounded-md border bg-background px-3 py-2 sm:max-w-48"
+                    />
+                  </label>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    Disabled means retain indefinitely. The window is remembered
+                    while disabled.
+                  </p>
+                </div>
+              ))}
+              <Alert variant="destructive">
+                <AlertTitle>Expired logs are permanently deleted</AlertTitle>
+                <AlertDescription>
+                  Enabling or shortening retention also affects existing logs
+                  and cannot recover deleted data. MongoDB deletes expired
+                  time-series buckets in the background, not at an exact
+                  deadline. Disabling retention cannot undo deletions already
+                  underway. If saving fails, settings may be stored without all
+                  index changes applied; reload and retry after backend
+                  recovery.
+                </AlertDescription>
+              </Alert>
               <div className="flex items-center gap-4">
                 <PolicySubmit
                   label="Save workspace configuration"

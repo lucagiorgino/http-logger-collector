@@ -7,6 +7,10 @@ let workspace = {
   encrypt_request_body: true,
   encrypt_authorization_header: true,
   encrypt_cookies: true,
+  retention_enabled: true,
+  retention_days: 7,
+  suspicious_retention_enabled: true,
+  suspicious_retention_days: 30,
 };
 for (const deviceId of [
   "agent-discovered@clients",

@@ -13,7 +13,7 @@ from app.core.openbao import KMSUnavailable
 from app.db.mongo import PersistenceError
 from app.main import app
 from app.schemas.traffic import TrafficLogRequest
-from app.schemas.workspace import StoragePolicy, WorkspaceConfiguration
+from app.schemas.workspace import RetentionPolicy, StoragePolicy, WorkspaceConfiguration
 from app.services.traffic_service import normalize_traffic_log
 
 URL = "/api/v1/workspace/configuration"
@@ -50,6 +50,51 @@ def test_workspace_configuration_requires_management_and_is_not_cached(
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert response.json() == WorkspaceConfiguration().model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"retention_enabled": "false"},
+        {"suspicious_retention_enabled": 1},
+        {"retention_days": 0},
+        {"retention_days": True},
+        {"retention_days": "7"},
+        {"retention_days": 1.5},
+        {"suspicious_retention_days": 24856},
+        {"suspicious_retention_days": None},
+    ],
+)
+def test_retention_settings_reject_invalid_values(authorized_client, repository, invalid):
+    app.dependency_overrides[require_bearer_token] = operator
+    response = authorized_client.patch(
+        URL, json={"expected_version": 0, **dict.fromkeys(FLAGS, True), **invalid}
+    )
+    assert response.status_code == 422
+    repository.update_workspace_configuration.assert_not_awaited()
+
+
+def test_retention_settings_are_versioned_and_independent(authorized_client, repository):
+    app.dependency_overrides[require_bearer_token] = operator
+    policy = {
+        **dict.fromkeys(FLAGS, True),
+        **RetentionPolicy(
+            retention_enabled=False,
+            retention_days=14,
+            suspicious_retention_enabled=True,
+            suspicious_retention_days=365,
+        ).model_dump(),
+    }
+    repository.update_workspace_configuration.return_value = {**policy, "version": 1}
+    response = authorized_client.patch(URL, json={"expected_version": 0, **policy})
+    assert response.status_code == 200
+    assert response.json()["suspicious_retention_days"] == 365
+    assert response.json()["retention_enabled"] is False
+    repository.update_workspace_configuration.assert_awaited_once_with(0, policy)
+    repository.update_workspace_configuration.side_effect = PersistenceError("private DDL details")
+    failed = authorized_client.patch(URL, json={"expected_version": 1, **policy})
+    assert failed.status_code == 503
+    assert "private DDL" not in failed.text
 
 
 def test_workspace_updates_are_versioned_strict_and_fail_closed(

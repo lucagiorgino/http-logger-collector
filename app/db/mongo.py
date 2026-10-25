@@ -91,6 +91,8 @@ class MongoRepository:
                 upsert=expected_version == 0,
                 return_document=ReturnDocument.AFTER,
             )
+            if document is not None:
+                await self.ensure_retention_indexes()
             return (
                 {key: value for key, value in document.items() if key != "_id"}
                 if document is not None
@@ -100,6 +102,60 @@ class MongoRepository:
             return None
         except PyMongoError as exc:
             raise PersistenceError("Failed to update workspace configuration") from exc
+
+    async def ensure_retention_indexes(self) -> None:
+        # DDL cannot join the settings CAS transaction. Re-read after applying so
+        # concurrent updates converge on the latest policy, including across pods.
+        for _ in range(5):
+            configuration = WorkspaceConfiguration.model_validate(
+                await self.get_workspace_configuration()
+            )
+            try:
+                cursor = await self.traffic_logs.list_indexes()
+                indexes = {index["name"]: index for index in await cursor.to_list(length=None)}
+                for name, enabled, days, predicate in (
+                    (
+                        "retention_ordinary",
+                        configuration.retention_enabled,
+                        configuration.retention_days,
+                        {"metadata.suspicious": {"$in": [False, None]}},
+                    ),
+                    (
+                        "retention_suspicious",
+                        configuration.suspicious_retention_enabled,
+                        configuration.suspicious_retention_days,
+                        {"metadata.suspicious": True},
+                    ),
+                ):
+                    existing = indexes.get(name)
+                    if not enabled:
+                        if existing is not None:
+                            await self.traffic_logs.drop_index(name)
+                    elif (
+                        existing is not None
+                        and existing.get("partialFilterExpression") != predicate
+                    ):
+                        raise PersistenceError("Incompatible traffic log retention index")
+                    elif existing is None or existing.get("expireAfterSeconds") != days * 86400:
+                        # MongoDB 7 rejects collMod TTL changes on time-series indexes.
+                        if existing is not None:
+                            await self.traffic_logs.drop_index(name)
+                        await self.traffic_logs.create_index(
+                            [("timestamp", ASCENDING)],
+                            name=name,
+                            expireAfterSeconds=days * 86400,
+                            partialFilterExpression=predicate,
+                        )
+                latest = await self.get_workspace_configuration()
+                if latest["version"] == configuration.version:
+                    return
+            except OperationFailure as exc:
+                if exc.code not in {27, 85, 86}:
+                    raise PersistenceError("Failed to apply log retention indexes") from exc
+                # Another process created, modified or dropped the same index.
+            except PyMongoError as exc:
+                raise PersistenceError("Failed to apply log retention indexes") from exc
+        raise PersistenceError("Log retention configuration changed concurrently; retry")
 
     async def ping(self) -> bool:
         try:
@@ -143,6 +199,10 @@ class MongoRepository:
                 raise PersistenceError(
                     "traffic_logs must use timestamp and metadata as its time-series fields"
                 )
+            if collection_options.get("expireAfterSeconds", "off") != "off":
+                raise PersistenceError(
+                    "Collection-wide expiration must be disabled before using retention policies"
+                )
             await self.traffic_logs.create_indexes(indexes)
             await self.device_configurations.create_index(
                 "name",
@@ -150,6 +210,7 @@ class MongoRepository:
                 unique=True,
                 partialFilterExpression={"name": {"$type": "string"}},
             )
+            await self.ensure_retention_indexes()
         except PyMongoError as exc:
             raise PersistenceError("Failed to initialize MongoDB storage") from exc
 

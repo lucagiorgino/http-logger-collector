@@ -2,7 +2,7 @@ import asyncio
 import gzip
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from uuid import uuid4
 
@@ -316,7 +316,7 @@ def test_time_series_ingestion_and_analysis_routing(
                 await asyncio.sleep(0.1)
             assert len({document["_id"] for document in documents}) == 2
             assert all(document["batch_id"] == receipt.batch_id for document in documents)
-            assert documents[0]["metadata"] == {"device_id": "device"}
+            assert documents[0]["metadata"] == {"device_id": "device", "suspicious": False}
             assert documents[0]["client_id"] == "oauth-client"
             assert documents[0]["source_ip"] == "127.0.0.1"
             assert documents[0]["captured_source_ip"] == "192.0.2.10"
@@ -621,6 +621,95 @@ def test_workspace_settings_control_storage_and_survive_concurrent_edits(
                 assert await repository.traffic_logs.count_documents({}) == 2
         finally:
             app.dependency_overrides.clear()
+            await repository.client.drop_database(repository.database.name)
+            await repository.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not os.getenv("MONGO_TEST_URI"), reason="Set MONGO_TEST_URI for retention TTL")
+def test_retention_ttl_deletes_expired_logs_and_preserves_suspicious_and_disabled_logs(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "mongo_allow_primary_reads", True)
+    monkeypatch.setattr(settings, "app_env", "development")
+
+    async def scenario():
+        repository = MongoRepository(
+            uri=os.environ["MONGO_TEST_URI"], db_name="retention_test_" + uuid4().hex
+        )
+        try:
+            await repository.ensure_indexes()
+            await repository.update_workspace_configuration(
+                0, {"retention_enabled": False, "suspicious_retention_enabled": False}
+            )
+            now = datetime.now(UTC)
+            documents = [
+                {
+                    "timestamp": now - timedelta(days=days),
+                    "metadata": {"device_id": label, **classification},
+                }
+                for label, days, classification in (
+                    ("ordinary-expired", 2, {"suspicious": False}),
+                    ("legacy-expired", 2, {}),
+                    ("suspicious-retained", 2, {"suspicious": True}),
+                    ("suspicious-expired", 4, {"suspicious": True}),
+                    ("ordinary-recent", 0, {"suspicious": False}),
+                )
+            ]
+            await repository.insert_traffic_logs(documents)
+            await repository.update_workspace_configuration(
+                1,
+                {
+                    "retention_enabled": True,
+                    "retention_days": 1,
+                    "suspicious_retention_enabled": True,
+                    "suspicious_retention_days": 3,
+                },
+            )
+
+            async def wait_for_devices(expected):
+                deadline = monotonic() + 100
+                while monotonic() < deadline:
+                    remaining = {
+                        document["metadata"]["device_id"]
+                        for document in await repository.traffic_logs.find({}).to_list(None)
+                    }
+                    if remaining == expected:
+                        return
+                    await asyncio.sleep(1)
+                pytest.fail(f"TTL did not converge: {remaining!r} != {expected!r}")
+
+            await wait_for_devices({"suspicious-retained", "ordinary-recent"})
+            await repository.update_workspace_configuration(
+                2, {"retention_days": 2, "suspicious_retention_days": 4}
+            )
+            indexes = await repository.traffic_logs.index_information()
+            assert indexes["retention_ordinary"]["expireAfterSeconds"] == 2 * 86400
+            assert indexes["retention_suspicious"]["expireAfterSeconds"] == 4 * 86400
+            await repository.update_workspace_configuration(
+                3, {"retention_enabled": False, "suspicious_retention_days": 1}
+            )
+            await repository.insert_traffic_logs(
+                [
+                    {
+                        "timestamp": now - timedelta(days=10),
+                        "metadata": {"device_id": "ordinary-disabled", "suspicious": False},
+                    }
+                ]
+            )
+            await wait_for_devices({"ordinary-disabled", "ordinary-recent"})
+            await repository.update_workspace_configuration(
+                4, {"suspicious_retention_enabled": False}
+            )
+            indexes = await repository.traffic_logs.index_information()
+            assert "retention_ordinary" not in indexes
+            assert "retention_suspicious" not in indexes
+            await repository.ensure_indexes()
+            indexes = await repository.traffic_logs.index_information()
+            assert "retention_ordinary" not in indexes
+            assert "retention_suspicious" not in indexes
+        finally:
             await repository.client.drop_database(repository.database.name)
             await repository.close()
 

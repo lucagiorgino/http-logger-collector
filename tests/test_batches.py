@@ -38,7 +38,7 @@ def test_compressed_batch_is_normalized_before_durable_acceptance(
     assert len({document["_id"] for document in documents}) == 2
     for document in documents:
         assert document["batch_id"] == receipt["batch_id"]
-        assert document["metadata"] == {"device_id": "device-456"}
+        assert document["metadata"] == {"device_id": "device-456", "suspicious": False}
         assert document["client_id"] == "oauth-client-123"
         assert document["source_ip"] == "203.0.113.10"
         assert document["timestamp"].isoformat() == "2026-01-15T08:00:00+00:00"
@@ -244,6 +244,7 @@ def test_missing_device_claim_uses_subject_and_ignores_untrusted_forwarding_head
     document = repository.insert_traffic_logs.call_args.args[0][0]
     assert document["metadata"] == {
         "device_id": "oauth-client@clients",
+        "suspicious": False,
     }
     assert document["client_id"] is None
     assert document["source_ip"] == "203.0.113.10"

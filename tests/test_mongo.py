@@ -9,6 +9,7 @@ from pymongo.read_preferences import ReadPreference
 
 from app.core.config import settings
 from app.db.mongo import MongoRepository, PersistenceError
+from app.schemas.workspace import WorkspaceConfiguration
 
 
 @pytest.fixture
@@ -72,6 +73,7 @@ def test_startup_creates_and_validates_time_series_collection(mongo, creation_er
     mongo.database = AsyncMock()
     mongo.traffic_logs = AsyncMock()
     mongo.device_configurations = AsyncMock()
+    mongo.ensure_retention_indexes = AsyncMock()
     mongo.database.create_collection.side_effect = creation_error
     cursor = Mock()
     cursor.to_list = AsyncMock(
@@ -87,6 +89,98 @@ def test_startup_creates_and_validates_time_series_collection(mongo, creation_er
     )
     mongo.traffic_logs.create_indexes.assert_awaited_once()
     mongo.device_configurations.create_index.assert_awaited_once()
+    mongo.ensure_retention_indexes.assert_awaited_once()
+
+
+def test_retention_indexes_separate_ordinary_legacy_and_suspicious_logs(mongo):
+    mongo.traffic_logs = AsyncMock()
+    cursor = Mock()
+    cursor.to_list = AsyncMock(return_value=[])
+    mongo.traffic_logs.list_indexes.return_value = cursor
+    mongo.get_workspace_configuration = AsyncMock(
+        return_value=WorkspaceConfiguration().model_dump()
+    )
+    asyncio.run(mongo.ensure_retention_indexes())
+    assert mongo.traffic_logs.create_index.await_count == 2
+    ordinary, suspicious = mongo.traffic_logs.create_index.await_args_list
+    assert ordinary.kwargs == {
+        "name": "retention_ordinary",
+        "expireAfterSeconds": 7 * 86400,
+        "partialFilterExpression": {"metadata.suspicious": {"$in": [False, None]}},
+    }
+    assert suspicious.kwargs == {
+        "name": "retention_suspicious",
+        "expireAfterSeconds": 30 * 86400,
+        "partialFilterExpression": {"metadata.suspicious": True},
+    }
+
+
+def test_retention_reconciles_current_policy_after_a_concurrent_update(mongo):
+    mongo.traffic_logs = AsyncMock()
+    mongo.database = AsyncMock()
+    cursor = Mock()
+    cursor.to_list = AsyncMock(
+        return_value=[
+            {
+                "name": "retention_ordinary",
+                "expireAfterSeconds": 7 * 86400,
+                "partialFilterExpression": {"metadata.suspicious": {"$in": [False, None]}},
+            },
+            {
+                "name": "retention_suspicious",
+                "expireAfterSeconds": 30 * 86400,
+                "partialFilterExpression": {"metadata.suspicious": True},
+            },
+        ]
+    )
+    mongo.traffic_logs.list_indexes.return_value = cursor
+    policy = WorkspaceConfiguration(retention_days=14)
+    newer = policy.model_copy(
+        update={"version": 1, "retention_enabled": False, "suspicious_retention_days": 365}
+    )
+    mongo.get_workspace_configuration = AsyncMock(
+        side_effect=[
+            policy.model_dump(),
+            newer.model_dump(),
+            newer.model_dump(),
+            newer.model_dump(),
+        ]
+    )
+    asyncio.run(mongo.ensure_retention_indexes())
+    assert [call.args[0] for call in mongo.traffic_logs.drop_index.await_args_list] == [
+        "retention_ordinary",
+        "retention_ordinary",
+        "retention_suspicious",
+    ]
+    assert mongo.traffic_logs.create_index.await_args_list[-1].kwargs["name"] == (
+        "retention_suspicious"
+    )
+    assert mongo.traffic_logs.create_index.await_args_list[-1].kwargs["expireAfterSeconds"] == (
+        365 * 86400
+    )
+
+
+def test_retention_index_errors_are_explicit_and_configuration_is_persisted_first(mongo):
+    mongo.workspace_configurations = AsyncMock()
+    mongo.workspace_configurations.find_one_and_update.return_value = {
+        "_id": "workspace",
+        "version": 1,
+        "retention_days": 14,
+    }
+    mongo.ensure_retention_indexes = AsyncMock(side_effect=PersistenceError("DDL failed"))
+    with pytest.raises(PersistenceError, match="DDL failed"):
+        asyncio.run(mongo.update_workspace_configuration(0, {"retention_days": 14}))
+    mongo.workspace_configurations.find_one_and_update.assert_awaited_once()
+
+
+def test_retention_does_not_swallow_database_permission_errors(mongo):
+    mongo.traffic_logs = AsyncMock()
+    mongo.traffic_logs.list_indexes.side_effect = OperationFailure("unauthorized", code=13)
+    mongo.get_workspace_configuration = AsyncMock(
+        return_value=WorkspaceConfiguration().model_dump()
+    )
+    with pytest.raises(PersistenceError, match="retention"):
+        asyncio.run(mongo.ensure_retention_indexes())
 
 
 def test_startup_rejects_existing_non_time_series_collection(mongo):
@@ -99,6 +193,25 @@ def test_startup_rejects_existing_non_time_series_collection(mongo):
     with pytest.raises(PersistenceError, match="time-series"):
         asyncio.run(mongo.ensure_indexes())
     mongo.traffic_logs.create_indexes.assert_not_awaited()
+
+
+def test_collection_wide_ttl_cannot_override_suspicious_retention(mongo):
+    mongo.database = AsyncMock()
+    mongo.database.create_collection.side_effect = CollectionInvalid("exists")
+    cursor = Mock()
+    cursor.to_list = AsyncMock(
+        return_value=[
+            {
+                "options": {
+                    "timeseries": {"timeField": "timestamp", "metaField": "metadata"},
+                    "expireAfterSeconds": 604800,
+                }
+            }
+        ]
+    )
+    mongo.database.list_collections.return_value = cursor
+    with pytest.raises(PersistenceError, match="Collection-wide expiration"):
+        asyncio.run(mongo.ensure_indexes())
 
 
 def test_startup_does_not_swallow_database_permission_errors(mongo):

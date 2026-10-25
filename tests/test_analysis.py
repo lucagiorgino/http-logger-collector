@@ -14,6 +14,38 @@ from app.services.traffic_service import normalize_traffic_log
 URL = "/api/v1/traffic-logs"
 
 
+@pytest.mark.parametrize("suspicious", [None, False, True])
+def test_suspicious_classification_is_returned_in_details_and_lists(
+    authorized_client, repository, traffic_payload, trusted_context, suspicious
+):
+    document = normalize_traffic_log(
+        TrafficLogRequest(**traffic_payload), "batch-123", trusted_context
+    )
+    if suspicious is None:
+        document["metadata"].pop("suspicious")
+    else:
+        document["metadata"]["suspicious"] = suspicious
+    repository.list_traffic_logs.return_value = [document]
+    repository.get_traffic_log.return_value = document
+    assert authorized_client.get(URL).json()["items"][0]["suspicious"] is (suspicious is True)
+    assert authorized_client.get(f"{URL}/{document['_id']}").json()["suspicious"] is (
+        suspicious is True
+    )
+
+
+def test_agents_cannot_assign_suspicious_classification(authorized_client, traffic_payload):
+    import gzip
+    import json
+
+    traffic_payload["suspicious"] = True
+    response = authorized_client.post(
+        "/api/v1/traffic-log-batches",
+        content=gzip.compress(json.dumps({"logs": [traffic_payload]}).encode()),
+        headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
+    )
+    assert response.status_code == 422
+
+
 def test_paginated_analysis_returns_an_opaque_cursor(
     authorized_client, repository, traffic_payload, trusted_context
 ):

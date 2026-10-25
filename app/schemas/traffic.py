@@ -164,6 +164,7 @@ class StoredTrafficLog(BaseModel):
     id: str
     batch_id: str
     device_id: str
+    suspicious: bool = False
     client_id: str | None = None
     timestamp: datetime
     received_at: datetime

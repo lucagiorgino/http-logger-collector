@@ -89,6 +89,15 @@ test("workspace encryption settings persist and reject stale edits without JavaS
     await expect(
       page.getByRole("checkbox", { name, exact: false }),
     ).toBeChecked();
+  await expect(
+    page.getByRole("heading", { name: "Retention policies", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Ordinary logs retention (days)")).toHaveValue(
+    "7",
+  );
+  await expect(page.getByLabel("Suspicious logs retention (days)")).toHaveValue(
+    "30",
+  );
   const stale = await context.newPage();
   await stale.goto("/settings");
   await page
@@ -97,6 +106,9 @@ test("workspace encryption settings persist and reject stale edits without JavaS
   await page
     .getByRole("checkbox", { name: "Encrypt cookies", exact: false })
     .uncheck();
+  await page.getByLabel("Ordinary logs retention (days)").fill("14");
+  await page.getByLabel("Suspicious logs retention (days)").fill("365");
+  await page.getByLabel("Enable retention for suspicious logs").uncheck();
   await page
     .getByRole("button", { name: "Save workspace configuration", exact: true })
     .click();
@@ -104,6 +116,15 @@ test("workspace encryption settings persist and reject stale edits without JavaS
     page.getByText("Workspace configuration saved", { exact: true }),
   ).toBeVisible();
   await page.reload();
+  await expect(page.getByLabel("Ordinary logs retention (days)")).toHaveValue(
+    "14",
+  );
+  await expect(page.getByLabel("Suspicious logs retention (days)")).toHaveValue(
+    "365",
+  );
+  await expect(
+    page.getByLabel("Enable retention for suspicious logs"),
+  ).not.toBeChecked();
   await expect(
     page.getByRole("checkbox", { name: "Encrypt request body", exact: false }),
   ).not.toBeChecked();
@@ -129,6 +150,9 @@ test("workspace encryption settings persist and reject stale edits without JavaS
   await page
     .getByRole("checkbox", { name: "Encrypt cookies", exact: false })
     .check();
+  await page.getByLabel("Ordinary logs retention (days)").fill("7");
+  await page.getByLabel("Suspicious logs retention (days)").fill("30");
+  await page.getByLabel("Enable retention for suspicious logs").check();
   await page
     .getByRole("button", { name: "Save workspace configuration", exact: true })
     .click();

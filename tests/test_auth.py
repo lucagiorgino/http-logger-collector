@@ -126,9 +126,7 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
     )
     monkeypatch.setitem(app.dependency_overrides, get_mongo_repository, lambda: repository)
     monkeypatch.setitem(app.dependency_overrides, get_encryption_keys, lambda: EncryptionKeys({}))
-    monkeypatch.setitem(
-        app.dependency_overrides, get_storage_encryption, lambda: storage_encryption
-    )
+    monkeypatch.setitem(app.dependency_overrides, get_storage_encryption, lambda: storage_encryption)
     signed_client = TestClient(app, base_url="https://testserver", client=("2001:db8::1", 50000))
     response = signed_client.post(
         "/api/v1/traffic-log-batches",
@@ -144,6 +142,7 @@ def test_ingestion_attribution_comes_from_verified_jwt_and_connection(
     stored = repository.insert_traffic_logs.call_args.args[0][0]
     assert stored["metadata"] == {
         "device_id": "issuer-bound-device",
+        "suspicious": False,
     }
     assert stored["client_id"] == "issuer-bound-client"
     assert stored["source_ip"] == "2001:db8::1"

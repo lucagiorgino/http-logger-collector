@@ -159,6 +159,23 @@ export function workspaceUpdate(form) {
     if (value !== null && value !== "on") throw new ApiError(422);
     body[field] = value === "on";
   }
+  for (const field of ["retention_enabled", "suspicious_retention_enabled"]) {
+    const value = form.get(field);
+    if (value !== null && value !== "on") throw new ApiError(422);
+    body[field] = value === "on";
+  }
+  for (const field of ["retention_days", "suspicious_retention_days"]) {
+    const value = form.get(field);
+    if (
+      typeof value !== "string" ||
+      !/^\d+$/.test(value) ||
+      !Number.isSafeInteger(Number(value)) ||
+      Number(value) < 1 ||
+      Number(value) > 24855
+    )
+      throw new ApiError(422);
+    body[field] = Number(value);
+  }
   return body;
 }
 

@@ -16,14 +16,35 @@ test("workspace updates parse encryption choices and the expected version", () =
   form.set("expected_version", "2");
   form.set("encrypt_request_body", "on");
   form.set("encrypt_cookies", "on");
-
+  form.set("retention_days", "7");
+  form.set("suspicious_retention_days", "30");
   assert.deepEqual(workspaceUpdate(form), {
     expected_version: 2,
     encrypt_request_body: true,
     encrypt_authorization_header: false,
     encrypt_cookies: true,
+    retention_enabled: false,
+    suspicious_retention_enabled: false,
+    retention_days: 7,
+    suspicious_retention_days: 30,
   });
   form.set("encrypt_cookies", "false");
+  assert.throws(() => workspaceUpdate(form), ApiError);
+});
+
+test("workspace rejects invalid retention windows even when expiration is disabled", () => {
+  const form = new FormData();
+  form.set("expected_version", "0");
+  form.set("retention_days", "7");
+  form.set("suspicious_retention_days", "30");
+  for (const field of ["retention_days", "suspicious_retention_days"]) {
+    for (const value of ["0", "-1", "1.5", "24856", "7days", "", "Infinity"]) {
+      form.set(field, value);
+      assert.throws(() => workspaceUpdate(form), ApiError);
+    }
+    form.set(field, "7");
+  }
+  form.set("suspicious_retention_enabled", "false");
   assert.throws(() => workspaceUpdate(form), ApiError);
 });
 
