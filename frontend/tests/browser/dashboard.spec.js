@@ -2,12 +2,12 @@ import { test, expect } from "@playwright/test";
 import { generateSessionCookie } from "@auth0/nextjs-auth0/testing";
 import { testSecret } from "../../playwright.config.js";
 
-async function signIn(context) {
+async function signIn(context, accessToken = "test-server-access-token") {
   const cookie = await generateSessionCookie(
     {
       user: { sub: "operator-test", name: "Test Operator" },
       tokenSet: {
-        accessToken: "test-server-access-token",
+        accessToken,
         expiresAt: Math.floor(Date.now() / 1000) + 3600,
         audience: "https://api.example",
         scope: "openid profile email manage:devices",
@@ -59,6 +59,68 @@ test("welcome is server-rendered and private pages require a session", async ({
   const privatePage = await request.get("/overview", { maxRedirects: 0 });
   expect([303, 307]).toContain(privatePage.status());
   expect(privatePage.headers().location).toContain("/auth/login");
+  const privateStatus = await request.get("/status", { maxRedirects: 0 });
+  expect([303, 307]).toContain(privateStatus.status());
+  expect(privateStatus.headers().location).toContain("/auth/login");
+});
+
+test("status sidebar shows the pipeline and real state labels without JavaScript", async ({
+  browser,
+}) => {
+  const context = await browser.newContext({ javaScriptEnabled: false });
+  await signIn(context);
+  const page = await context.newPage();
+  await page.goto("/overview");
+  await page.getByRole("link", { name: "Status", exact: true }).click();
+  await expect(page).toHaveTitle("Status / amazing-http-logger");
+  await expect(
+    page.getByRole("heading", { name: "Status", exact: true }),
+  ).toBeVisible();
+  const stages = page.getByRole("list", { name: "Ingestion pipeline stages" });
+  await expect(stages.getByRole("listitem")).toHaveCount(8);
+  const loader = stages.getByRole("listitem").filter({
+    has: page.getByRole("heading", { name: "Mongo loader", exact: true }),
+  });
+  await expect(loader.getByText(/^(Unknown|Unavailable)$/)).toBeVisible();
+  for (const label of [
+    "Collector API",
+    "Object-event Pub/Sub",
+    "Parser / protection",
+    "Silver Pub/Sub",
+    "Mongo loader",
+    "MongoDB",
+    "Raw cleanup",
+  ])
+    await expect(
+      stages.getByRole("heading", { name: label, exact: true }),
+    ).toBeVisible();
+  expect(await page.content()).not.toContain("test-server-access-token");
+  await expect(
+    page.getByRole("link", { name: "Refresh snapshot" }),
+  ).toHaveAttribute("href", "/status");
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await context.close();
+});
+
+test("status request failures do not render a healthy diagram", async ({
+  browser,
+}) => {
+  const context = await browser.newContext();
+  await signIn(context, "invalid-status-test-token");
+  const page = await context.newPage();
+  await page.goto("/status");
+  await expect(
+    page.getByText("Unable to load workspace data · HTTP 401"),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("list", { name: "Ingestion pipeline stages" }),
+  ).toHaveCount(0);
+  await context.close();
 });
 
 test("authenticated overview is SSR HTML without JavaScript or exposed tokens", async ({

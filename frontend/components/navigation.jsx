@@ -2,13 +2,20 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, LayoutDashboard, Monitor, Settings2 } from "lucide-react";
+import {
+  Activity,
+  HeartPulse,
+  LayoutDashboard,
+  Monitor,
+  Settings2,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const links = [
   ["/overview", LayoutDashboard, "Overview"],
   ["/logs", Activity, "Traffic explorer"],
   ["/devices", Monitor, "Device policies"],
+  ["/status", HeartPulse, "Status"],
   ["/settings", Settings2, "Workspace"],
 ];
 

@@ -3,7 +3,7 @@ export class ApiError extends Error {
     const messages = {
       400: "The API could not accept this request.",
       401: "Your API session has expired or is not authorized. Sign in again.",
-      403: "This operation is not permitted. Device registration and policy changes require manage:devices.",
+      403: "This operation is not permitted. Device registration, policy changes and pipeline status require manage:devices.",
       404: "The record was not found for an accessible device.",
       409: "The device configuration changed. Reload it before saving again.",
       422: "Check the filters, device ID, or configuration values.",

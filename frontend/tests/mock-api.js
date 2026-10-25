@@ -77,6 +77,32 @@ const server = createServer(async (request, response) => {
     return reply(401, { detail: "Unauthorized" });
   if (url.pathname === "/api/v1/me")
     return reply(200, { device_id: "operator-test", client_id: "test-client" });
+  if (url.pathname === "/api/v1/status")
+    return reply(200, {
+      checked_at: "2026-10-25T21:00:00Z",
+      deployment: "local",
+      status: "unavailable",
+      nodes: [
+        ["collector", "Collector API", "healthy"],
+        ["raw", "MinIO raw storage", "healthy"],
+        ["events", "Object-event Pub/Sub", "healthy"],
+        ["parse", "Parser / protection", "healthy"],
+        ["silver", "Silver Pub/Sub", "healthy"],
+        ["load", "Mongo loader", "unavailable"],
+        ["mongo", "MongoDB", "healthy"],
+        ["cleanup", "Raw cleanup", "healthy"],
+      ].map(([id, label, status]) => ({
+        id,
+        label,
+        status,
+        detail:
+          status === "unavailable"
+            ? "No fresh worker heartbeat."
+            : "Metadata check passed.",
+        pending: ["events", "silver", "cleanup"].includes(id) ? 0 : null,
+        last_seen: null,
+      })),
+    });
   if (url.pathname === "/api/v1/workspace/configuration") {
     if (request.method === "PATCH") {
       let content = "";
