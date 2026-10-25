@@ -37,6 +37,10 @@ test("welcome is server-rendered and private pages require a session", async ({
   expect(html).not.toContain("Every request.");
   await page.goto("/");
   await expect(page).toHaveTitle("amazing-http-logger / Management console");
+  const icon = page.locator('link[rel="icon"][type="image/svg+xml"]');
+  const favicon = await request.get(await icon.getAttribute("href"));
+  expect(favicon.status()).toBe(200);
+  expect(favicon.headers()["content-type"]).toContain("image/svg+xml");
   await expect(
     page.getByRole("link", { name: "amazing-http-logger home" }),
   ).toBeVisible();
