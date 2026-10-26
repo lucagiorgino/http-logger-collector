@@ -87,3 +87,98 @@ def test_benchmark_fails_explicitly_on_async_validation_error(tmp_path, monkeypa
     )
     with pytest.raises(RuntimeError, match="parse_failed"):
         asyncio.run(benchmark_ingestion.benchmark(args))
+
+
+@pytest.mark.parametrize("timeout", ["nan", "inf", "-inf", "0", "-1"])
+def test_benchmark_rejects_invalid_completion_timeout_before_uploading(monkeypatch, timeout):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["benchmark_ingestion", "--wire-file", "unused.gz", f"--completion-timeout={timeout}"],
+    )
+    with pytest.raises(SystemExit) as error:
+        benchmark_ingestion.main()
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("origin", ["https:///missing-host", "https://example.test/api"])
+def test_benchmark_rejects_invalid_origins_before_reading_payload(monkeypatch, origin):
+    monkeypatch.setenv("INGEST_BENCH_TOKEN", "test-only-placeholder")
+    args = argparse.Namespace(base_url=origin, wire_file="unused.gz")
+    with pytest.raises(ValueError, match="origin"):
+        asyncio.run(benchmark_ingestion.benchmark(args))
+
+
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_benchmark_polls_completed_uploads_while_other_uploads_are_pending(
+    tmp_path, monkeypatch, capsys, concurrency
+):
+    wire = tmp_path / "synthetic.gz"
+    wire.write_bytes(b"synthetic-wire")
+    monkeypatch.setenv("INGEST_BENCH_TOKEN", "test-only-placeholder")
+
+    async def scenario():
+        first_polled = asyncio.Event()
+        uploads = 0
+
+        async def respond(request):
+            nonlocal uploads
+            if request.method == "POST":
+                uploads += 1
+                upload_id = str(uploads)
+                await asyncio.sleep(0)
+                if upload_id == "2":
+                    await asyncio.wait_for(first_polled.wait(), timeout=1)
+                return Response(202, json={"upload_id": upload_id, "duplicate": False})
+            if request.url.path.endswith("/1"):
+                first_polled.set()
+            return Response(200, json={"status": "stored"})
+
+        monkeypatch.setattr(
+            benchmark_ingestion,
+            "AsyncClient",
+            lambda **kwargs: AsyncClient(transport=MockTransport(respond), **kwargs),
+        )
+        await benchmark_ingestion.benchmark(
+            argparse.Namespace(
+                base_url="http://localhost:8080",
+                wire_file=str(wire),
+                jwe=False,
+                requests=2,
+                concurrency=concurrency,
+                completion_timeout=5,
+            )
+        )
+
+    asyncio.run(scenario())
+    report = json.loads(capsys.readouterr().out)
+    assert len(report["uploads"]) == 2
+    assert report["uploads"][0]["stored_observed_at"] <= report["uploads"][1]["ack_at"]
+
+
+def test_benchmark_completion_deadline_bounds_a_stalled_status_request(tmp_path, monkeypatch):
+    wire = tmp_path / "synthetic.gz"
+    wire.write_bytes(b"synthetic-wire")
+    monkeypatch.setenv("INGEST_BENCH_TOKEN", "test-only-placeholder")
+
+    async def respond(request):
+        if request.method == "POST":
+            return Response(202, json={"upload_id": "upload"})
+        await asyncio.sleep(1)
+        return Response(200, json={"status": "stored"})
+
+    monkeypatch.setattr(
+        benchmark_ingestion,
+        "AsyncClient",
+        lambda **kwargs: AsyncClient(transport=MockTransport(respond), **kwargs),
+    )
+    args = argparse.Namespace(
+        base_url="http://localhost:8080",
+        wire_file=str(wire),
+        jwe=False,
+        requests=1,
+        concurrency=1,
+        completion_timeout=0.01,
+    )
+    with pytest.raises(TimeoutError, match="completion timeout"):
+        asyncio.run(benchmark_ingestion.benchmark(args))

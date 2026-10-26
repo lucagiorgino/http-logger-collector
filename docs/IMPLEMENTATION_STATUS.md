@@ -211,6 +211,7 @@ requests and outcomes; common token validation is shown once.
 | OpenBao bootstrap, runtime key loading, EC/KEK/storage rotation | [Local and Helm key management](#local-and-helm-key-management) |
 | GCP missing-only secret/key bootstrap and runtime loading | [Cloud secret and key bootstrap](#cloud-secret-and-key-bootstrap) |
 | `make gcp-check`, `make gcp-deploy` | [Automated GCP deployment](#automated-gcp-deployment) |
+| `integration_tests.benchmark_ingestion` | [Ingestion latency measurement](#ingestion-latency-measurement) |
 
 ### Identity and sessions
 
@@ -843,6 +844,39 @@ cloud dependencies. Atlas provisioning and Auth0 tenant administration remain
 external prerequisites; successful probes are not authenticated end-to-end
 ingestion or live deployment performance evidence.
 
+### Ingestion latency measurement
+
+Source: [`benchmark_ingestion.py`](../integration_tests/benchmark_ingestion.py);
+[benchmark procedure](RUNBOOK.md#measuring-ingestion-latency).
+This measures the existing ingestion flow; runtime architecture is unchanged.
+
+```mermaid
+sequenceDiagram
+    actor Operator
+    participant Benchmark
+    participant API
+    participant Pipeline as Parser / loader / Mongo
+    Operator->>Benchmark: Synthetic gzip/JWE, dedicated token, bounded concurrency
+    Benchmark->>Benchmark: Validate origin and positive finite timeout
+    loop Concurrent uploads with separately bounded upload and polling slots
+        Benchmark->>API: POST /traffic-log-uploads
+        API-->>Benchmark: Durable raw acknowledgement
+        Benchmark->>Benchmark: Record acknowledgement latency
+        API-->>Pipeline: Object event; asynchronous processing
+        loop Poll each acknowledged upload while other uploads continue
+            Benchmark->>API: GET upload receipt
+            API-->>Benchmark: Current state
+            Benchmark->>Benchmark: Release request slot before polling delay
+        end
+        Benchmark->>Benchmark: Record observed stored latency or fail explicitly
+    end
+    Benchmark-->>Operator: ACK/storage percentiles; rate through final acknowledgement
+```
+
+Observed storage includes status polling delay, not an exact Mongo completion
+timestamp. Failure states abort the run; they are not reported as successful
+samples. Percentiles from small local runs do not establish production capacity.
+
 ## Validation scope
 
 The [test runbook](RUNBOOK.md#run-tests) separates fast tests from opt-in services:
@@ -852,6 +886,8 @@ GCS conditional operations use mocked SDK calls; Terraform tests use mocked
 providers. Frontend mocks verify SSR/forms without JavaScript; a separate fixture
 exercises real FastAPI/Mongo but replaces Auth0/KMS. Only live-tenant tests validate
 actual OAuth grants. See [frontend validation](../frontend/README.md#validation).
+The [local performance report](../performance-report.md) records a measured
+ingestion matrix and regression results, separately from production capacity.
 
 ## Known limitations
 

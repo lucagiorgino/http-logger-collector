@@ -32,8 +32,15 @@ async def benchmark(args: argparse.Namespace) -> None:
         origin.scheme == "http" and origin.hostname in {"localhost", "127.0.0.1", "::1"}
     ):
         raise ValueError("Use HTTPS except on loopback")
-    if origin.username or origin.password or origin.query or origin.fragment:
-        raise ValueError("Supply an origin without credentials, query or fragment")
+    if (
+        not origin.hostname
+        or origin.username is not None
+        or origin.password is not None
+        or origin.query
+        or origin.fragment
+        or origin.path not in {"", "/"}
+    ):
+        raise ValueError("Supply an origin without credentials, path prefix, query or fragment")
     wire = Path(args.wire_file).read_bytes()
     headers = {
         "Authorization": f"Bearer {token}",
@@ -41,48 +48,59 @@ async def benchmark(args: argparse.Namespace) -> None:
     }
     if not args.jwe:
         headers["Content-Encoding"] = "gzip"
-    semaphore = asyncio.Semaphore(args.concurrency)
+    upload_slots = asyncio.Semaphore(args.concurrency)
+    polling_slots = asyncio.Semaphore(args.concurrency)
     async with AsyncClient(
         base_url=args.base_url, headers=headers, timeout=30, follow_redirects=False
     ) as client:
+        started = monotonic()
+        last_ack = started
 
         async def post_one():
-            async with semaphore:
+            nonlocal last_ack
+            async with upload_slots:
                 start = monotonic()
                 response = await client.post("/api/v1/traffic-log-uploads", content=wire)
                 if response.status_code not in {200, 202}:
                     raise RuntimeError(f"Upload HTTP {response.status_code}")
+                last_ack = monotonic()
                 return {
                     "start": start,
-                    "ack_ms": (monotonic() - start) * 1000,
+                    "ack_ms": (last_ack - start) * 1000,
                     "ack_at": datetime.now(UTC).isoformat(),
                     **response.json(),
                 }
 
-        started = monotonic()
-        results = await asyncio.gather(*(post_one() for _ in range(args.requests)))
-        elapsed = monotonic() - started
-
         async def await_stored(result):
-            async with semaphore:
-                while monotonic() - result["start"] < args.completion_timeout:
+            while monotonic() - result["start"] < args.completion_timeout:
+                async with polling_slots:
                     response = await client.get(
                         f"/api/v1/traffic-log-uploads/{result['upload_id']}"
                     )
-                    if response.status_code != 200:
-                        raise RuntimeError(f"Status HTTP {response.status_code}")
-                    status = response.json()["status"]
-                    if status == "stored":
-                        result["stored_observed_ms"] = (monotonic() - result["start"]) * 1000
-                        result["stored_observed_at"] = datetime.now(UTC).isoformat()
-                        return
-                    if status in {"parse_failed", "load_failed"}:
-                        # Print only canonical state, never raw server error messages.
-                        raise RuntimeError(f"Upload ended in {status}; inspect receipt/DLQ")
-                    await asyncio.sleep(0.2)
+                if response.status_code != 200:
+                    raise RuntimeError(f"Status HTTP {response.status_code}")
+                status = response.json()["status"]
+                if status == "stored":
+                    result["stored_observed_ms"] = (monotonic() - result["start"]) * 1000
+                    result["stored_observed_at"] = datetime.now(UTC).isoformat()
+                    return
+                if status in {"parse_failed", "load_failed"}:
+                    # Print only canonical state, never raw server error messages.
+                    raise RuntimeError(f"Upload ended in {status}; inspect receipt/DLQ")
+                await asyncio.sleep(0.2)
             raise TimeoutError("Upload completion timeout; inspect its receipt/DLQ")
 
-        await asyncio.gather(*(await_stored(result) for result in results))
+        async def upload_and_observe():
+            result = await post_one()
+            try:
+                async with asyncio.timeout_at(result["start"] + args.completion_timeout):
+                    await await_stored(result)
+            except TimeoutError:
+                raise TimeoutError("Upload completion timeout; inspect its receipt/DLQ") from None
+            return result
+
+        results = await asyncio.gather(*(upload_and_observe() for _ in range(args.requests)))
+        elapsed = last_ack - started
         print(
             json.dumps(
                 {
@@ -116,8 +134,10 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--completion-timeout", type=float, default=120)
     args = parser.parse_args()
-    if min(args.requests, args.concurrency, args.completion_timeout) <= 0:
-        parser.error("Counts, concurrency and timeout must be positive")
+    if min(args.requests, args.concurrency, args.completion_timeout) <= 0 or not math.isfinite(
+        args.completion_timeout
+    ):
+        parser.error("Counts, concurrency and timeout must be positive and finite")
     asyncio.run(benchmark(args))
 
 

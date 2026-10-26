@@ -36,7 +36,10 @@ class RoutingListener(CommandListener):
             event.command_name in {"insert", "find"}
             and event.command[event.command_name] == "traffic_logs"
         ):
-            self.operations.append((event.command_name, event.connection_id))
+            operation = event.command_name
+            if operation == "find" and "ingestion.batch_id" in event.command["filter"]:
+                operation = "replay_check"
+            self.operations.append((operation, event.connection_id))
 
     def succeeded(self, event):
         pass
@@ -352,6 +355,11 @@ def test_time_series_ingestion_and_analysis_routing(
                 limit=10,
             )
             assert [document["_id"] for document in next_page] == [documents[1]["_id"]]
+            assert {operation for operation, _ in listener.operations} == {
+                "insert",
+                "replay_check",
+                "find",
+            }
             for operation, (host, port) in set(listener.operations):
                 node = AsyncMongoClient(
                     f"mongodb://{host}:{port}/?directConnection=true",
@@ -359,7 +367,7 @@ def test_time_series_ingestion_and_analysis_routing(
                 )
                 try:
                     hello = await node.admin.command("hello")
-                    assert hello["isWritablePrimary"] is (operation == "insert" or allow_primary)
+                    assert hello["isWritablePrimary"] is (operation != "find" or allow_primary)
                     if operation == "find" and not allow_primary:
                         assert hello["secondary"] is True
                 finally:

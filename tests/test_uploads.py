@@ -899,6 +899,18 @@ def test_real_minio_notification_to_mongo_and_cleanup(
     monkeypatch.setattr(settings, "mongo_allow_primary_reads", True)
     repository.get_device_configuration.return_value["encryption_mode"] = "optional"
     traffic_payload["timestamp"] = datetime.now(UTC).isoformat()
+    suffix = uuid4().hex
+    project = settings.spool_event_topic.split("/topics/")[0]
+    monkeypatch.setattr(
+        settings, "spool_subscription", f"{project}/subscriptions/test-objects-{suffix}"
+    )
+    for stage in ("silver", "parse_dlq", "load_dlq"):
+        monkeypatch.setattr(
+            settings, f"spool_{stage}_topic", f"{project}/topics/test-{stage}-{suffix}"
+        )
+    monkeypatch.setattr(
+        settings, "spool_silver_subscription", f"{project}/subscriptions/test-silver-{suffix}"
+    )
 
     async def scenario():
         name = "test_minio_" + uuid4().hex
@@ -907,7 +919,25 @@ def test_real_minio_notification_to_mongo_and_cleanup(
         cloud = UploadCloud()
         queue = UploadQueue(cloud)
         descriptor = None
+        topics = []
+        subscriptions = []
         try:
+            for topic in (
+                settings.spool_silver_topic,
+                settings.spool_parse_dlq_topic,
+                settings.spool_load_dlq_topic,
+            ):
+                await asyncio.to_thread(cloud.publisher.create_topic, name=topic)
+                topics.append(topic)
+            for subscription, topic in (
+                (settings.spool_subscription, settings.spool_event_topic),
+                (settings.spool_silver_subscription, settings.spool_silver_topic),
+            ):
+                await asyncio.to_thread(
+                    cloud.subscriber.create_subscription,
+                    request={"name": subscription, "topic": topic, "ack_deadline_seconds": 10},
+                )
+                subscriptions.append(subscription)
             await mongo.ensure_indexes()
             await store.initialize()
             app.dependency_overrides[get_upload_cloud] = lambda: cloud
@@ -942,7 +972,9 @@ def test_real_minio_notification_to_mongo_and_cleanup(
                     while (await store.get(upload_id))["status"] != "queued":
                         await parser.consume_once()
                 loader = UploadLoader(cloud, store, queue, mongo)
-                assert await loader.consume_once()
+                async with asyncio.timeout(45):
+                    while (await store.get(upload_id))["status"] != "stored":
+                        await loader.consume_once()
                 status = await client.get(f"{URL}/{upload_id}")
                 assert status.json() == {
                     "upload_id": upload_id,
@@ -965,6 +997,12 @@ def test_real_minio_notification_to_mongo_and_cleanup(
         finally:
             if descriptor is not None:
                 await cloud.delete(descriptor.object_key)
+            for subscription in subscriptions:
+                await asyncio.to_thread(
+                    cloud.subscriber.delete_subscription, subscription=subscription
+                )
+            for topic in topics:
+                await asyncio.to_thread(cloud.publisher.delete_topic, topic=topic)
             await cloud.close()
             await mongo.client.drop_database(name)
             await mongo.close()

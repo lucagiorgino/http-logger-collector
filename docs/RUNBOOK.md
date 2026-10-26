@@ -195,12 +195,22 @@ The tool reports p50/p95/p99 HTTP acknowledgement and acknowledged batches/secon
 Its default base URL is `http://localhost:8080`, exercising the public NGINX path.
 It also polls terminal status and reports
 `stored_observed` latency, including polling/scheduling delay. This is **not**
-an exact write timestamp. Compare
+an exact write timestamp. Each acknowledged upload is polled while other uploads
+are still running. Uploads and status requests each have their own bounded
+concurrency pool; polling releases its slot between attempts, so slow requests
+and queued uploads cannot monopolize observation slots. The completion deadline
+also bounds an in-flight status request.
+Acknowledged batches/second uses the time to the final upload acknowledgement,
+not the later completion of status polling. Counts/concurrency must be positive,
+and the completion timeout must also be finite. The base URL must be an origin,
+without an API path prefix. Compare
 `pipeline.e2e.latency_ms` logs to measure actual Mongo completion, and
 check replica visibility separately. Test 1/100/500 records, gzip versus JWE,
 large retained bodies, several concurrency levels, warmed/cold runs and recovery
 from Mongo stalls. Acknowledgement confirms only raw durability.
 No production speedup is asserted.
+See the [local performance report](../performance-report.md) for a measured
+concurrency/payload matrix, test results and explicit environment limitations.
 
 Focused service validation after `make spool-dev-up`:
 
@@ -214,6 +224,10 @@ PUBSUB_EMULATOR_HOST=localhost:28681 \
 Use the MinIO/PubSub configuration above in `.env`. Tests create/drop only unique
 test Mongo databases/Pub/Sub resources and delete their raw uploads. They do not
 authenticate with live Auth0 or validate live GCS IAM/event latency.
+The MinIO test uses dedicated object/silver subscriptions and silver/DLQ topics,
+but its raw bucket and notification bridge remain shared. Prefer an idle local
+stack: application workers can still receive copies of test object notifications
+whose receipts belong to the temporary test database.
 
 ## Local setup
 ```bash
