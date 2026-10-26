@@ -28,18 +28,20 @@ bodies. Ordinary/suspicious log retention defaults to 7/30 days.
 
 ## Core ingestion flow
 
-```text
-Agent -> Collector -> GCS raw spool -> object-event Pub/Sub
-            |                               |
-       202 after durable write         Parser / protection worker
-                                            |
-                                       silver Pub/Sub
-                                            |
-                                       Rate-limited Mongo loader
-                                            |
-                                       MongoDB -> raw cleanup
-                                            |
-                                       Analysis API -> SSR dashboard
+```mermaid
+flowchart TB
+    Agent["Agent"] -->|"Upload gzip JSON or JWE"| Collector["Collector"]
+    Collector -->|"Persist original bytes"| Raw["GCS raw spool"]
+    Collector -->|"202 only after durable raw write"| Agent
+    Raw -->|"Object-created notification"| Events["Object-event Pub/Sub"]
+    Events --> Parser["Parser / protection worker"]
+    Parser -->|"Normalized, protected documents"| Silver["Silver Pub/Sub"]
+    Silver --> Loader["Rate-limited Mongo loader"]
+    Loader -->|"Majority writes"| Mongo["MongoDB"]
+    Loader -->|"After confirmed persistence and stored receipt"| Cleanup["Raw cleanup"]
+    Cleanup -->|"Delete original object"| Raw
+    Mongo -->|"Secondary reads in deployment"| Analysis["Analysis API"]
+    Analysis --> Dashboard["SSR dashboard"]
 ```
 
 The collector durably stores original gzip/JWE bytes **before** acknowledging.

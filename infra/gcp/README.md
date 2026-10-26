@@ -42,20 +42,33 @@ and [cloud bootstrap sequence](../../docs/IMPLEMENTATION_STATUS.md#cloud-secret-
 The compact flow below is a deployment reference, not a replacement for those
 reviewer-facing visual views.
 
-```text
-Browsers -> Cloud Run Next.js frontend HTTPS URL
-              -> server-side requests to Cloud Run API HTTPS URL
-Devices  -> Cloud Run API HTTPS URL
-Cloud Run provides TLS and HTTP-to-HTTPS redirect for both run.app origins.
-
-POST /api/v1/traffic-log-uploads
-  -> GCS immutable raw -> object-event Pub/Sub -> Cloud Run spool-parse
-  -> silver Pub/Sub -> Cloud Run spool-load -> majority Atlas writes
-  -> majority stored receipt -> delete raw -> ACK
-Parser and loader each have a DLQ.
-
-All Cloud Run egress -> dedicated VPC subnet -> Cloud NAT -> static IP
-Frontend SSR -> backend HTTPS origin for API calls (no browser API tokens/CORS)
+```mermaid
+flowchart TB
+    Browser["Browsers"] -->|"HTTPS public_url"| Frontend
+    Devices["Devices"] -->|"HTTPS backend_url"| API
+    subgraph Run["Cloud Run"]
+        Frontend["Next.js SSR frontend<br/>Native TLS / HTTP-to-HTTPS redirect"]
+        API["FastAPI API<br/>Native TLS / HTTP-to-HTTPS redirect"]
+        Parser["spool-parse"]
+        Loader["spool-load"]
+    end
+    Frontend -->|"Server-side HTTPS calls<br/>No browser API tokens or CORS needed"| API
+    API -->|"POST /api/v1/traffic-log-uploads"| Raw["GCS immutable raw"]
+    Raw -->|"Object-created notification"| Events["Object-event Pub/Sub"]
+    Events -->|"Pull"| Parser
+    Parser -->|"Protected documents"| Silver["Silver Pub/Sub"]
+    Silver -->|"Pull"| Loader
+    Parser --> ParseDLQ["Parse DLQ"]
+    Loader --> LoadDLQ["Load DLQ"]
+    Loader -->|"Majority writes"| Atlas["MongoDB Atlas"]
+    Atlas --> Receipt["Majority stored receipt"]
+    Receipt --> Cleanup["Loader: delete raw"]
+    Cleanup -->|"Delete object"| Raw
+    Cleanup -->|"After deletion confirmed"| Ack["ACK silver message"]
+    Ack --> Silver
+    Run -.->|"All workload egress"| Subnet["Dedicated VPC subnet"]
+    Subnet --> NAT["Cloud NAT"]
+    NAT --> Egress["Static egress IP"]
 ```
 
 Terraform always provisions the private regional raw bucket, GCS notifications,
