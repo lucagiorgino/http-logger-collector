@@ -61,9 +61,30 @@ def test_primary_analysis_reads_are_rejected_outside_development(monkeypatch):
         "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true",
     ],
 )
-def test_standalone_and_direct_connections_cannot_bypass_replica_routing(uri):
+def test_standalone_and_direct_connections_cannot_bypass_replica_routing(uri, monkeypatch):
+    monkeypatch.setattr(settings, "app_env", "production")
+    monkeypatch.setattr(settings, "mongo_allow_primary_reads", False)
     with pytest.raises(PersistenceError, match="replicaSet"):
         MongoRepository(uri=uri)
+
+
+@pytest.mark.parametrize("allow_primary", [False, True])
+def test_compose_direct_connection_requires_explicit_development_primary_reads(
+    monkeypatch, allow_primary
+):
+    monkeypatch.setattr(settings, "app_env", "development")
+    monkeypatch.setattr(settings, "mongo_allow_primary_reads", allow_primary)
+    uri = "mongodb://mongo:28017/?replicaSet=rs0&directConnection=true"
+    if not allow_primary:
+        with pytest.raises(PersistenceError, match="directConnection"):
+            MongoRepository(uri=uri)
+    else:
+        repository = MongoRepository(uri=uri)
+        try:
+            assert repository.analysis_logs.read_preference == ReadPreference.PRIMARY
+            assert repository.traffic_logs.write_concern.document == {"w": "majority"}
+        finally:
+            asyncio.run(repository.close())
 
 
 @pytest.mark.parametrize(

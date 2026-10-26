@@ -61,28 +61,31 @@ idempotency, buffering, DLQs and latency tradeoffs.
 
 ## Try it locally
 
-Requires Python 3.11+, Node.js 22.13+/24+ LTS, Docker/Compose and configured Auth0
-API/frontend applications. From the repository root:
+Requires Python 3.11+, Docker/Compose and configured Auth0 API/frontend applications.
+Native frontend development additionally needs Node.js 22.13+/24+ LTS.
+From the repository root:
 
 ```bash
 make install
 cp .env.example .env
 # Set the backend Auth0 tenant and API audience.
-make frontend-install
 cp frontend/.env.example frontend/.env.local
 # Configure frontend Auth0 credentials and a random session secret.
-make dev                         # API, both workers and Docker dependencies
+make local-containers-up         # Full stack in Docker, including API, workers and frontend
 ```
 
-In another terminal, run `make frontend-dev`, then open
-**http://localhost:8080**. On native Linux, use
-`make dev PROXY_SERVICE=proxy-host` instead.
+Open **http://localhost:8080**. For a native collector instead, use
+`make local-infra-up`, `make local-collector-run`, and the other explicit
+`local-*-run` / `local-frontend-dev` commands in the
+[local-mode guide](docs/RUNBOOK.md#run-the-live-development-stack).
+`make help` lists actions; old commands remain compatibility aliases.
 
 [Local setup and ports](docs/RUNBOOK.md#local-setup) and
 [frontend/Auth0 setup](frontend/README.md#run-locally) cover configuration.
 Use synthetic data: local OpenBao is ephemeral, and restarting it loses encryption
-keys even though MongoDB/MinIO volumes persist. `make dev-down` stops containers
-without deleting those volumes.
+keys even though MongoDB/MinIO volumes persist. `make local-apps-stop` preserves
+running dependencies and keys; `make local-containers-down` also removes
+dependency containers without deleting their volumes.
 
 ## Evaluate and deploy
 

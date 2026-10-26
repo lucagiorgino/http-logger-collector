@@ -33,9 +33,15 @@ class MongoRepository:
             options = parse_uri(uri)["options"]
         except PyMongoError:
             raise PersistenceError("Invalid MongoDB connection configuration") from None
-        if not options.get("replicaSet") or options.get("directConnection"):
+        development_primary = (
+            settings.app_env == "development" and settings.mongo_allow_primary_reads
+        )
+        if not options.get("replicaSet") or (
+            options.get("directConnection") and not development_primary
+        ):
             raise PersistenceError(
-                "MONGO_URI must specify replicaSet and must not enable directConnection"
+                "MONGO_URI must specify replicaSet; directConnection requires explicit "
+                "development primary reads"
             )
         self.client: AsyncMongoClient[dict[str, Any]] = AsyncMongoClient(
             uri,

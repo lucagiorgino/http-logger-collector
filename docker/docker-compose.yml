@@ -12,8 +12,9 @@ x-proxy: &proxy
     PROXY_EXTERNAL_SCHEME: ${PROXY_EXTERNAL_SCHEME:-http}
     APP_PORT: ${APP_PORT:-9090}
     FRONTEND_PORT: ${FRONTEND_PORT:-3000}
-    PROXY_UPSTREAM_HOST: host.docker.internal
-    NGINX_ENVSUBST_FILTER: "^(PROXY_BIND_HOST|PROXY_PORT|PROXY_EXTERNAL_SCHEME|PROXY_UPSTREAM_HOST|APP_PORT|FRONTEND_PORT)$$"
+    PROXY_BACKEND_HOST: host.docker.internal
+    PROXY_FRONTEND_HOST: host.docker.internal
+    NGINX_ENVSUBST_FILTER: "^(PROXY_BIND_HOST|PROXY_PORT|PROXY_EXTERNAL_SCHEME|PROXY_BACKEND_HOST|PROXY_FRONTEND_HOST|APP_PORT|FRONTEND_PORT)$$"
   volumes:
     - ./docker/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
   healthcheck:
@@ -22,10 +23,48 @@ x-proxy: &proxy
     timeout: 5s
     retries: 15
 
+x-application-environment: &application-environment
+  APP_ENV: development
+  APP_HOST: 0.0.0.0
+  APP_PORT: ${APP_PORT:-9090}
+  APP_RELOAD: "false"
+  REQUIRE_HTTPS: "false"
+  AUTH0_DOMAIN: ${AUTH0_DOMAIN:-}
+  AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:-}
+  MONGO_URI: mongodb://mongo:${MONGO_PORT:-28017}/?replicaSet=${MONGO_REPLICA_SET:-rs0}&directConnection=true
+  MONGO_ALLOW_PRIMARY_READS: "true"
+  OPENBAO_ADDR: http://openbao:${OPENBAO_PORT:-28200}
+  OPENBAO_TOKEN_FILE: /run/secrets/openbao-token
+  SPOOL_STORAGE_BACKEND: minio
+  SPOOL_ENDPOINT_URL: http://minio:9000
+  PUBSUB_EMULATOR_HOST: pubsub:8681
+  SPOOL_MINIO_ACCESS_KEY_FILE: /run/secrets/minio-access-key
+  SPOOL_MINIO_SECRET_KEY_FILE: /run/secrets/minio-secret-key
+
+x-application: &application
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: amazing-http-logger:dev
+  env_file:
+    - ${ENV_FILE:-.env}
+  environment: *application-environment
+  secrets: [minio-access-key, minio-secret-key]
+  restart: unless-stopped
+  stop_grace_period: 75s
+  mem_limit: 1g
+  depends_on: &application-dependencies
+    mongo:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+    pubsub-init:
+      condition: service_completed_successfully
+
 services:
   proxy:
     <<: *proxy
-    profiles: [dev, proxy]
+    profiles: [dev, proxy, native-proxy]
     network_mode: bridge
     ports:
       - "${PROXY_BIND_HOST:-127.0.0.1}:${PROXY_PORT:-8080}:${PROXY_PORT:-8080}"
@@ -36,9 +75,24 @@ services:
     environment:
       <<: *proxy-environment
       PROXY_BIND_HOST: ${PROXY_BIND_HOST:-127.0.0.1}
-      PROXY_UPSTREAM_HOST: 127.0.0.1
+      PROXY_BACKEND_HOST: 127.0.0.1
+      PROXY_FRONTEND_HOST: 127.0.0.1
+  proxy-containers:
+    <<: *proxy
+    profiles: [full]
+    environment:
+      <<: *proxy-environment
+      PROXY_BACKEND_HOST: collector
+      PROXY_FRONTEND_HOST: frontend
+    ports:
+      - "${PROXY_BIND_HOST:-127.0.0.1}:${PROXY_PORT:-8080}:${PROXY_PORT:-8080}"
+    depends_on:
+      collector:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
   openbao:
-    profiles: [dev]
+    profiles: [infra, full, dev]
     image: ${OPENBAO_IMAGE:-ghcr.io/openbao/openbao:2.7.1}
     user: "${OPENBAO_UID:-1000}:${OPENBAO_GID:-1000}"
     entrypoint: ["/bin/sh", "-ec"]
@@ -62,7 +116,7 @@ services:
       timeout: 5s
       retries: 30
   mongo:
-    profiles: [dev]
+    profiles: [infra, full, dev]
     image: ${MONGO_IMAGE:-mongo:7}
     command: ["mongod", "--replSet", "${MONGO_REPLICA_SET:-rs0}", "--bind_ip_all", "--port", "${MONGO_PORT:-28017}"]
     restart: unless-stopped
@@ -96,11 +150,11 @@ services:
       timeout: 5s
       retries: 30
   pubsub:
-    profiles: [dev, spool, tools]
+    profiles: [infra, full, dev, spool, tools]
     image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
     command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8681", "--project=logger-local"]
     ports:
-      - "127.0.0.1:28681:8681"
+      - "127.0.0.1:${PUBSUB_PORT:-28681}:8681"
     mem_limit: 512m
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8681"]
@@ -108,7 +162,7 @@ services:
       timeout: 5s
       retries: 60
   spool-bridge:
-    profiles: [dev, spool, tools]
+    profiles: [infra, full, dev, spool, tools]
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -117,7 +171,7 @@ services:
     environment:
       APP_ENV: development
       PUBSUB_EMULATOR_HOST: pubsub:8681
-      SPOOL_EVENT_TOPIC: projects/logger-local/topics/uploads
+      SPOOL_EVENT_TOPIC: ${SPOOL_EVENT_TOPIC:-projects/logger-local/topics/uploads}
     depends_on:
       pubsub:
         condition: service_healthy
@@ -129,7 +183,7 @@ services:
       timeout: 5s
       retries: 30
   minio:
-    profiles: [dev, spool, tools]
+    profiles: [infra, full, dev, spool, tools]
     build:
       context: .
       dockerfile: docker/minio.Dockerfile
@@ -147,8 +201,8 @@ services:
       spool-bridge:
         condition: service_healthy
     ports:
-      - "127.0.0.1:29000:9000"
-      - "127.0.0.1:29001:9001"
+      - "127.0.0.1:${MINIO_PORT:-29000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-29001}:9001"
     volumes:
       - minio-spool:/data
     mem_limit: 512m
@@ -158,7 +212,7 @@ services:
       timeout: 5s
       retries: 30
   minio-init:
-    profiles: [tools]
+    profiles: [full, apps, workers, collector, maintenance, tools]
     build:
       context: .
       dockerfile: docker/minio.Dockerfile
@@ -168,18 +222,97 @@ services:
     command:
       - |
         mc alias set local http://minio:9000 "$$(cat /run/secrets/minio-access-key)" "$$(cat /run/secrets/minio-secret-key)" >/dev/null
-        mc mb --ignore-existing local/traffic-uploads
-        mc event add local/traffic-uploads arn:minio:sqs::spool:webhook --event put --prefix raw/ --suffix .upload --ignore-existing
+        mc mb --ignore-existing "local/$$SPOOL_BUCKET"
+        mc event add "local/$$SPOOL_BUCKET" arn:minio:sqs::spool:webhook --event put --prefix raw/ --suffix .upload --ignore-existing
+    environment:
+      SPOOL_BUCKET: ${SPOOL_BUCKET:-traffic-uploads}
     secrets: [minio-access-key, minio-secret-key]
     depends_on:
       minio:
         condition: service_healthy
+  pubsub-init:
+    <<: *application
+    profiles: [full, apps, workers, collector, maintenance, tools]
+    command: ["python", "-m", "app.spool_dev", "init"]
+    restart: "no"
+    depends_on:
+      pubsub:
+        condition: service_healthy
+  collector:
+    <<: *application
+    profiles: [apps, full, collector]
+    command: ["python", "-m", "app"]
+    secrets: [openbao-token, minio-access-key, minio-secret-key]
+    ports:
+      - "127.0.0.1:${APP_PORT:-9090}:${APP_PORT:-9090}"
+    depends_on:
+      <<: *application-dependencies
+      openbao:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ['APP_PORT'] + '/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  parser:
+    <<: *application
+    profiles: [apps, full, workers]
+    command: ["python", "-m", "app.spool_worker", "parse"]
+    secrets: [openbao-token, minio-access-key, minio-secret-key]
+    depends_on:
+      <<: *application-dependencies
+      openbao:
+        condition: service_healthy
+  loader:
+    <<: *application
+    profiles: [apps, full, workers]
+    command: ["python", "-m", "app.spool_worker", "load"]
+  cleaner:
+    <<: *application
+    profiles: [maintenance]
+    restart: "no"
+    environment:
+      <<: *application-environment
+      UPLOAD_ID: ${UPLOAD_ID:-}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        test -n "$$UPLOAD_ID" || { echo "UPLOAD_ID is required; only stored uploads may be cleaned" >&2; exit 2; }
+        exec python -m app.spool_worker cleanup "$$UPLOAD_ID"
+  frontend:
+    profiles: [apps, full, frontend]
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    image: amazing-http-logger-dashboard:dev
+    env_file:
+      - path: frontend/.env
+        required: false
+      - path: ${FRONTEND_ENV_FILE:-frontend/.env.local}
+        required: false
+    environment:
+      APP_ENV: development
+      BACKEND_API_URL: http://collector:${APP_PORT:-9090}
+      PORT: ${FRONTEND_PORT:-3000}
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:${FRONTEND_PORT:-3000}"
+    restart: unless-stopped
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:' + process.env.PORT).then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
 volumes:
   mongo-data:
   minio-spool:
 
 secrets:
+  openbao-token:
+    file: ${OPENBAO_TOKEN_FILE:-.secrets/openbao-token}
   openbao-dev-root-token:
     file: ${OPENBAO_DEV_ROOT_TOKEN_FILE:-.secrets/openbao-dev-root-token}
   minio-access-key:

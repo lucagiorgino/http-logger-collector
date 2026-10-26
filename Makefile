@@ -1,4 +1,5 @@
 PYTHON ?= python3
+.DEFAULT_GOAL := help
 VENV ?= .venv
 PIP := $(VENV)/bin/pip
 PYTHON_VENV := $(VENV)/bin/python
@@ -11,9 +12,8 @@ STACK_TEST_ENV_FILE ?= .env.stack-test
 OPENBAO_UID ?= $(shell id -u)
 OPENBAO_GID ?= $(shell id -g)
 export OPENBAO_UID OPENBAO_GID
-COMPOSE = docker compose --project-directory . --env-file "$(ENV_FILE)" -f docker/docker-compose.yml
+COMPOSE = ENV_FILE="$(ENV_FILE)" docker compose --project-directory . --env-file "$(ENV_FILE)" -f docker/docker-compose.yml
 PROXY_SERVICE ?= proxy
-SPOOL_DEV_ENV = APP_ENV=development SPOOL_STORAGE_BACKEND=minio SPOOL_ENDPOINT_URL=http://localhost:29000 PUBSUB_EMULATOR_HOST=localhost:28681 SPOOL_BUCKET=traffic-uploads SPOOL_EVENT_TOPIC=projects/logger-local/topics/uploads SPOOL_SUBSCRIPTION=projects/logger-local/subscriptions/uploads SPOOL_SILVER_TOPIC=projects/logger-local/topics/uploads-silver SPOOL_SILVER_SUBSCRIPTION=projects/logger-local/subscriptions/uploads-silver SPOOL_PARSE_DLQ_TOPIC=projects/logger-local/topics/parse-dlq SPOOL_LOAD_DLQ_TOPIC=projects/logger-local/topics/load-dlq
 IMAGE_REPOSITORY ?= amazing-http-logger
 FRONTEND_IMAGE_REPOSITORY ?= amazing-http-logger-dashboard
 IMAGE_TAG ?= dev
@@ -27,6 +27,25 @@ HELM_VALUES ?= $(HELM_CHART)/values-development.yaml
 HELM_ARGS ?=
 HELM_CONTEXT = $(if $(KUBE_CONTEXT),--kube-context "$(KUBE_CONTEXT)",)
 KUBECTL_CONTEXT = $(if $(KUBE_CONTEXT),--context "$(KUBE_CONTEXT)",)
+
+help:
+	@printf '%s\n' \
+	  'Local development (see docs/RUNBOOK.md):' \
+	  '  local-infra-up          Start Docker dependencies; provision credentials, keys, queues and bucket' \
+	  '  local-containers-up     Start the full Docker stack, including collector, workers, frontend and proxy' \
+	  '  local-workers-up        Start parser and loader containers plus dependencies' \
+	  '  local-apps-stop         Stop application containers/proxy; preserve running dependencies and keys' \
+	  '  local-containers-down   Remove local containers/network; retain Mongo/MinIO volumes (OpenBao keys are lost)' \
+	  '  local-collector-run     Run ONLY the collector natively in this terminal using .venv and ENV_FILE' \
+	  '  local-parser-run        Run the parser natively in this terminal' \
+	  '  local-loader-run        Run the loader natively in this terminal' \
+	  '  local-frontend-dev      Run the Next.js dev server natively in this terminal' \
+	  '  local-native-run        Start dependencies/proxy, then supervise native collector/parser/loader' \
+	  '  local-proxy-native-up   Start the proxy for native applications (PROXY_SERVICE=proxy-host on native Linux)' \
+	  '  local-cleanup           Run one-shot container cleanup; requires UPLOAD_ID=<stored receipt ID>' \
+	  '  compose-config          Validate every profile without printing environment values' \
+	  '  compose-ps / compose-logs  Show containers / follow logs' \
+	  'Legacy run/dev/spool-* and frontend-dev commands remain compatibility aliases.'
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -59,16 +78,20 @@ lint:
 frontend-install:
 	npm --prefix frontend ci
 
-frontend-dev: FRONTEND_PORT ?= 3000
-frontend-dev:
+local-frontend-dev: FRONTEND_PORT ?= 3000
+local-frontend-dev:
 	PORT="$(FRONTEND_PORT)" npm --prefix frontend run dev
+
+frontend-dev: local-frontend-dev
 
 frontend-build:
 	npm --prefix frontend run build
 
-frontend-start: FRONTEND_PORT ?= 3000
-frontend-start:
+local-frontend-start: FRONTEND_PORT ?= 3000
+local-frontend-start:
 	PORT="$(FRONTEND_PORT)" npm --prefix frontend run start
+
+frontend-start: local-frontend-start
 
 frontend-test:
 	npm --prefix frontend test
@@ -79,31 +102,38 @@ frontend-test-browser:
 	npm --prefix frontend run build
 	npm --prefix frontend run test:e2e
 
-run:
+local-collector-run:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app
 
-spool-parser:
+local-parser-run:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_worker parse
 
-spool-loader:
+local-loader-run:
 	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_worker load
 
+run: local-collector-run
+spool-parser: local-parser-run
+spool-loader: local-loader-run
+
 spool-dev-up:
-	ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_dev prepare
-	$(COMPOSE) up -d --build --wait pubsub spool-bridge minio
-	$(SPOOL_DEV_ENV) ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_dev init
-	$(COMPOSE) --profile spool run --no-deps --build --rm minio-init
+	APP_ENV=development ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_dev prepare
+	$(COMPOSE) --profile spool up -d --build --wait
+	$(COMPOSE) build pubsub-init minio-init
+	$(COMPOSE) run --rm --no-deps pubsub-init
+	$(COMPOSE) run --rm --no-deps minio-init
 
 spool-dev-down:
 	$(COMPOSE) stop minio spool-bridge pubsub
 
-proxy-up:
+local-proxy-native-up:
 	@case "$(PROXY_SERVICE)" in proxy|proxy-host) ;; *) echo "PROXY_SERVICE must be proxy or proxy-host" >&2; exit 1;; esac
-	$(COMPOSE) stop $(if $(filter proxy-host,$(PROXY_SERVICE)),proxy,proxy-host)
+	$(COMPOSE) stop proxy-containers $(if $(filter proxy-host,$(PROXY_SERVICE)),proxy,proxy-host)
 	$(COMPOSE) up -d --wait "$(PROXY_SERVICE)"
 
+proxy-up: local-proxy-native-up
+
 proxy-down:
-	$(COMPOSE) stop proxy proxy-host
+	$(COMPOSE) stop proxy proxy-host proxy-containers
 
 mongo-up:
 	$(COMPOSE) up -d --wait mongo
@@ -119,10 +149,35 @@ openbao-up:
 openbao-down:
 	$(COMPOSE) stop openbao
 
-dev-up: mongo-up openbao-up proxy-up spool-dev-up
+local-infra-up:
+	APP_ENV=development ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.kms prepare-dev
+	APP_ENV=development ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.spool_dev prepare
+	$(COMPOSE) up -d --no-recreate --wait openbao
+	APP_ENV=development ENV_FILE="$(ENV_FILE)" "$(PYTHON_VENV)" -m app.kms bootstrap-dev
+	$(COMPOSE) --profile infra up -d --build --wait mongo pubsub spool-bridge minio
+	$(COMPOSE) build pubsub-init minio-init
+	$(COMPOSE) run --rm --no-deps pubsub-init
+	$(COMPOSE) run --rm --no-deps minio-init
 
-dev-down:
+local-containers-up: local-infra-up
+	$(COMPOSE) stop proxy proxy-host
+	$(COMPOSE) --profile full up -d --build --wait --no-deps --force-recreate collector parser loader frontend proxy-containers
+
+local-workers-up: local-infra-up
+	$(COMPOSE) --profile infra --profile workers up -d --build --wait --no-deps --force-recreate parser loader
+
+local-apps-stop:
+	$(COMPOSE) --profile "*" stop collector parser loader frontend proxy-containers
+
+local-containers-down:
 	$(COMPOSE) --profile "*" down
+
+local-cleanup:
+	@test -n "$(UPLOAD_ID)" || { echo 'UPLOAD_ID=<stored receipt ID> is required' >&2; exit 2; }
+	$(COMPOSE) --profile infra --profile maintenance run --rm cleaner
+
+dev-up: local-infra-up local-proxy-native-up
+dev-down: local-containers-down
 
 compose-config:
 	$(COMPOSE) --profile "*" config --quiet
@@ -133,14 +188,16 @@ compose-ps:
 compose-logs:
 	$(COMPOSE) --profile "*" logs --follow --tail 100
 
-dev: dev-up
-	$(SPOOL_DEV_ENV) ENV_FILE="$(ENV_FILE)" bash -ec '\
+local-native-run: dev-up
+	ENV_FILE="$(ENV_FILE)" bash -ec '\
 	  "$(PYTHON_VENV)" -m app.spool_worker parse & parse_pid=$$!; \
 	  "$(PYTHON_VENV)" -m app.spool_worker load & load_pid=$$!; \
 	  "$(PYTHON_VENV)" -m app & api_pid=$$!; \
 	  trap '\''kill "$$parse_pid" "$$load_pid" "$$api_pid" 2>/dev/null || true; wait'\'' EXIT; \
 	  trap '\''exit 130'\'' INT TERM; \
 	  wait -n "$$parse_pid" "$$load_pid" "$$api_pid"'
+
+dev: local-native-run
 
 image:
 	docker build -f docker/Dockerfile -t "$(IMAGE_REPOSITORY):$(IMAGE_TAG)" .
@@ -166,4 +223,4 @@ helm-down:
 helm-port-forward:
 	kubectl $(KUBECTL_CONTEXT) --namespace "$(KUBE_NAMESPACE)" port-forward "service/$(KUBE_SERVICE)" "$(KUBE_LOCAL_PORT):http"
 
-.PHONY: install gcp-install gcp-check gcp-deploy gcp-secrets-bootstrap test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run spool-parser spool-loader spool-dev-up spool-dev-down proxy-up proxy-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev compose-config compose-ps compose-logs image frontend-image helm-lint helm-template helm-up helm-test helm-down helm-port-forward
+.PHONY: help local-infra-up local-containers-up local-workers-up local-apps-stop local-containers-down local-cleanup local-collector-run local-parser-run local-loader-run local-frontend-dev local-frontend-start local-proxy-native-up local-native-run install gcp-install gcp-check gcp-deploy gcp-secrets-bootstrap test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run spool-parser spool-loader spool-dev-up spool-dev-down proxy-up proxy-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev compose-config compose-ps compose-logs image frontend-image helm-lint helm-template helm-up helm-test helm-down helm-port-forward

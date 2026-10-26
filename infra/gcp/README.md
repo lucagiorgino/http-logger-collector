@@ -3,8 +3,32 @@
 # GCP production deployment
 
 Use a dedicated billing-enabled GCP project per environment. This is an independent
-production deployment; local development still uses Docker dependencies and host
-Python. Cloud-only KMS adapters remain under `infra/gcp/`.
+production deployment; local development supports full Compose containers or
+native applications with Docker dependencies. Cloud-only KMS adapters remain
+under `infra/gcp/`.
+
+## Impact of local Compose profiles and native collector mode
+
+**No Terraform or Cloud Run topology changes are required.** Compose profiles
+select local processes/containers only; Terraform and the cloud deployment script
+do not read `docker/docker-compose.yml`.
+
+| Area | Impact / required adjustment |
+| --- | --- |
+| Cloud workloads | Still four separate services: backend, frontend, spool-parse and spool-load; no local proxy/MinIO/bridge/emulator is deployed |
+| Images / commands | Unchanged cloud build paths: `infra/gcp/runtime/Dockerfile` for API/workers and `docker/frontend.Dockerfile` for frontend; cloud supervisor entrypoints remain unchanged |
+| Native collector | Local `.venv/bin/python -m app` does not replace, stop or supervise any deployed Cloud Run instance |
+| Networking | Local Compose DNS and loopback ports do not alter Cloud Run HTTPS origins, VPC/NAT, Atlas allowlists or workload identities |
+| MongoDB | Local container direct connections require both `APP_ENV=development` and explicit primary reads; production continues rejecting direct connections and using strict-secondary analysis |
+| Frontend | The additional `http://collector` exception requires explicit development; the deployed frontend retains the generated HTTPS `BACKEND_API_URL` |
+| Cleanup / retention | No new cloud cleaner service/job is required: loader deletes raw after persistence; MongoDB TTL handles configured retention |
+| Environment / secrets | Do not copy Compose development overrides, MinIO/OpenBao credentials, emulator addresses or direct Mongo URIs into cloud configuration; existing secret bootstrap and Terraform env generation already enforce separation |
+
+The regular next image build includes the development-gated configuration
+changes, but there is no profile migration or mandatory infrastructure rollout.
+Keep cloud image paths/entrypoints, production read routing and generated URLs
+unchanged. There is no billed-resource action associated with switching local
+modes; the existing GCP check/deploy commands retain their behavior.
 
 ## Deployment summary
 

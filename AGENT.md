@@ -56,11 +56,12 @@ Kubernetes, kubectl, and Helm are needed only for deployment.
 
 ```bash
 make install
-make dev
+make help
+make local-containers-up
 make test
 make lint
-make run
-make dev-down
+make local-collector-run
+make local-apps-stop
 make image
 make helm-lint
 make helm-up

@@ -14,8 +14,8 @@ the [operation index](../docs/IMPLEMENTATION_STATUS.md#operation-index), and
 
 ## Run locally
 
-Use Node.js 22.13+ LTS or 24+ LTS, npm, and a running backend (`make dev` in a
-separate terminal).
+Use Node.js 22.13+ LTS or 24+ LTS, npm, and a running backend
+(`make local-native-run` in a separate terminal).
 
 From the repository root:
 
@@ -25,10 +25,10 @@ cp frontend/.env.example frontend/.env.local
 openssl rand -hex 32
 # Set the generated value as AUTH0_SECRET in frontend/.env.local.
 # Fill in the other Auth0 settings described below.
-make frontend-dev
+make local-frontend-dev
 ```
 
-`make dev` starts NGINX; open **http://localhost:8080**.
+`make local-native-run` starts NGINX; open **http://localhost:8080**.
 Without complete Auth0 configuration, the welcome
 page displays setup instructions instead of pretending to be authenticated.
 There is no mock/demo bypass in the application.
@@ -36,7 +36,7 @@ There is no mock/demo bypass in the application.
 The frontend has its own environment file; it does not read the backend's `.env`.
 Its listener is **3000** in development and production; Python uses **9090** in both.
 NGINX exposes the shared development origin on **8080**. Change the listener with
-`make frontend-dev FRONTEND_PORT=3010` (or `PORT=3010 npm --prefix frontend run dev`)
+`make local-frontend-dev FRONTEND_PORT=3010` (or `PORT=3010 npm --prefix frontend run dev`)
 and update the proxy's upstream port. Change `APP_BASE_URL` and Auth0 URLs together
 only if the browser-facing origin changes. `PORT` belongs in the process
 environment, not Next.js's `.env.local`.
@@ -49,6 +49,22 @@ Use the origin only, without `/api` or `/api/v1`: request paths already contain
 `/api/v1`. Adding a prefix produces incorrect paths such as `/api/api/v1/devices`.
 The public frontend origin belongs in `APP_BASE_URL`; it does not determine the
 API address.
+
+### Containerized local mode
+
+After configuring the same Auth0 values, `make local-containers-up` starts the
+frontend, collector and both workers in dedicated Compose containers. A host Node
+installation is unnecessary for this mode. Runtime variables come from
+`frontend/.env` followed by `frontend/.env.local` (or `FRONTEND_ENV_FILE`).
+Compose sets `APP_ENV=development` and overrides the server-side API origin to
+`http://collector:9090`; only that exact Docker hostname is allowed as an
+additional non-loopback HTTP origin in explicit development. HTTPS remains
+required for other remote origins and all production configurations.
+
+The public origin stays `http://localhost:8080`, so Auth0 callbacks/grants do not
+change between modes. Stop the native frontend/collector before binding their
+ports with containers. Use `make local-apps-stop` to return to native mode without
+restarting OpenBao. See the [profile guide](../docs/RUNBOOK.md#run-the-live-development-stack).
 
 For proxy routing, trusted HTTPS tunnels and native Linux's
 `PROXY_SERVICE=proxy-host`, see [local stack setup](../docs/RUNBOOK.md#run-the-live-development-stack)
@@ -110,7 +126,7 @@ Regular Web Application **User-Delegated Access**, including the requested
 **Client Access** machine-to-machine grant or enable all applications.
 See [Auth0 API access policies](https://auth0.com/docs/get-started/apis/api-access-policies-for-applications).
 
-After changing environment settings, restart `make frontend-dev` and begin a
+After changing environment settings, restart `make local-frontend-dev` and begin a
 fresh sign-in from the configured `APP_BASE_URL` rather than reloading an old
 callback URL. That origin's `/auth/callback` must be in the Web application's
 Allowed Callback URLs. For direct local development, use `http://localhost:3000`

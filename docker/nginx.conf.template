@@ -6,12 +6,12 @@ map $http_upgrade $connection_upgrade {
 }
 
 upstream backend {
-    server ${PROXY_UPSTREAM_HOST}:${APP_PORT};
+    server ${PROXY_BACKEND_HOST}:${APP_PORT};
     keepalive 16;
 }
 
 upstream frontend {
-    server ${PROXY_UPSTREAM_HOST}:${FRONTEND_PORT};
+    server ${PROXY_FRONTEND_HOST}:${FRONTEND_PORT};
     keepalive 16;
 }
 

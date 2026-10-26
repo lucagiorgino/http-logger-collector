@@ -261,6 +261,27 @@ test("backend config rejects API path prefixes instead of duplicating versioned 
   );
 });
 
+test("Compose collector HTTP is restricted to explicit local development", () => {
+  assert.equal(
+    backendSettings({
+      APP_ENV: "development",
+      BACKEND_API_URL: "http://collector:9090",
+    }).baseUrl,
+    "http://collector:9090",
+  );
+  for (const APP_ENV of [undefined, "production", "test"]) {
+    assert.throws(() =>
+      backendSettings({ APP_ENV, BACKEND_API_URL: "http://collector:9090" }),
+    );
+  }
+  assert.throws(() =>
+    backendSettings({
+      APP_ENV: "development",
+      BACKEND_API_URL: "http://remote.example:9090",
+    }),
+  );
+});
+
 test("registration sends only device fields and validates identity, name and policy", () => {
   const form = new FormData();
   form.set("device_id", "device-123");

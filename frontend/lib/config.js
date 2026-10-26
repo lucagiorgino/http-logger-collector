@@ -21,11 +21,12 @@ export function backendSettings(env = process.env) {
     (url.protocol !== "https:" &&
       !(
         url.protocol === "http:" &&
-        ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+        (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) ||
+          (env.APP_ENV === "development" && url.hostname === "collector"))
       ))
   ) {
     throw new Error(
-      "BACKEND_API_URL must use HTTPS, except for local loopback development.",
+      "BACKEND_API_URL must use HTTPS, except for loopback or the development Compose collector.",
     );
   }
   if (url.pathname !== "/") {

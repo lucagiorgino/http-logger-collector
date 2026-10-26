@@ -35,7 +35,7 @@ holding API credentials.
 | [`app/db/mongo.py`](app/db/mongo.py) | Collections/indexes, primary operations and secondary analysis |
 | [`app/spool_worker.py`](app/spool_worker.py), [`app/spool_dev.py`](app/spool_dev.py) | Worker/operator entry point and local event bootstrap |
 | [`frontend/`](frontend/README.md) | Auth0 sessions, private API adapter, SSR pages and forms |
-| [`docker/`](docker/) | Deployment image and profile-based local dependency stack |
+| [`docker/`](docker/) | Deployment images and profile-based full local stack; native application mode also supported |
 | [`helm/amazing-http-logger/`](helm/amazing-http-logger/) | Optional Kubernetes workloads; cloud resources remain external |
 | [`infra/gcp/`](infra/gcp/README.md) | Terraform, rerunnable deployment orchestration, direct Cloud Run services, cloud-only KMS overlay and secret bootstrap |
 
@@ -55,7 +55,9 @@ Use [contributor guidance](AGENT.md) for repository rules, not copied scaffoldin
   credentials. Neither worker has an unbounded in-memory backlog.
 - Operational settings/receipts use primary/majority; analysis uses strict
   secondary/majority, accepting replica lag instead of increasing primary load
-  during replica outages. Replica-set URIs are mandatory; direct connections fail.
+  during replica outages. Replica-set URIs are mandatory; direct connections fail
+  outside explicit development-primary mode, which allows the single-member
+  Compose replica set to be reached through Docker DNS.
 - OpenBao wraps EC keys at rest, but JWE private keys enter process RAM. If this
   is unacceptable, remote ECDH or a protocol redesign is needed. Cloud KMS keeps
   wrapping/storage master keys non-exportable; its envelope is not OpenBao-compatible.

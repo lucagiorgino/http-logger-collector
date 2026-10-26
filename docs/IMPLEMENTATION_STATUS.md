@@ -66,16 +66,68 @@ and [trust boundaries](../PROJECT-BLUEPRINT.md#trust-and-availability-decisions)
 
 ### Development architecture
 
-Default ports are shown; setup/bootstrap tools are not long-running workloads.
-`make dev` starts dependencies plus host API/parser/loader; the frontend starts
-separately with `make frontend-dev`.
+Default ports are shown; setup/bootstrap tools and the cleaner are not
+long-running workloads. `make local-containers-up` selects the full Compose stack:
+
+```mermaid
+flowchart TB
+    Browser["Browser / external agent :8080"] --> Proxy
+    Browser <-->|"Hosted sign-in / logout"| Auth0["Auth0 tenant"]
+    subgraph Compose["Compose full profile"]
+        Proxy["proxy-containers :8080"]
+        Frontend["frontend :3000"]
+        API["collector :9090"]
+        Parser["parser container"]
+        Loader["loader container"]
+        Mongo["Single-member Mongo rs0 :28017<br/>Persistent volume"]
+        Bao["OpenBao :28200<br/>Ephemeral development keys"]
+        Minio["MinIO :29000<br/>Persistent raw volume"]
+        Bridge["Private spool-bridge :9091"]
+        Emulator["Pub/Sub emulator :28681"]
+        Initializers["Bucket / queue initialization<br/>one-shot dependency gates"]
+    end
+    Proxy -->|"Compose DNS"| Frontend
+    Proxy -->|"Compose DNS"| API
+    Frontend -->|"Development-only http://collector"| API
+    Frontend --> Auth0
+    API -.->|"JWKS"| Auth0
+    API --> Mongo
+    API --> Bao
+    API --> Minio
+    Minio --> Bridge --> Emulator
+    Emulator -->|"Object subscription"| Parser
+    Parser --> Bao
+    Parser --> Minio
+    Parser --> Mongo
+    Parser -->|"Protected silver / parse DLQ"| Emulator
+    Emulator -->|"Silver subscription"| Loader
+    Loader --> Mongo
+    Loader -->|"Raw cleanup"| Minio
+    Loader -->|"Load DLQ"| Emulator
+    Initializers -.->|"Complete before application startup"| API
+    Initializers -.-> Parser
+    Initializers -.-> Loader
+    Cleaner["maintenance profile: one-shot cleaner<br/>Requires stored upload ID"] --> Mongo
+    Cleaner -->|"Retry deletion only after stored"| Minio
+```
+
+Application containers use Compose DNS. The single-node development Mongo URI
+permits direct connection only with explicit development-primary reads; production
+replica discovery/secondary routing is unchanged. The cleaner is not selected by
+`full`; ordinary raw deletion remains in the loader and retention remains Mongo TTL.
+Container frontend/API retain the same public localhost origin and Auth0 callbacks.
+
+Native mode remains supported: `make local-native-run` starts dependencies plus
+host collector/parser/loader; the frontend starts with `make local-frontend-dev`.
+`local-collector-run` alone starts only the host collector. The mixed mode uses
+`local-workers-up` with a native collector/frontend.
 
 ```mermaid
 flowchart TB
     Browser["Browser :8080"] --> Proxy
     Agent["External agent"] --> Proxy
     Browser <-->|"Hosted login / logout"| Auth0["Auth0 tenant"]
-    subgraph Compose["Docker Compose dependencies"]
+    subgraph Compose["Compose infra plus native proxy"]
         Proxy["NGINX :8080"]
         Mongo["Mongo replica set :28017<br/>Single member; persistent volume"]
         Bao["OpenBao :28200<br/>Ephemeral development keys"]
@@ -212,6 +264,7 @@ requests and outcomes; common token validation is shown once.
 | GCP missing-only secret/key bootstrap and runtime loading | [Cloud secret and key bootstrap](#cloud-secret-and-key-bootstrap) |
 | `make gcp-check`, `make gcp-deploy` | [Automated GCP deployment](#automated-gcp-deployment) |
 | `integration_tests.benchmark_ingestion` | [Ingestion latency measurement](#ingestion-latency-measurement) |
+| `local-containers-up`, native component commands, profile selection and `local-cleanup` | [Local development startup and maintenance](#local-development-startup-and-maintenance) |
 
 ### Identity and sessions
 
@@ -876,6 +929,48 @@ sequenceDiagram
 Observed storage includes status polling delay, not an exact Mongo completion
 timestamp. Failure states abort the run; they are not reported as successful
 samples. Percentiles from small local runs do not establish production capacity.
+
+### Local development startup and maintenance
+
+Sources: [`Makefile`](../Makefile), [`docker-compose.yml`](../docker/docker-compose.yml);
+[local mode guide](RUNBOOK.md#run-the-live-development-stack) and
+[GCP impact analysis](../infra/gcp/README.md#impact-of-local-compose-profiles-and-native-collector-mode).
+
+```mermaid
+sequenceDiagram
+    participant Operator
+    participant Make
+    participant Compose
+    participant Bao as OpenBao
+    participant Init as Queue / bucket initialization
+    participant Apps as Collector / parser / loader / frontend
+    Operator->>Make: local-containers-up
+    Make->>Make: Prepare ignored credential files
+    Make->>Compose: Start OpenBao without recreating a running instance
+    Make->>Bao: Idempotent key bootstrap / runtime credential
+    Make->>Compose: Start infra and await health
+    Make->>Init: Provision topics/subscriptions and raw notification bucket
+    Init-->>Make: Completed or explicit error
+    alt Full container mode
+        Make->>Compose: Stop native proxy variants; select full application services
+        Compose->>Apps: Recreate only application containers; refresh credential mounts
+        Note over Compose,Apps: Dedicated container proxy uses Docker DNS; no host gateway
+    else Native collector mode
+        Operator->>Make: local-collector-run after infra setup
+        Make->>Apps: Foreground host Python collector only
+        Note over Operator,Apps: Start native frontend and native/container workers separately
+    end
+    opt Explicit cleanup retry
+        Operator->>Make: local-cleanup UPLOAD_ID=stored receipt ID
+        Make->>Compose: Run one-shot cleaner; never enable with full
+        Compose->>Apps: Existing receipt-based cleanup; reject non-stored receipt
+    end
+    Note over Make,Bao: local-apps-stop preserves running dependencies/keys; full down loses ephemeral keys
+```
+
+These operations do not invoke Terraform or alter Cloud Run services. Old Make
+names remain compatibility aliases. Profile validation, development-only routing
+tests and real local ingestion verify the execution boundary.
 
 ## Validation scope
 

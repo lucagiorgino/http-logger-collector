@@ -10,7 +10,8 @@ plus [health](IMPLEMENTATION_STATUS.md#pipeline-health) and
 
 ## Prerequisites
 - Python 3.11+
-- Docker and Docker Compose for MongoDB/OpenBao/NGINX and MinIO/emulator/bridge
+- Docker Compose 2.24+ for the full containerized stack or just its dependencies
+- Node.js 22.13+/24+ LTS only for native frontend development
 - For Kubernetes deployment only: Kubernetes 1.27+, kubectl, Helm 3 or 4, and a
   StorageClass when using bundled MongoDB
 
@@ -27,21 +28,22 @@ delivery guarantees. This section owns setup and recovery; see the
 
 ```bash
 make install
-make dev-up
+make local-infra-up
 ```
 
-`make dev-up` generates two ignored private MinIO credential files, builds
+`make local-infra-up` generates two ignored private MinIO credential files, builds
 pinned MinIO community server/client releases from source, starts MinIO on
 loopback **29000** (console **29001**), a Pub/Sub emulator on **28681**, and a
 private unexposed MinIO-notification bridge. Archived public MinIO images/binaries
 are no longer available, so the first source build can take several minutes.
-The API/workers run on the host without application image builds;
-the bridge/MinIO setup builds images.
+It provisions OpenBao, bucket notifications and both Pub/Sub hops. The
+containerized mode builds application images; native mode runs application
+processes in the host virtual environment.
 The MinIO volume persists raw uploads; the Pub/Sub emulator is ephemeral.
-After emulator restart rerun `make dev-up` and replay outstanding raw uploads.
-`make spool-dev-up` remains a convenience setup target.
-All services live in `docker/docker-compose.yml`: `spool` selects these three
-services, while `tools` also enables the one-shot MinIO initializer.
+After emulator restart rerun `make local-infra-up` and replay outstanding raw uploads.
+`make spool-dev-up` remains a compatibility target for just the transport services.
+All services live in `docker/docker-compose.yml`; see the
+[profiles and execution modes](#run-the-live-development-stack).
 Make handles credentials, topic provisioning and notification initialization;
 starting a Compose profile alone does not replace these bootstrap steps.
 Synthetic data only: this local MinIO volume does not provide production
@@ -51,16 +53,17 @@ Use the local `SPOOL_*`, `PUBSUB_EMULATOR_HOST` and `GOOGLE_CLOUD_PROJECT`
 defaults in [`.env.example`](../.env.example), preserving existing Auth0/OpenBao
 values in your ignored `.env`. Keep both MinIO credential-file paths.
 
-`make dev` starts the API and both workers. To run separate host processes:
+`make local-containers-up` starts the full containerized stack.
+To run separate host processes after preparing dependencies:
 
 ```bash
-make run
+make local-collector-run
 # Other terminals:
-make spool-parser    # decrypt / decompress / validate / minimize / encrypt
-make spool-loader    # rate-limited Mongo writes / raw cleanup
+make local-parser-run    # decrypt / decompress / validate / minimize / encrypt
+make local-loader-run    # rate-limited Mongo writes / raw cleanup
 ```
 
-Stop host processes with Ctrl+C; `make dev-down` stops the development
+Stop host processes with Ctrl+C; `make local-containers-down` removes the development
 containers and retains MongoDB/MinIO volumes.
 Do not delete MinIO credential files while retaining its volume.
 
@@ -240,89 +243,120 @@ Set backend Auth0 tenant/audience in `.env`; configure the
 
 ## Run the live development stack
 
-```bash
-make dev
-```
-
-Compose starts one MongoDB container as a one-member `rs0` replica set. Its
-healthcheck initializes it and waits for primary readiness. The backend runs in
-the host virtual environment through `python -m app` with Uvicorn reload.
-Python code changes do not require a Docker build, Helm, or Kubernetes.
-
-Compose also starts OpenBao and bootstraps its Transit KEK, wrapped EC key set,
-and a least-privilege runtime credential. It also starts MinIO, the Pub/Sub
-emulator and the private notification bridge, provisions bucket/event resources,
-and starts NGINX. `make dev` then runs the API plus parser and loader host processes.
-Backend and Compose share `.env`, preserving
-Auth0 settings. The backend listens on `127.0.0.1:9090`; the separately started
-frontend listens on `127.0.0.1:3000`. Open the public development origin
-`http://localhost:8080`: NGINX routes API/docs/health paths to the backend and
-all other paths, including `/auth/*`, to the frontend without stripping prefixes.
-Set frontend `APP_BASE_URL=http://localhost:8080` and
-`BACKEND_API_URL=http://127.0.0.1:9090` in `frontend/.env.local`: the former is
-the browser/Auth0 origin, the latter is reached by the SSR server.
-Keep frontend Auth0 Web application credentials there and use `localhost`
-consistently in callback/logout URLs; it is not interchangeable with `127.0.0.1`.
-
-Compose publishes proxy port 8080 by default and uses the Docker Desktop host
-gateway. No selector is needed on Docker Desktop. On native Linux, select the
-host-network proxy to reach loopback-bound host applications:
+### Full containerized mode
 
 ```bash
-make dev PROXY_SERVICE=proxy-host
-# Shutdown covers both proxy variants and all other profiles:
-make dev-down
+make local-containers-up
 ```
 
-The host-network service binds `127.0.0.1:8080` and reaches applications through
-`127.0.0.1`; keep the host backend/frontend bound to loopback.
-The default bridge service uses `host.docker.internal` instead.
-`make proxy-up PROXY_SERVICE=proxy-host` switches just the proxy, stopping the
-other variant first.
+This first prepares private credentials, starts dependencies and bootstraps
+OpenBao without recreating a running OpenBao container. It then starts separate
+collector, parser, loader and frontend containers plus `proxy-containers`.
+Each Python role has an explicit command even though it shares the backend image.
+The private `spool-bridge` runs notifications, not the collector.
 
-To run the components independently:
+Open **http://localhost:8080**. The proxy routes API/docs/health to `collector`
+and pages/auth/forms to `frontend` over Compose DNS, without the host gateway.
+All published ports are loopback-only. Collector/frontend direct ports remain
+9090/3000; images are rebuilt explicitly by the startup command, not hot-reloaded.
+Parser and loader wait for completed bucket and queue initialization.
+Make recreates only application containers after bootstrap so refreshed
+file-mounted runtime credentials are picked up; it never force-recreates OpenBao.
+
+Frontend runtime configuration comes from `frontend/.env`, followed by
+`frontend/.env.local` (or `FRONTEND_ENV_FILE`). Keep real Auth0 Web application
+credentials and `APP_BASE_URL=http://localhost:8080` there. Compose overrides only
+the private API origin to `http://collector:9090` and sets `APP_ENV=development`;
+that exact internal HTTP hostname is allowed only in explicit development.
+Session/API tokens remain server-side. No Auth0 callback/grant changes are needed
+when switching modes with the same public origin.
+
+The single-member Mongo replica set continues advertising `localhost`, preserving
+its existing volume and native clients. Container clients use
+`mongodb://mongo:28017/?replicaSet=rs0&directConnection=true` with explicit
+development primary reads. This avoids hosts-file changes, replica-set
+reconfiguration or shared network namespaces. Outside development, or without
+the explicit primary-read allowance, direct connections remain rejected.
+Production secondary-only behavior is unchanged.
+
+### Native applications with Docker dependencies
 
 ```bash
-make dev-up
-make run
-# In a separate terminal:
-make spool-parser
-# In another terminal:
-make spool-loader
-# In another terminal, after frontend setup:
-make frontend-dev
+make local-infra-up
+make local-proxy-native-up       # Docker Desktop
+# On native Linux instead:
+make local-proxy-native-up PROXY_SERVICE=proxy-host
+
+# Separate terminals; each command stays in the foreground:
+make local-collector-run
+make local-parser-run
+make local-loader-run
+make frontend-install
+make local-frontend-dev
 ```
 
-`make run` uses the MongoDB URI in `.env`, which interpolates `MONGO_HOST`,
-`MONGO_PORT`, and `MONGO_REPLICA_SET`, normally resolving to
-`mongodb://localhost:28017/?replicaSet=rs0`. MongoDB publishes only port 28017 on
-loopback and stores data in one named volume. MongoDB requires no hosts-file edits,
-shared network namespaces, or extra database services. OpenBao uses loopback port
-28200; Python loads `OPENBAO_ADDR` and `OPENBAO_TOKEN_FILE` from the same `.env`.
-The generated `.secrets/` credentials are private and ignored by Git and Docker builds.
-The application never receives the development root credential.
+**`local-collector-run` runs only the collector outside Docker**, using
+`ENV_FILE` and `.venv/bin/python -m app`. It does not start workers, containers
+or frontend. Native clients retain the normal replica-set URI
+`mongodb://localhost:28017/?replicaSet=rs0`. OpenBao/MinIO/Pub/Sub are reached
+through their loopback-published ports.
 
-The local profile sets `MONGO_ALLOW_PRIMARY_READS=true`, explicitly reading analysis
-from its only member. This setting is allowed only with `APP_ENV=development`;
-enabling it in another environment fails startup. Deployments continue to read
-strictly from secondaries, without primary fallback.
+For native frontend configuration, use `BACKEND_API_URL=http://127.0.0.1:9090`.
+The browser origin remains `APP_BASE_URL=http://localhost:8080`. Docker Desktop's
+`proxy` routes to the host gateway; native Linux's `proxy-host` uses host networking.
+Both keep their public listener loopback-bound. Do not run either alongside
+`proxy-containers` on the same port.
 
-All host processes load `.env`; parser needs OpenBao/EC access, loader does not.
-API auto-reload does not reload workers; restart workers after code/config changes.
-Stop host processes with Ctrl+C. `make dev-down` stops all development containers
-and retains MongoDB/MinIO volumes.
-Individual targets include `mongo-up/down`, `openbao-up/down`, and
-`proxy-up/down`. All use the single `docker/docker-compose.yml`.
-Profiles are `dev` (dependencies with the bridge proxy), `spool`
-(MinIO/emulator/bridge), `proxy`, `proxy-host`, and `tools`
-(spool dependencies plus the initializer). Do not enable both proxy variants.
-`make compose-config` validates all profiles, `make compose-ps` lists containers,
-and `make compose-logs` follows logs. `dev-down` covers all profiles without
-deleting volumes. Direct Compose commands must include `--project-directory .`
-from the repository root so bind mounts/build contexts resolve correctly.
-Use the same
-`COMPOSE_PROJECT` value for start/stop if overriding `amazing-http-logger-dev`.
-These non-TLS services are for local development only.
+`make local-native-run` is the convenience foreground supervisor for native
+collector/parser/loader plus dependencies/proxy; start the native frontend
+separately. `make local-workers-up` supports the mixed mode of native
+collector/frontend and containerized parser/loader. Do not also start native
+workers unless deliberately adding replicas; each loader adds its own write budget.
+
+### Profiles, commands and safe switching
+
+| Profile | Services selected |
+| --- | --- |
+| `infra` | MongoDB, OpenBao, MinIO, bridge and emulator; `local-infra-up` also runs bucket/queue initialization |
+| `full` | `infra` plus collector, parser, loader, frontend and the container-to-container proxy |
+| `apps` | Collector, parser, loader and frontend; combine with `infra` |
+| `workers` | Parser and loader; combine with `infra` |
+| `collector` / `frontend` | Individual application role; combine with `infra` and any other needed roles |
+| `maintenance` | One-shot cleaner; combine with `infra`; never enabled by `full` |
+| `native-proxy` / `proxy-host` | Docker Desktop / native Linux proxy for host applications |
+| `dev`, `spool`, `proxy`, `tools` | Compatibility dependency/transport/proxy selections; `dev` is not the full application stack |
+
+Bootstrap with `make local-infra-up` before invoking raw Compose application
+profiles; Compose cannot create the initial OpenBao credential/key set by itself:
+
+```bash
+docker compose --project-directory . --env-file .env \
+  -f docker/docker-compose.yml --profile infra --profile workers up -d --build --wait
+```
+
+The cleaner is **not a new daemon**: normal raw cleanup belongs to the loader,
+and MongoDB TTL indexes implement retention. For a stored receipt whose raw
+deletion needs administrative retry, run `make local-cleanup UPLOAD_ID=<id>`.
+It fails explicitly without an ID or for an upload not yet stored; there is no
+bucket sweep or age-based deletion of pending/failed data.
+
+Before switching native applications to containers, stop native collector,
+frontend and workers with Ctrl+C to avoid port conflicts or duplicate consumers.
+`local-containers-up` switches off native proxy containers, but does not kill host
+processes. To switch back, use `make local-apps-stop`, then the native commands
+above. This preserves running dependencies and OpenBao keys.
+
+`make help` describes canonical commands. Compatibility aliases are `run` ->
+`local-collector-run`, `spool-parser/loader` -> `local-parser/loader-run`,
+`frontend-dev/start` -> native frontend commands, `dev` -> `local-native-run`,
+`dev-up` -> infra plus native proxy, and `dev-down` -> `local-containers-down`.
+`make compose-config` validates all profiles without printing resolved secrets;
+`compose-ps` lists containers and `compose-logs` follows their logs.
+`local-containers-down` removes every profile's containers/network but retains
+Mongo/MinIO volumes. Keep the same `COMPOSE_PROJECT` for startup and shutdown.
+These non-TLS services are for local development only; generated credentials
+remain ignored and are mounted only into the roles that need them. Application
+containers never receive the development root token; the loader has no KMS token.
 
 OpenBao runs in **ephemeral dev mode**, not persistent production storage.
 Restarting/recreating it loses the KEK and EC key set; buffered encrypted uploads
@@ -355,22 +389,22 @@ Restart applications and proxy after changing addresses or upstream ports.
 `ENV_FILE` selects the local configuration file for both Compose and Python:
 
 ```bash
-make dev ENV_FILE=.env
+make local-containers-up ENV_FILE=.env
 ```
 
 Copy `.env.example` for another profile and keep it git-ignored. Explicit shell or
 Make command-line variables override its values, including URI interpolation:
 
 ```bash
-make dev MONGO_PORT=29017 APP_PORT=8101
+make local-containers-up MONGO_PORT=29017 APP_PORT=8101
 ```
 
 | Listener | Default | Parameter |
 | --- | --- | --- |
 | Docker MongoDB, host and container | 28017 | `.env` `MONGO_PORT` |
 | Docker OpenBao, host and container | 28200 | `.env` `OPENBAO_PORT` |
-| MinIO API / console, loopback | 29000 / 29001 | local spool configuration |
-| Pub/Sub emulator, loopback | 28681 | `PUBSUB_EMULATOR_HOST` |
+| MinIO API / console, loopback | 29000 / 29001 | `MINIO_PORT` / `MINIO_CONSOLE_PORT`; match native `SPOOL_ENDPOINT_URL` |
+| Pub/Sub emulator, loopback | 28681 | `PUBSUB_PORT`; match native `PUBSUB_EMULATOR_HOST` |
 | Public development NGINX proxy | 8080 | `.env` `PROXY_BIND_HOST` / `PROXY_PORT` |
 | Host Python backend | 9090 | `.env` `APP_HOST` / `APP_PORT` |
 | Host Next.js frontend | 3000 | Make `FRONTEND_PORT`; match Compose `.env` `FRONTEND_PORT` |
@@ -615,9 +649,11 @@ Deleting the namespace or manually deleting those PVCs can destroy data. Use a s
 release name and namespace for the development database.
 
 For externally managed dependencies, set their reachable addresses and runtime
-credential path in `.env` and use `make run`, `make spool-parser` and `make spool-loader`
-instead of `make dev`. `make dev` deliberately supplies `SPOOL_DEV_ENV` local
-MinIO/emulator settings; the individual commands use the configured `.env`.
+credential path in `.env` and use `make local-collector-run`,
+`make local-parser-run` and `make local-loader-run`. These commands use the
+configured `.env` without starting or overriding dependencies. Do not use
+`local-infra-up`, `local-native-run` or Compose application containers for this
+case: those commands explicitly provision the local development dependency stack.
 Kubernetes MongoDB DNS names remain
 cluster-internal; forwarding a single member port does not preserve replica discovery.
 
@@ -746,7 +782,7 @@ chmod 600 .env.stack-test
 # Edit .env.stack-test locally: set the backend URL, Auth0 token URL/audience,
 # and the separate plaintext/encrypted client IDs and secrets.
 # Configure the devices' policies before running.
-# In another terminal, run make dev (API, both workers and dependencies).
+# In another terminal, run make local-containers-up or make local-native-run.
 make test-stack
 ```
 
