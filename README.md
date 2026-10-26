@@ -1,3 +1,5 @@
+<!-- Purpose: Introduce Amazing HTTP Logger, summarize its capabilities and ingestion flow, and direct readers to setup and detailed documentation. -->
+
 # Amazing HTTP Logger
 
 A proof-of-concept platform for collecting HTTP traffic from device agents,
@@ -93,7 +95,7 @@ without deleting those volumes.
 | UI screens, Auth0 setup and browser tests | [Frontend guide](frontend/README.md) |
 | GCP: direct Cloud Run URLs, IAM, secrets and deployment | [GCP deployment](infra/gcp/README.md) |
 | Optional Kubernetes/Helm deployment | [Kubernetes runbook](docs/RUNBOOK.md#optional-local-kubernetes-deployment) |
-| Implemented capabilities and remaining limitations | [Implementation status](docs/IMPLEMENTATION_STATUS.md) |
+| Implemented capabilities, visual architecture/operation review and limitations | [Implementation status](docs/IMPLEMENTATION_STATUS.md), [architecture diagrams](docs/IMPLEMENTATION_STATUS.md#architecture-diagrams) and [operation sequences](docs/IMPLEMENTATION_STATUS.md#operation-sequence-diagrams) |
 
 Quick checks: `make test`, `make lint`, `make frontend-test` and
 `make frontend-test-browser`. [Service-backed tests](docs/RUNBOOK.md#run-tests)

@@ -1,9 +1,15 @@
+<!-- Purpose: Explain the implemented architecture, component responsibilities, trust boundaries, persistence model, and documentation ownership. -->
+
 # Project blueprint
 
 Implementation map and architectural rationale for [Amazing HTTP Logger](README.md).
 Detailed contracts live in the [API reference](docs/API.md),
 [ingestion design](docs/INGESTION.md) and [encryption protocol](docs/ENCRYPTION.md);
 commands belong in the [runbook](docs/RUNBOOK.md).
+
+For reviewer-facing visual views, see the implementation status
+[high-level, development and production architecture diagrams](docs/IMPLEMENTATION_STATUS.md#architecture-diagrams)
+and [implemented-operation sequences](docs/IMPLEMENTATION_STATUS.md#operation-sequence-diagrams).
 
 ## Component boundaries
 
@@ -125,9 +131,12 @@ They are operational state, not measurements or alternative ingestion triggers.
 | [API](docs/API.md) / [ingestion](docs/INGESTION.md) / [encryption](docs/ENCRYPTION.md) | Detailed contracts and guarantees |
 | [Runbook](docs/RUNBOOK.md) | Local/Kubernetes setup, tests and operations |
 | [Frontend](frontend/README.md) / [GCP](infra/gcp/README.md) | Component-specific setup and deployment |
-| [Implementation status](docs/IMPLEMENTATION_STATUS.md) | Capability/test inventory and known limitations |
+| [Implementation status](docs/IMPLEMENTATION_STATUS.md) | Capability/test inventory, maintained architecture and operation diagrams, and known limitations |
 | [Plan](docs/PLAN.md) | Actionable verification gates; links instead of copied design |
 
 Keep one canonical explanation and link to it from other guides.
+The visual views in implementation status complement those explanations: retain
+them even when they overlap prose, and update affected diagrams and their operation
+index whenever implementation changes.
 The README's [protected manual roadmap](README.md#future-roadmap--architecture-enhancements)
 is author-maintained prose, excluded from automated editing and planning.

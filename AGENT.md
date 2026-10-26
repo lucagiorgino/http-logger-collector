@@ -1,3 +1,5 @@
+<!-- Purpose: Define repository-specific guidance for coding agents, including architecture, documentation maintenance, development commands, and testing conventions. -->
+
 # AGENT.md
 
 Guidance for the coding agent in this repository. It contains only the persistent instructions needed for this project.
@@ -16,7 +18,9 @@ Read the relevant file before starting a task and update it when the design chan
 - [Project blueprint](PROJECT-BLUEPRINT.md): architecture and persistence model.
 - [API](docs/API.md), [ingestion](docs/INGESTION.md), and
   [encryption](docs/ENCRYPTION.md): canonical contracts and guarantees.
-- [Implementation status](docs/IMPLEMENTATION_STATUS.md): capabilities and evidence.
+- [Implementation status](docs/IMPLEMENTATION_STATUS.md): capabilities, evidence,
+  [architecture diagrams](docs/IMPLEMENTATION_STATUS.md#architecture-diagrams) and
+  [operation sequences](docs/IMPLEMENTATION_STATUS.md#operation-sequence-diagrams).
 - [Runbook](docs/RUNBOOK.md): setup, tests and operations.
 - [Plan](docs/PLAN.md): remaining verification gates, not duplicated design.
 
@@ -87,6 +91,11 @@ make helm-test
 - API route and schema: if the request body changes, update both the HTTP contract and validation schema.
 - Service logic and tests: every auth or ingestion rule must be covered by tests.
 - Storage model and persistence code: schema changes must be reflected in MongoDB models and any consumer code.
+- Implementation changes and visual documentation: update affected high-level,
+  development and production architecture diagrams, operation sequence diagrams
+  and their index in `docs/IMPLEMENTATION_STATUS.md`. Add sequences for new
+  operations and keep links current. Preserve these visual views even when they
+  overlap prose; do not remove them during documentation consolidation.
 
 ## Tests
 - Unit tests cover validation, auth decisions, and service logic.

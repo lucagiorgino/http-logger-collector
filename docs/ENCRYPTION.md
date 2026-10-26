@@ -1,4 +1,12 @@
+<!-- Purpose: Document transport and storage encryption, device configuration and acknowledgement protocols, and encryption key lifecycle management. -->
+
 # Log encryption and device configuration
+
+Visual flows are maintained in implementation status:
+[policy and acknowledgement](IMPLEMENTATION_STATUS.md#policy-changes-and-agent-acknowledgement),
+[workspace storage/retention](IMPLEMENTATION_STATUS.md#workspace-storage-and-retention),
+[OpenBao key management](IMPLEMENTATION_STATUS.md#local-and-helm-key-management) and
+[cloud bootstrap](IMPLEMENTATION_STATUS.md#cloud-secret-and-key-bootstrap).
 
 ## Transport and storage
 

@@ -1,3 +1,5 @@
+<!-- Purpose: Guide GCP deployment and operation, including Terraform provisioning, Cloud Run architecture, identity and secrets, encryption, and verification. -->
+
 # GCP production deployment
 
 Use a dedicated billing-enabled GCP project per environment. This is an independent
@@ -32,6 +34,13 @@ The sections below contain the commands and permission requirements. Atlas, NAT,
 storage, messaging, KMS and running services still incur costs.
 
 ## Architecture
+
+The implementation status provides the maintained
+[production architecture diagram](../../docs/IMPLEMENTATION_STATUS.md#production-architecture),
+[operation sequences](../../docs/IMPLEMENTATION_STATUS.md#operation-sequence-diagrams)
+and [cloud bootstrap sequence](../../docs/IMPLEMENTATION_STATUS.md#cloud-secret-and-key-bootstrap).
+The compact flow below is a deployment reference, not a replacement for those
+reviewer-facing visual views.
 
 ```text
 Browsers -> Cloud Run Next.js frontend HTTPS URL

@@ -1,3 +1,5 @@
+<!-- Purpose: Preserve the original backend project assignment, including requirements, evaluation criteria, technology choices, and submission instructions. -->
+
 # Back-end project assignment
 
 Don't edit this file.

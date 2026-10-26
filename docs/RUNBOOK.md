@@ -1,4 +1,12 @@
+<!-- Purpose: Provide operational instructions for local setup, deployment, testing, monitoring, retention, and upload recovery. -->
+
 # Runbook
+
+For visual orientation, see the implementation status
+[development](IMPLEMENTATION_STATUS.md#development-architecture) and
+[production](IMPLEMENTATION_STATUS.md#production-architecture) architecture views,
+plus [health](IMPLEMENTATION_STATUS.md#pipeline-health) and
+[operator recovery](IMPLEMENTATION_STATUS.md#operator-recovery) sequences.
 
 ## Prerequisites
 - Python 3.11+

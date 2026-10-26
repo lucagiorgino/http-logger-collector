@@ -1,9 +1,14 @@
+<!-- Purpose: Specify the implemented HTTP API contracts, identity and permission rules, request validation, and response behavior. -->
+
 # API reference
 
 All versioned endpoints are under `/api/v1`. Interactive [OpenAPI](http://localhost:8080/docs)
 documents request/response examples and each operation's permissions. Swagger
 does not gzip or encrypt the displayed batch JSON; send actual wire bytes with
 an HTTP client. Operational setup belongs in the [runbook](RUNBOOK.md).
+
+Every implemented endpoint is mapped to a visual flow in the
+[operation sequence index](IMPLEMENTATION_STATUS.md#operation-index).
 
 ## Identity and permissions
 

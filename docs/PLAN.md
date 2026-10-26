@@ -1,3 +1,5 @@
+<!-- Purpose: Track remaining production verification gates and unresolved implementation constraints without duplicating architecture or the manual roadmap. -->
+
 # Verification plan
 
 This file tracks delivery gates, not a second architecture specification.

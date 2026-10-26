@@ -1,8 +1,16 @@
+<!-- Purpose: Define the durable upload pipeline, processing responsibilities, policy boundaries, retry and delivery guarantees, and recovery constraints. -->
+
 # Ingestion pipeline
 
 This is the canonical pipeline design. See the [API reference](API.md) for wire
 schemas and permissions, [encryption protocol](ENCRYPTION.md) for cryptography,
 and [runbook](RUNBOOK.md#upload-ingestion) for setup and recovery commands.
+
+For visual review, see the [component/deployment diagrams](IMPLEMENTATION_STATUS.md#architecture-diagrams)
+and the [upload acceptance](IMPLEMENTATION_STATUS.md#durable-upload-acceptance),
+[parser](IMPLEMENTATION_STATUS.md#parsing-and-protection),
+[loader/cleanup](IMPLEMENTATION_STATUS.md#mongo-loading-and-raw-cleanup) and
+[recovery](IMPLEMENTATION_STATUS.md#operator-recovery) sequences.
 
 ## Flow and responsibilities
 

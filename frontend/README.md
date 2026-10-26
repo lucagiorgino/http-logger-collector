@@ -1,9 +1,16 @@
+<!-- Purpose: Explain management console setup, Auth0 configuration, SSR screens and forms, API boundaries, troubleshooting, and validation. -->
+
 # amazing-http-logger management console
 
 An SSR management dashboard in **plain JavaScript/JSX**, built with Next.js App
 Router, React, Tailwind CSS, and the JavaScript shadcn/ui registry components.
 The Python backend remains the sole authority for device access, permissions,
 persistence, and encryption policy.
+
+For a visual review, see [identity/session](../docs/IMPLEMENTATION_STATUS.md#identity-and-sessions)
+and [SSR read/form](../docs/IMPLEMENTATION_STATUS.md#console-reads-and-forms) sequences,
+the [operation index](../docs/IMPLEMENTATION_STATUS.md#operation-index), and
+[component/deployment diagrams](../docs/IMPLEMENTATION_STATUS.md#architecture-diagrams).
 
 ## Run locally
 
