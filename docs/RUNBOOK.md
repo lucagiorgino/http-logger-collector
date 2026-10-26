@@ -68,6 +68,10 @@ Do not delete MinIO credential files while retaining its volume.
 
 For Cloud Run, follow the [GCP deployment summary](../infra/gcp/README.md#deployment-summary),
 including `notification_channels`, secret bootstrap and scoped identities.
+The [automated workflow](../infra/gcp/README.md#automated-deployment) provides
+`make gcp-check` for read-only status and `make gcp-deploy` for guided provisioning,
+image publication and rollout using existing env files without copying local
+Mongo/emulator/OpenBao settings into production.
 `terraform output spool_environment` provides nonsecret connection settings.
 Use workload identity/ADC, never repository-stored service-account JSON keys.
 

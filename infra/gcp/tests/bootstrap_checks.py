@@ -111,6 +111,43 @@ def test_bootstrap_fills_only_missing_values(secure_inputs):
     assert secure_inputs[0].startswith("Auth0")
 
 
+def test_in_memory_inputs_initialize_once_without_prompts_or_rotation(monkeypatch, capsys):
+    client = FakeSecrets()
+
+    def forbidden(*args):
+        pytest.fail("In-memory values should avoid interactive/file input")
+
+    monkeypatch.setattr(bootstrap, "read_input", forbidden)
+    inputs = {"mongo_uri": b"private-mongo-uri", "auth0_client_secret": b"private-web-secret"}
+    first = bootstrap.bootstrap(client, "example-project", "staging", input_values=inputs)
+    assert client.payloads["mongo_uri"] == inputs["mongo_uri"]
+    saved = client.payloads.copy()
+    assert (
+        bootstrap.bootstrap(
+            client,
+            "example-project",
+            "staging",
+            input_values={"mongo_uri": b"replacement", "auth0_client_secret": b"replacement"},
+        )
+        == first
+    )
+    assert client.payloads == saved
+    assert "private-mongo-uri" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", [b"", b" ", b"\xff", b"x" * 65_537])
+def test_invalid_in_memory_input_is_rejected_before_writes(value, secure_inputs):
+    client = FakeSecrets()
+    with pytest.raises(bootstrap.BootstrapError):
+        bootstrap.bootstrap(
+            client,
+            "example-project",
+            "staging",
+            input_values={"mongo_uri": value},
+        )
+    assert not client.payloads
+
+
 @pytest.mark.parametrize(
     "state",
     [secretmanager.SecretVersion.State.DISABLED, secretmanager.SecretVersion.State.DESTROYED],

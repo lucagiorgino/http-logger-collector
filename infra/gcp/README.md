@@ -12,6 +12,10 @@ Frontend and API use separate generated Cloud Run HTTPS URLs; workers stay
 internal. No load balancer, purchased domain or custom certificate is required.
 Keep the existing Auth0 tenant and API audience.
 
+Use the [automated deployment command](#automated-deployment) for the normal
+workflow. The numbered procedure below remains the manual alternative and
+documents the underlying permissions and resources.
+
 1. Prepare a billing-enabled GCP project, Terraform, Google Cloud CLI, Docker,
    Python and authenticated deployment credentials.
 2. Bootstrap Terraform state, configure `terraform.tfvars`, then apply foundation
@@ -32,6 +36,144 @@ Keep the existing Auth0 tenant and API audience.
 
 The sections below contain the commands and permission requirements. Atlas, NAT,
 storage, messaging, KMS and running services still incur costs.
+
+## Automated deployment
+
+[`deploy.py`](deploy.py) orchestrates the existing Terraform configuration and
+missing-only secret bootstrap using **gcloud, Docker and Terraform**. It reads
+cloud status before changing anything, creates missing infrastructure, publishes
+the cloud backend/frontend images, pins secret versions, deploys all four
+services, and checks readiness, HTTP liveness and unauthenticated API rejection.
+The API initializes its Mongo collections/indexes on startup; there is no separate
+database reset or local OpenBao initialization in this workflow.
+
+### One-time prerequisites
+
+Install Terraform >=1.9, Google Cloud CLI, Docker with an active daemon and
+Python >=3.11. A billing-enabled GCP project and the
+[deployer permissions](#1-tools-authentication-and-state) are required.
+Authenticate both the CLI and Application Default Credentials (ADC):
+
+```bash
+gcloud auth login
+gcloud auth application-default login
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+make gcp-install
+```
+
+ADC and the gcloud login are separate. The script never downloads service-account
+keys or launches an interactive authorization flow on your behalf.
+The deployer also needs `secretmanager.versions.get` to verify pinned-version
+metadata, in addition to the standalone bootstrap's get/list/add permissions;
+secret payload read access is not required by the script.
+`make gcp-install` creates the ignored cloud Python environment; set
+`GCP_VENV=/path/to/venv` to reuse a compatible environment.
+
+Keep nonsecret settings in ignored `infra/gcp/terraform.tfvars`, starting from
+the example if needed. The script reuses backend `.env` and frontend
+`frontend/.env.local` (or `frontend/.env` when `.env.local` is absent), without
+sourcing them as shell scripts. Terraform evaluates HCL, rather than a shell or
+ad-hoc parser. Values are selected as follows:
+
+| Setting | Source / behavior |
+| --- | --- |
+| Project | `--project`, tfvars, or `GCP_PROJECT_ID`; never local emulator `GOOGLE_CLOUD_PROJECT=logger-local` |
+| Region / environment | Explicit CLI override, then tfvars, then Terraform defaults |
+| Auth0 domain / audience / frontend client ID | tfvars, with env-file fallback; conflicting local identity settings fail rather than reusing the wrong secret |
+| Frontend Auth0 client secret | Process environment or frontend/backend env files; secure prompt only when missing in Secret Manager and locally |
+| Cloud Mongo URI | `GCP_MONGO_URI`, otherwise a TLS/replica-set-compatible `MONGO_URI`; secure prompt if only local Mongo settings are available |
+| EC key set / cloud session secret | Generated in RAM only when absent; local OpenBao keys and frontend session secrets are not copied |
+| Previously deployed image tags / secret pins | Preserved from the generated deployment settings until a new rollout; pinned secrets are never silently advanced to newer versions |
+
+Process environment overrides env-file fallback values. Local MongoDB,
+MinIO/emulator endpoints, OpenBao credentials and development primary-read
+overrides are not deployed. Cloud Mongo must have healthy secondaries, verified
+TLS, suitable permissions and a fresh database for cloud ciphertext. The script
+does not provision Atlas clusters, migrate local ciphertext or change Auth0 grants.
+Do not put credential values in `GCP_ARGS` or tfvars.
+
+### Check and deploy
+
+From the repository root:
+
+```bash
+make gcp-check                    # Read-only status and credential preflight
+make gcp-deploy                   # Guided deployment; confirm plans and external setup
+```
+
+`GCP_ARGS` forwards CLI options. For example, override an accidentally configured
+zone with a **region** (`europe-west2`, not `europe-west2-a`):
+
+```bash
+make gcp-check GCP_ARGS="--region=europe-west2"
+make gcp-deploy GCP_ARGS="--region=europe-west2 --release=release-20261026-1"
+```
+
+If gcloud is installed but absent from this shell's PATH, add
+`--gcloud=/absolute/path/to/google-cloud-sdk/bin/gcloud` to `GCP_ARGS`.
+The script exposes that SDK directory to Docker's gcloud credential helper too.
+Use `--env-file` / `--frontend-env-file` for alternative local configuration files.
+Run `infra/gcp/.venv/bin/python -m infra.gcp.deploy --help` for all options.
+
+The guided flow:
+
+1. Verify CLI/ADC authentication and billing; report each application's Cloud Run
+   service as absent, ready or not ready.
+2. Create the private, versioned remote state bucket if absent and initialize the
+   GCS backend at `logger/ENVIRONMENT`. The default bucket is
+   `PROJECT_ID-logger-tfstate`; override it with `--state-bucket`.
+3. Plan/apply foundation resources. **Existing managed services remain enabled**;
+   reruns never apply a blanket `deploy_services=false` to an active deployment.
+4. Print the NAT egress `/32` and generated Auth0 callback/logout/web-origin URLs.
+   Confirm that Atlas and Auth0 have been configured before rollout. Existing
+   Auth0 allowlist entries must be preserved.
+5. Initialize missing secrets from safe local inputs or hidden prompts, verify
+   enabled numeric pins, and build/push missing immutable image tags.
+6. Plan/apply the application rollout and verify all four Ready conditions, backend
+   `/health` returning `200`, frontend `/` returning `200`, and `/api/v1/me`
+   returning `401` without a token. Complete authenticated sign-in/upload checks
+   separately; these probes do not prove an end-to-end ingestion round trip.
+
+To resume interrupted image publication, supply the **same `--release`**.
+Already-published immutable tags are reused, not overwritten. Without a release
+argument each invocation creates a unique tag. Do not reuse an old tag to deploy
+changed source.
+
+For unattended use, provision Atlas/Auth0 beforehand and explicitly acknowledge
+those external prerequisites:
+
+```bash
+make gcp-deploy GCP_ARGS="--yes --external-ready --release=release-20261026-1"
+```
+
+`--yes` approves only nondestructive Terraform plans; deletion/replacement is
+always refused. Without `--external-ready`, unattended deployment stops after
+foundation and prints the required external settings. Credentials must already
+exist locally or in Secret Manager to avoid secure input prompts.
+
+### State, reruns and failure handling
+
+The script writes **nonsecret** resolved settings, deployed tags and numeric
+secret pins to ignored `infra/gcp/deployment.auto.tfvars.json` with private file
+permissions. Keep this file to preserve release pins on reruns; normal Terraform
+commands also load it. It takes precedence over `terraform.tfvars`, so review it
+when deliberately changing pins/rolling back. Secret rotation remains a separate
+reviewed operation. No secret payload enters this file, Terraform plans/state,
+Docker build arguments or command output.
+
+The state bucket is created/protected with gcloud, not the alternative
+`bootstrap/` Terraform workspace. If already initialized manually, supply the
+same bucket/prefix. The command refuses local state, a different initialized
+backend, nondefault workspaces, destructive plans and Cloud Run services not
+owned by the selected state. It does not import arbitrary existing cloud resources
+or recover lost Terraform state automatically. Resolve those conditions using
+the manual procedure before rerunning.
+
+Failures stop with a nonzero exit code and a named failed step; tool diagnostics
+that could contain credentials are withheld. Repair credentials/IAM or external
+dependencies, then rerun. Published images, successful Terraform changes and
+already-created secrets are retained; there is no rollback by deletion.
+Only one operator should deploy/bootstrap a given environment at a time.
 
 ## Architecture
 
@@ -421,13 +563,15 @@ terraform -chdir=infra/gcp init -backend=false
 terraform -chdir=infra/gcp fmt -check -recursive
 terraform -chdir=infra/gcp validate
 terraform -chdir=infra/gcp test
-infra/gcp/.venv/bin/python -m pytest -q infra/gcp/tests/runtime_checks.py infra/gcp/tests/bootstrap_checks.py
-infra/gcp/.venv/bin/ruff check infra/gcp/bootstrap_secrets.py infra/gcp/runtime infra/gcp/tests
-infra/gcp/.venv/bin/ruff format --check infra/gcp/bootstrap_secrets.py infra/gcp/runtime infra/gcp/tests
+infra/gcp/.venv/bin/python -m pytest -q infra/gcp/tests/runtime_checks.py infra/gcp/tests/bootstrap_checks.py infra/gcp/tests/deploy_checks.py
+infra/gcp/.venv/bin/ruff check infra/gcp/deploy.py infra/gcp/bootstrap_secrets.py infra/gcp/runtime infra/gcp/tests
+infra/gcp/.venv/bin/ruff format --check infra/gcp/deploy.py infra/gcp/bootstrap_secrets.py infra/gcp/runtime infra/gcp/tests
 ```
 
 Mock Terraform/Google RPC tests do not prove live IAM, GCS event latency,
 Atlas connectivity, platform forwarding headers or Auth0 grants. Complete staging smoke tests.
+Deployment tests cover first/repeated rollout, read-only status, state/destructive
+plan refusal, immutable image reuse and safe local secret input/pin preservation.
 The cloud `*_checks.py` suites stay outside local test discovery; storage/Pub/Sub SDKs are
 root dependencies, while KMS/Secret Manager SDKs stay in cloud requirements.
 

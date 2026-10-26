@@ -3,6 +3,13 @@
 .env.*
 .secrets/
 .venv/
+venv/
+**/.venv/
+**/.terraform/
+**/*.tfstate*
+**/*.tfplan
+**/*.tfvars
+**/*.tfvars.json
 **/__pycache__/
 .pytest_cache/
 .ruff_cache/

@@ -83,6 +83,7 @@ def bootstrap(
     *,
     mongo_uri_file: Path | None = None,
     auth0_client_secret_file: Path | None = None,
+    input_values: dict[str, bytes] | None = None,
 ) -> dict[str, str]:
     names = {
         key: f"projects/{project}/secrets/logger-{environment}-{suffix}"
@@ -95,7 +96,17 @@ def bootstrap(
         ("auth0_client_secret", "Auth0 frontend client secret", auth0_client_secret_file),
     ):
         if versions[key] is None:
-            inputs[key] = read_input(label, path)
+            value = (input_values or {}).get(key)
+            if value is not None:
+                if not value.strip() or len(value) > MAX_SECRET_BYTES:
+                    raise BootstrapError(f"{label} must contain 1-{MAX_SECRET_BYTES} UTF-8 bytes.")
+                try:
+                    value.decode("utf-8")
+                except UnicodeError:
+                    raise BootstrapError(f"{label} must be valid UTF-8.") from None
+                inputs[key] = value
+            else:
+                inputs[key] = read_input(label, path)
 
     result = {}
     for key, name in names.items():

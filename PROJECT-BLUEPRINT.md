@@ -37,7 +37,7 @@ holding API credentials.
 | [`frontend/`](frontend/README.md) | Auth0 sessions, private API adapter, SSR pages and forms |
 | [`docker/`](docker/) | Deployment image and profile-based local dependency stack |
 | [`helm/amazing-http-logger/`](helm/amazing-http-logger/) | Optional Kubernetes workloads; cloud resources remain external |
-| [`infra/gcp/`](infra/gcp/README.md) | Terraform, direct Cloud Run services, cloud-only KMS overlay and secret bootstrap |
+| [`infra/gcp/`](infra/gcp/README.md) | Terraform, rerunnable deployment orchestration, direct Cloud Run services, cloud-only KMS overlay and secret bootstrap |
 
 Tests import the application, never vice versa. Add HTTP contracts with matching
 schemas and refusal-path tests; keep business logic out of route handlers.

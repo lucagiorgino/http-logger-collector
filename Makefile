@@ -5,6 +5,8 @@ PYTHON_VENV := $(VENV)/bin/python
 ENV_FILE ?= .env
 PROJECT_ID ?=
 ENVIRONMENT ?= production
+GCP_VENV ?= infra/gcp/.venv
+GCP_ARGS ?=
 STACK_TEST_ENV_FILE ?= .env.stack-test
 OPENBAO_UID ?= $(shell id -u)
 OPENBAO_GID ?= $(shell id -g)
@@ -32,6 +34,16 @@ install:
 
 gcp-secrets-bootstrap:
 	@"$(PYTHON_VENV)" -m infra.gcp.bootstrap_secrets --project="$(PROJECT_ID)" --environment="$(ENVIRONMENT)"
+
+gcp-install:
+	$(PYTHON) -m venv "$(GCP_VENV)"
+	"$(GCP_VENV)/bin/pip" install -r requirements.txt -r infra/gcp/runtime/requirements.txt
+
+gcp-check:
+	@"$(GCP_VENV)/bin/python" -m infra.gcp.deploy --check $(GCP_ARGS)
+
+gcp-deploy:
+	@"$(GCP_VENV)/bin/python" -m infra.gcp.deploy $(GCP_ARGS)
 
 .test:
 	$(PYTHON_VENV) -m pytest -q
@@ -154,4 +166,4 @@ helm-down:
 helm-port-forward:
 	kubectl $(KUBECTL_CONTEXT) --namespace "$(KUBE_NAMESPACE)" port-forward "service/$(KUBE_SERVICE)" "$(KUBE_LOCAL_PORT):http"
 
-.PHONY: install gcp-secrets-bootstrap test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run spool-parser spool-loader spool-dev-up spool-dev-down proxy-up proxy-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev compose-config compose-ps compose-logs image frontend-image helm-lint helm-template helm-up helm-test helm-down helm-port-forward
+.PHONY: install gcp-install gcp-check gcp-deploy gcp-secrets-bootstrap test test-stack lint frontend-install frontend-dev frontend-build frontend-start frontend-test frontend-test-browser run spool-parser spool-loader spool-dev-up spool-dev-down proxy-up proxy-down mongo-up mongo-down openbao-up openbao-down dev-up dev-down dev compose-config compose-ps compose-logs image frontend-image helm-lint helm-template helm-up helm-test helm-down helm-port-forward

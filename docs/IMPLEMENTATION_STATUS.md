@@ -24,7 +24,7 @@ every implementation change. Detailed contracts remain in the linked guides.
 | Strict-secondary analysis and timestamp/ID cursors | [Analysis API](API.md#analyze-logs), [data model](../PROJECT-BLUEPRINT.md#stored-document-layout) | [`test_analysis.py`](../tests/test_analysis.py), [`test_mongo_integration.py`](../tests/test_mongo_integration.py) |
 | SSR dashboard/forms, traffic details, devices, workspace and portable Status diagram | [Frontend](../frontend/README.md), [probe semantics](RUNBOOK.md#pipeline-status) | [`frontend/tests/`](../frontend/tests/), [`test_status.py`](../tests/test_status.py) |
 | Local Compose dependencies with host API/workers; optional hardened Helm workloads | [Runbook](RUNBOOK.md#local-setup) | [`tests/`](../tests/), [browser validation](../frontend/README.md#validation) |
-| Direct Cloud Run URLs, scoped cloud IAM, KMS adapter and missing-only secret bootstrap | [GCP guide](../infra/gcp/README.md) | [`infra/gcp/tests/`](../infra/gcp/tests/) |
+| Direct Cloud Run URLs, scoped IAM, KMS adapter, missing-only secret bootstrap and rerunnable deployment CLI | [GCP guide](../infra/gcp/README.md), [automated deployment](../infra/gcp/README.md#automated-deployment) | [`infra/gcp/tests/`](../infra/gcp/tests/), [`deploy_checks.py`](../infra/gcp/tests/deploy_checks.py) |
 
 ## Architecture diagrams
 
@@ -173,6 +173,9 @@ path. Atlas is provisioned independently. Runtime access uses scoped workload
 identity/ADC, not service-account key files. The loader has neither EC key-set nor
 KMS access. Cloud ciphertext is not interchangeable with local OpenBao ciphertext.
 See [GCP architecture and IAM](../infra/gcp/README.md#architecture).
+The runtime topology is unchanged by the
+[automated deployment operation](#automated-gcp-deployment), which provisions and
+reconciles these resources from the operator's machine.
 
 The [optional Helm deployment](RUNBOOK.md#optional-local-kubernetes-deployment)
 runs the same API/parser/loader and optional frontend in Kubernetes, with
@@ -207,6 +210,7 @@ requests and outcomes; common token validation is shown once.
 | `app.spool_worker replay`, `app.spool_worker cleanup` | [Operator recovery](#operator-recovery) |
 | OpenBao bootstrap, runtime key loading, EC/KEK/storage rotation | [Local and Helm key management](#local-and-helm-key-management) |
 | GCP missing-only secret/key bootstrap and runtime loading | [Cloud secret and key bootstrap](#cloud-secret-and-key-bootstrap) |
+| `make gcp-check`, `make gcp-deploy` | [Automated GCP deployment](#automated-gcp-deployment) |
 
 ### Identity and sessions
 
@@ -786,6 +790,55 @@ not EC/KMS access. Missing-only bootstrap is not a secret/key rotation workflow.
 Unlike OpenBao's application-wrapped KV record, cloud EC key-set JSON is protected
 by Secret Manager's at-rest encryption/access controls; the adapter uses Cloud KMS
 to wrap **field-encryption data keys**, not to unwrap the EC key set.
+
+### Automated GCP deployment
+
+Source: [`infra/gcp/deploy.py`](../infra/gcp/deploy.py);
+[setup and safety boundaries](../infra/gcp/README.md#automated-deployment).
+This is an operator-side control-plane flow, not an additional runtime service.
+
+```mermaid
+sequenceDiagram
+    actor Operator
+    participant Script as make gcp-check / gcp-deploy
+    participant Local as Local env files / tfvars
+    participant CLI as gcloud / Docker
+    participant TF as Terraform
+    participant GCP as GCP resources / Cloud Run
+    participant Secrets as Secret Manager
+    Operator->>Script: Check or deploy; optional project/region/release overrides
+    Script->>Local: Read whitelisted env settings; never source shell code
+    Script->>TF: Evaluate HCL in providerless temporary directory
+    Script->>CLI: Check login, billing and Cloud Run state; verify ADC
+    CLI->>GCP: Read cloud metadata
+    alt Read-only check
+        Script-->>Operator: Service state / explicit prerequisite failures; no cloud mutation
+    else Deploy with approval
+        Script->>CLI: Ensure private versioned state bucket
+        Script->>TF: Initialize matching backend; inspect state ownership
+        Script->>TF: Plan foundation, preserving existing managed services
+        TF-->>Script: Plan; refuse all deletion/replacement
+        Script->>TF: Apply approved plan
+        Script-->>Operator: NAT IP and generated Auth0 URLs
+        Operator->>Operator: Configure Atlas allowlist and Auth0 URLs, preserving existing entries
+        Operator->>Script: Confirm external setup or use external-ready flag
+        Script->>Secrets: Missing-only bootstrap; reuse suitable local inputs / prompt securely
+        Secrets-->>Script: Enabled numeric secret pins; no rotation
+        Script->>CLI: Build/push missing immutable backend/frontend release tags
+        CLI->>GCP: Publish images to Artifact Registry
+        Script->>Local: Persist nonsecret settings, image tags and secret pins
+        Script->>TF: Plan/apply nondestructive four-service rollout
+        TF->>GCP: Create/update services and infrastructure
+        Script->>GCP: Verify four Ready conditions and public HTTP 200/401 boundaries
+        Script-->>Operator: Frontend/API URLs or explicit failed step
+    end
+```
+
+Reruns preserve existing secret values and pins; existing immutable images are
+reused when the same release is requested. Local Mongo/emulators/OpenBao are not
+cloud dependencies. Atlas provisioning and Auth0 tenant administration remain
+external prerequisites; successful probes are not authenticated end-to-end
+ingestion or live deployment performance evidence.
 
 ## Validation scope
 

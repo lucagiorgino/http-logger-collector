@@ -95,7 +95,7 @@ without deleting those volumes.
 | JWE, workspace encryption and key rotation | [Encryption protocol](docs/ENCRYPTION.md) |
 | Recovery, Status page, tests and latency measurement | [Runbook](docs/RUNBOOK.md) |
 | UI screens, Auth0 setup and browser tests | [Frontend guide](frontend/README.md) |
-| GCP: direct Cloud Run URLs, IAM, secrets and deployment | [GCP deployment](infra/gcp/README.md) |
+| GCP: direct Cloud Run URLs, IAM, secrets and deployment | [GCP deployment](infra/gcp/README.md), [automated deployment](infra/gcp/README.md#automated-deployment) |
 | Optional Kubernetes/Helm deployment | [Kubernetes runbook](docs/RUNBOOK.md#optional-local-kubernetes-deployment) |
 | Implemented capabilities, visual architecture/operation review and limitations | [Implementation status](docs/IMPLEMENTATION_STATUS.md), [architecture diagrams](docs/IMPLEMENTATION_STATUS.md#architecture-diagrams) and [operation sequences](docs/IMPLEMENTATION_STATUS.md#operation-sequence-diagrams) |
 
