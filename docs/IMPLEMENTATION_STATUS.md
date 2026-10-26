@@ -492,8 +492,11 @@ sequenceDiagram
     Parser->>Parser: Bounded gzip/JSON; validate entire batch; normalize stable IDs
     Parser->>Parser: Apply acceptance-time discard rules / body fingerprints
     opt Retained sensitive fields require encryption
-        Parser->>KMS: Encrypt field bundles with authenticated context
-        KMS-->>Parser: Protected fields or explicit failure
+        loop At most 100 field bundles per Transit request
+            Parser->>KMS: Encrypt bundles with authenticated context
+            KMS-->>Parser: Ciphertexts or explicit failure
+        end
+        Parser->>Parser: Attach ciphertexts only after every chunk succeeds
     end
     alt Valid protected batch within silver bounds
         Parser->>Silver: Publish normalized protected gzip BSON

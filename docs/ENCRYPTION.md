@@ -179,6 +179,9 @@ It must differ from the EC wrapping `OPENBAO_TRANSIT_KEY`. Idempotent bootstrap
 creates a non-exportable, non-derived Transit `aes256-gcm96` key with plaintext
 backup and convergent encryption disabled. The AES key never leaves OpenBao;
 the backend uses Transit batch encryption rather than implementing cryptography.
+Each Transit request contains at most 100 sensitive-field bundles to stay below
+OpenBao's JSON-complexity limit for maximum-size uploads. All chunks must succeed
+before ciphertexts are attached or the batch can be published to silver.
 OpenBao supplies random 96-bit nonces and full-length authentication tags.
 An authenticated context binds each encrypted sensitive-field bundle to its
 record ID, device ID, batch ID, field categories and format purpose/version.

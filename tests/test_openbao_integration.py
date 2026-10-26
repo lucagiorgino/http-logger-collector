@@ -97,6 +97,17 @@ def test_real_transit_envelope_rotation_cas_and_runtime_permissions(monkeypatch)
                 assert first.startswith("vault:v1:") and second.startswith("vault:v1:")
                 assert first != second
                 assert storage.decrypt(documents[0])["logdata"]["body"] == payload.body
+                small_payload = payload.model_copy(update={"body": "x" * 1024})
+                maximum_batch = [
+                    normalize_traffic_log(small_payload, "maximum-batch", context)
+                    for _ in range(500)
+                ]
+                asyncio.run(storage.protect(maximum_batch, [small_payload] * 500, StoragePolicy()))
+                for index in (0, 99, 100, 499):
+                    assert (
+                        storage.decrypt(maximum_batch[index])["logdata"]["body"]
+                        == small_payload.body
+                    )
                 tampered = {
                     **documents[0],
                     "ingestion": {**documents[0]["ingestion"], "batch_id": "different-batch"},

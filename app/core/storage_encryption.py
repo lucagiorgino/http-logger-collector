@@ -16,6 +16,7 @@ from app.schemas.workspace import StoragePolicy
 
 ENCRYPTED = "[ENCRYPTED]"
 MAX_TRANSIT_BYTES = 16_777_216
+MAX_TRANSIT_BATCH_ENTRIES = 100
 CIPHERTEXT = re.compile(r"vault:v[1-9][0-9]*:[A-Za-z0-9+/=]+")
 
 
@@ -88,29 +89,32 @@ class StorageEncryption:
                     "GET", f"{settings.openbao_transit_mount}/keys/{settings.openbao_storage_key}"
                 )
             )
-            response = await client.request(
-                "POST",
-                f"{settings.openbao_transit_mount}/encrypt/{settings.openbao_storage_key}",
-                {"batch_input": entries},
-                max_response_bytes=MAX_TRANSIT_BYTES,
-            )
-        try:
-            results = response["data"]["batch_results"]
-            if not isinstance(results, list) or len(results) != len(entries):
-                raise ValueError()
             ciphertexts = []
-            for result in results:
-                ciphertext = result["ciphertext"]
-                if (
-                    result.get("error")
-                    or not isinstance(ciphertext, str)
-                    or not CIPHERTEXT.fullmatch(ciphertext)
-                ):
-                    raise ValueError()
-                ciphertexts.append(ciphertext)
+            # Bound JSON complexity as well as bytes for OpenBao's request decoder.
+            for offset in range(0, len(entries), MAX_TRANSIT_BATCH_ENTRIES):
+                chunk = entries[offset : offset + MAX_TRANSIT_BATCH_ENTRIES]
+                response = await client.request(
+                    "POST",
+                    f"{settings.openbao_transit_mount}/encrypt/{settings.openbao_storage_key}",
+                    {"batch_input": chunk},
+                    max_response_bytes=MAX_TRANSIT_BYTES,
+                )
+                try:
+                    results = response["data"]["batch_results"]
+                    if not isinstance(results, list) or len(results) != len(chunk):
+                        raise ValueError()
+                    for result in results:
+                        ciphertext = result["ciphertext"]
+                        if (
+                            result.get("error")
+                            or not isinstance(ciphertext, str)
+                            or not CIPHERTEXT.fullmatch(ciphertext)
+                        ):
+                            raise ValueError()
+                        ciphertexts.append(ciphertext)
+                except (KeyError, TypeError, ValueError):
+                    raise KMSUnavailable("Invalid OpenBao storage encryption response") from None
             return ciphertexts
-        except (KeyError, TypeError, ValueError):
-            raise KMSUnavailable("Invalid OpenBao storage encryption response") from None
 
     def prepare(
         self,

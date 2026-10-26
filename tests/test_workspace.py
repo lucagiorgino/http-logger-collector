@@ -406,3 +406,54 @@ def test_partial_transit_success_rejects_the_entire_batch(
     assert state.json()["error_code"] == "parse_dependency_unavailable"
     assert "private encryption" not in response.text
     repository.insert_queued_traffic_logs.assert_not_awaited()
+
+
+def test_maximum_batch_protection_bounds_transit_requests(
+    storage_encryption, traffic_payload, trusted_context, monkeypatch
+):
+    payload = TrafficLogRequest.model_validate(traffic_payload)
+    documents = [
+        normalize_traffic_log(payload, "maximum-batch", trusted_context) for _ in range(500)
+    ]
+    original = storage_encryption.respond
+    request_sizes = []
+
+    def respond(request):
+        if "/encrypt/" in request.url.path:
+            entries = json.loads(request.content)["batch_input"]
+            request_sizes.append(len(entries))
+            if len(entries) > 100:
+                return httpx.Response(400, json={"errors": ["JSON complexity exceeded"]})
+        return original(request)
+
+    monkeypatch.setattr(storage_encryption, "respond", respond)
+    asyncio.run(storage_encryption.protect(documents, [payload] * 500, StoragePolicy()))
+    assert sum(request_sizes) == 500
+    assert max(request_sizes) <= 100
+    for index in (0, 99, 100, 499):
+        assert storage_encryption.decrypt(documents[index])["logdata"]["body"] == payload.body
+
+
+def test_later_transit_chunk_failure_leaves_entire_batch_unprotected(
+    storage_encryption, traffic_payload, trusted_context, monkeypatch
+):
+    payload = TrafficLogRequest.model_validate(traffic_payload)
+    documents = [
+        normalize_traffic_log(payload, "failing-batch", trusted_context) for _ in range(101)
+    ]
+    original = storage_encryption.respond
+    calls = 0
+
+    def respond(request):
+        nonlocal calls
+        if "/encrypt/" in request.url.path:
+            calls += 1
+            if calls == 2:
+                return httpx.Response(200, json={"data": {"batch_results": []}})
+        return original(request)
+
+    monkeypatch.setattr(storage_encryption, "respond", respond)
+    with pytest.raises(KMSUnavailable):
+        asyncio.run(storage_encryption.protect(documents, [payload] * 101, StoragePolicy()))
+    assert calls == 2
+    assert all("ciphertext" not in document["storage_encryption"] for document in documents)
