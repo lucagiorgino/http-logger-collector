@@ -297,7 +297,7 @@ sequenceDiagram
         API->>IdP: Discovery / JWKS
         IdP-->>API: Issuer metadata / public keys
     end
-    API->>API: Verify RS256, claims, issuer/audience; resolve device/client
+    API->>API: Verify RS256, claims, issuer/audience#59; resolve device/client
     alt Valid token and identity
         API-->>SSR: 200 device_id / optional client_id
     else Invalid token or identity
@@ -306,7 +306,7 @@ sequenceDiagram
         API-->>SSR: Sanitized 503
     end
     Browser->>SSR: GET /auth/logout
-    SSR-->>Browser: Clear local session; redirect to Auth0 logout
+    SSR-->>Browser: Clear local session#59; redirect to Auth0 logout
     Browser->>IdP: End SSO session
     IdP-->>Browser: Redirect to allowlisted frontend origin
 ```
@@ -334,14 +334,14 @@ sequenceDiagram
     SSR-->>Browser: Escaped server-rendered HTML / visible error or empty state
     opt Register device or save device/workspace policy
         Browser->>SSR: Submit form (works without JavaScript)
-        SSR->>SSR: Require session; same-origin protection; validate fields
+        SSR->>SSR: Require session#59; same-origin protection#59; validate fields
         SSR->>API: POST registration or PATCH policy with expected_version
         alt API accepts change
             API-->>SSR: Created resource / incremented policy version
             SSR-->>Browser: Redirect / refreshed saved state
         else Conflict or dependency/permission/validation failure
             API-->>SSR: Explicit HTTP error
-            SSR-->>Browser: Visible error; reload current policy on stale edit
+            SSR-->>Browser: Visible error#59; reload current policy on stale edit
         end
     end
 ```
@@ -358,19 +358,19 @@ sequenceDiagram
     participant Keys as Cached encryption keys
     participant Mongo as Mongo primary / majority
     Manager->>API: POST /devices (ID, name, initial encryption mode)
-    API->>API: Require manage:devices; validate closed schema
+    API->>API: Require manage:devices#59; validate closed schema
     opt Mode is optional or required
         API->>Keys: Require available public key
     end
-    API->>Mongo: Atomic create; unique device ID and name
+    API->>Mongo: Atomic create#59; unique device ID and name
     alt New device
         Mongo-->>API: Stored name, registered_at, policy version 1
         API-->>Manager: 201 configuration + Location
     else Existing ID/name, including concurrent duplicate
         Mongo-->>API: Duplicate
-        API-->>Manager: 400; no overwrite
+        API-->>Manager: 400#59; no overwrite
     end
-    Note over Manager,Mongo: Inventory only; no Auth0 credentials issued or JWT identity changed
+    Note over Manager,Mongo: Inventory only#59; no Auth0 credentials issued or JWT identity changed
 ```
 
 ### Inventory and configuration reads
@@ -390,7 +390,7 @@ sequenceDiagram
     Mongo-->>API: Accessible stored records
     API-->>Caller: 200 items / next_after
     Caller->>API: GET /devices/{id} or /devices/{id}/configuration
-    API->>API: Authorize own device or fleet permission; otherwise 403
+    API->>API: Authorize own device or fleet permission#59; otherwise 403
     API->>Mongo: Read effective device configuration
     Mongo-->>API: Stored record or version-zero TLS-only defaults
     alt Detail endpoint and record absent
@@ -416,7 +416,7 @@ sequenceDiagram
     participant Mongo as Mongo primary / majority
     actor Agent
     Manager->>API: PATCH /devices/{id}/configuration (expected_version, mode)
-    API->>API: Require manage:devices; require public key for JWE modes
+    API->>API: Require manage:devices#59; require public key for JWE modes
     API->>Mongo: Compare-and-swap policy version
     alt Version matches
         Mongo-->>API: Updated policy / incremented version
@@ -466,7 +466,7 @@ sequenceDiagram
     Mongo-->>API: Storage / retention / version
     API-->>Manager: 200 configuration
     Manager->>API: PATCH /workspace/configuration (expected_version, choices)
-    API->>API: Require manage:devices; validate / merge omitted fields
+    API->>API: Require manage:devices#59; validate / merge omitted fields
     opt Any retained category requires encryption
         API->>KMS: Validate storage key availability
         KMS-->>API: Available or fail closed
@@ -479,12 +479,12 @@ sequenceDiagram
         alt Index reconciliation succeeds
             API-->>Manager: 200 incremented version
         else Reconciliation fails
-            API-->>Manager: 503; desired settings may already be saved
+            API-->>Manager: 503#59; desired settings may already be saved
         end
     end
-    Note over API,Mongo: Startup also reconciles indexes; settings and DDL are not atomic
+    Note over API,Mongo: Startup also reconciles indexes#59; settings and DDL are not atomic
     TTL->>Mongo: Asynchronously expire eligible event-time buckets
-    Note over Manager,TTL: Field choices affect future accepted uploads; TTL affects existing and future logs
+    Note over Manager,TTL: Field choices affect future accepted uploads#59; TTL affects existing and future logs
 ```
 
 ### Durable upload acceptance
@@ -499,11 +499,11 @@ sequenceDiagram
     participant Mongo as Mongo primary / majority
     participant Raw as GCS / local MinIO
     participant Events as Object-event Pub/Sub
-    Agent->>API: POST /traffic-log-uploads (gzip JSON or JWE; optional X-Batch-Id)
-    API->>API: Authenticate; bind device/client/peer; check media and retry ID
+    Agent->>API: POST /traffic-log-uploads (gzip JSON or JWE#59; optional X-Batch-Id)
+    API->>API: Authenticate#59; bind device/client/peer#59; check media and retry ID
     API->>Mongo: Read device policy and workspace storage snapshot
     Mongo-->>API: Acceptance-time policies
-    API->>API: Enforce transfer policy; bound wire stream; hash bytes
+    API->>API: Enforce transfer policy#59; bound wire stream#59; hash bytes
     API->>Mongo: Reserve receipt / device-scoped retry identity
     Mongo-->>API: New or existing descriptor and state
     alt Retry ID reused with different bytes or format
@@ -515,9 +515,9 @@ sequenceDiagram
             API->>Mongo: Mark received
             Raw-->>Events: Object-created event (private bridge locally)
         end
-        API-->>Agent: 202 new receipt or 200 identical retry; upload_id / state
+        API-->>Agent: 202 new receipt or 200 identical retry#59; upload_id / state
     end
-    Note over Agent,Events: Workers may advance before POST returns; no validation/event count promised
+    Note over Agent,Events: Workers may advance before POST returns#59; no validation/event count promised
 ```
 
 Bad media, wire size and transfer policy fail synchronously; content, JWE and
@@ -542,8 +542,8 @@ sequenceDiagram
     Parser->>Mongo: Validate receipt / claim expiring parse lease
     Parser->>Raw: Read original object
     Raw-->>Parser: Trusted descriptor + wire bytes
-    Parser->>Parser: Check framing/hash; optional JWE decrypt with RAM EC key
-    Parser->>Parser: Bounded gzip/JSON; validate entire batch; normalize stable IDs
+    Parser->>Parser: Check framing/hash#59; optional JWE decrypt with RAM EC key
+    Parser->>Parser: Bounded gzip/JSON#59; validate entire batch#59; normalize stable IDs
     Parser->>Parser: Apply acceptance-time discard rules / body fingerprints
     opt Retained sensitive fields require encryption
         loop At most 100 field bundles per Transit request
@@ -559,14 +559,14 @@ sequenceDiagram
         Parser->>Events: ACK notification
     else Retryable dependency failure below attempt limit
         Parser->>Mongo: Return to received with sanitized error
-        Note over Events,Parser: No ACK; deadline expiry permits retry
+        Note over Events,Parser: No ACK#59; deadline expiry permits retry
     else Permanent failure or attempts exhausted
         Parser->>DLQ: Publish sanitized pointer / error code
         DLQ-->>Parser: Confirm publication
         Parser->>Mongo: Finish parse_failed
         Parser->>Events: ACK only after dead-letter success
     end
-    Note over Parser,Raw: Failures retain raw; no invalid batch reaches silver
+    Note over Parser,Raw: Failures retain raw#59; no invalid batch reaches silver
 ```
 
 Duplicate notifications skip terminal/already-queued work. A late raw object for
@@ -588,10 +588,10 @@ sequenceDiagram
     Loader->>Loader: Wait for per-instance rate capacity before pull
     Loader->>Silver: Pull bounded protected batch
     Loader->>Loader: Decode bounded gzip BSON / validate transport
-    Loader->>Mongo: Read receipt; claim expiring load lease when eligible
+    Loader->>Mongo: Read receipt#59; claim expiring load lease when eligible
     Loader->>Loader: Verify accepted count / device / deterministic IDs
     alt New or replayed load
-        Loader->>Mongo: Majority-read existing IDs; insert missing measurements unordered
+        Loader->>Mongo: Majority-read existing IDs#59; insert missing measurements unordered
         alt Writes confirmed
             Loader->>Mongo: Finish stored receipt with majority
         else Retryable write failure below attempt limit
@@ -654,11 +654,11 @@ sequenceDiagram
     participant Replica as Mongo analysis secondary / majority
     participant KMS as Storage decryption adapter
     Caller->>API: GET /traffic-logs (device/time filters, cursor, limit)
-    API->>API: Authorize device scope; validate filters / decode cursor
-    API->>Replica: Descending timestamp/ID query; limit + 1; omit bodies/ciphertext
+    API->>API: Authorize device scope#59; validate filters / decode cursor
+    API->>Replica: Descending timestamp/ID query#59; limit + 1#59; omit bodies/ciphertext
     Replica-->>API: Accessible page
-    API->>API: Flatten / redact credentials; encode next_cursor
-    API-->>Caller: 200 items / next_cursor; no bodies or KMS call
+    API->>API: Flatten / redact credentials#59; encode next_cursor
+    API-->>Caller: 200 items / next_cursor#59; no bodies or KMS call
     Caller->>API: GET /traffic-logs/{id}
     API->>Replica: Query ID with authorized device restriction
     alt Missing, expired, inaccessible or not yet replicated
@@ -669,10 +669,10 @@ sequenceDiagram
             API->>KMS: Decrypt with authenticated record/device/batch context
             KMS-->>API: Retained fields or fail closed
         end
-        API->>API: Flatten; include retained body; redact credentials
-        API-->>Caller: 200 detail; Cache-Control no-store
+        API->>API: Flatten#59; include retained body#59; redact credentials
+        API-->>Caller: 200 detail#59; Cache-Control no-store
     end
-    Note over API,Replica: Unavailable secondary returns 503; no deployment primary fallback
+    Note over API,Replica: Unavailable secondary returns 503#59; no deployment primary fallback
 ```
 
 ### Pipeline health
@@ -699,15 +699,15 @@ sequenceDiagram
         API->>Mongo: Read worker reports and outstanding receipt counts/age
         Mongo-->>API: Snapshot or failure
     and Three-second bounded analysis probe
-        API->>Replica: Minimal analysis read; no primary fallback
+        API->>Replica: Minimal analysis read#59; no primary fallback
         Replica-->>API: Reachable or failure
     and Concurrent three-second bounded cloud probes
         API->>Cloud: Bucket metadata / object and silver subscription metadata
         Cloud-->>API: Per-resource reachability or failure
     end
     API->>API: Evaluate staleness / failed receipts / stalled waits
-    API-->>SSR: Eight nodes + overall health; failures/unknowns explicit
-    SSR-->>Manager: Server-rendered pipeline diagram; no-store
+    API-->>SSR: Eight nodes + overall health#59; failures/unknowns explicit
+    SSR-->>Manager: Server-rendered pipeline diagram#59; no-store
 ```
 
 Probes never pull/ACK messages or write synthetic uploads. Counts come from
@@ -723,7 +723,7 @@ sequenceDiagram
     participant API
     Probe->>API: GET /health (no token required)
     API-->>Probe: 200 status=ok
-    Note over Probe,API: Process response only; no Mongo, KMS or Auth0 readiness checks
+    Note over Probe,API: Process response only#59; no Mongo, KMS or Auth0 readiness checks
 ```
 
 ### Operator recovery
@@ -739,16 +739,16 @@ sequenceDiagram
     participant Mongo as Receipt store / majority
     participant Raw
     participant Events as Object-event Pub/Sub
-    Operator->>Operator: Inspect sanitized failure; repair dependencies / preserve required keys
+    Operator->>Operator: Inspect sanitized failure#59; repair dependencies / preserve required keys
     alt replay upload_id
         Operator->>CLI: replay upload_id
-        CLI->>Mongo: Read receipt; check eligible state / raw not deleted
+        CLI->>Mongo: Read receipt#59; check eligible state / raw not deleted
         CLI->>Raw: Verify original object available
         Raw-->>CLI: Object exists
-        CLI->>Mongo: Conditional reset to received / clear attempts; refuse active processing lease
+        CLI->>Mongo: Conditional reset to received / clear attempts#59; refuse active processing lease
         Mongo-->>CLI: Reset confirmed or explicit refusal
         CLI->>Events: Publish targeted object event after successful reset
-        Note over Events,Raw: Normal parser/loader pipeline resumes; no bucket-listing trigger
+        Note over Events,Raw: Normal parser/loader pipeline resumes#59; no bucket-listing trigger
     else cleanup upload_id
         Operator->>CLI: cleanup upload_id
         CLI->>Mongo: Require stored receipt
@@ -779,29 +779,29 @@ sequenceDiagram
     CLI->>Bao: Read wrapped key set
     opt Key set absent
         CLI->>CLI: Generate EC key in memory
-        CLI->>Bao: Transit wrap; KV CAS create ciphertext only
+        CLI->>Bao: Transit wrap#59; KV CAS create ciphertext only
     end
     CLI->>Bao: Configure least-privilege runtime policy
     opt Development or Kubernetes bootstrap
         CLI->>Bao: Issue private development runtime token or bind Kubernetes auth role
     end
-    Runtime->>Bao: Authenticate; read wrapped key set; Transit unwrap
+    Runtime->>Bao: Authenticate#59; read wrapped key set#59; Transit unwrap
     Bao-->>Runtime: EC key set for validated RAM cache
     Runtime->>Bao: Validate separate storage key
     alt stage / rotate / activate / retire EC key
         Operator->>CLI: Requested key-set change
         CLI->>Bao: Read / unwrap current set
-        CLI->>CLI: Generate or select key; enforce active-key retirement guard
-        CLI->>Bao: Wrap modified set; KV compare-and-swap
+        CLI->>CLI: Generate or select key#59; enforce active-key retirement guard
+        CLI->>Bao: Wrap modified set#59; KV compare-and-swap
         Operator->>Runtime: Restart all API/parser processes to load updated set
     else rotate-kek
         Operator->>CLI: Rotate wrapping key
-        CLI->>Bao: Rotate KEK; rewrap ciphertext; KV compare-and-swap
+        CLI->>Bao: Rotate KEK#59; rewrap ciphertext#59; KV compare-and-swap
     else rotate-storage
         Operator->>CLI: Rotate independent storage key
-        CLI->>Bao: Validate key; create new Transit key version
+        CLI->>Bao: Validate key#59; create new Transit key version
     end
-    Note over Operator,Runtime: Retain old keys for stored logs and all raw backlog; no plaintext EC key files
+    Note over Operator,Runtime: Retain old keys for stored logs and all raw backlog#59; no plaintext EC key files
 ```
 
 `prepare-dev` only creates/preserves the private development root-credential file;
@@ -822,21 +822,21 @@ sequenceDiagram
     participant Secrets as Secret Manager
     participant KMS as Cloud KMS
     participant Runtime as Cloud API / parser
-    Operator->>Bootstrap: Run after Terraform foundation; use ADC
+    Operator->>Bootstrap: Run after Terraform foundation#59; use ADC
     Bootstrap->>Secrets: Inspect required containers / newest versions
     alt Newest version is enabled
-        Secrets-->>Bootstrap: Existing version; preserve unchanged
+        Secrets-->>Bootstrap: Existing version#59; preserve unchanged
     else Container exists but has no versions
         Bootstrap->>Bootstrap: Obtain private credentials or generate session / EC material in RAM
-        Bootstrap->>Secrets: Recheck absence; add missing version with CRC32C
+        Bootstrap->>Secrets: Recheck absence#59; add missing version with CRC32C
     else Container missing or newest version disabled/destroyed
-        Bootstrap-->>Operator: Explicit error; no silent regeneration
+        Bootstrap-->>Operator: Explicit error#59; no silent regeneration
     end
     Bootstrap-->>Operator: Numeric version references, never secret values
     Operator->>Operator: Pin versions and deploy with Terraform
     Runtime->>Secrets: Load pinned EC key-set version with workload identity
     Secrets-->>Runtime: EC key-set JSON / CRC32C
-    Runtime->>Runtime: Verify integrity / suite; cache EC keys in RAM
+    Runtime->>Runtime: Verify integrity / suite#59; cache EC keys in RAM
     Runtime->>KMS: Validate separate storage encryption key
     Note over KMS,Runtime: Field protection uses random per-record AES-GCM data keys wrapped by Cloud KMS
 ```
@@ -863,24 +863,24 @@ sequenceDiagram
     participant TF as Terraform
     participant GCP as GCP resources / Cloud Run
     participant Secrets as Secret Manager
-    Operator->>Script: Check or deploy; optional project/region/release overrides
-    Script->>Local: Read whitelisted env settings; never source shell code
+    Operator->>Script: Check or deploy#59; optional project/region/release overrides
+    Script->>Local: Read whitelisted env settings#59; never source shell code
     Script->>TF: Evaluate HCL in providerless temporary directory
-    Script->>CLI: Check login, billing and Cloud Run state; verify ADC
+    Script->>CLI: Check login, billing and Cloud Run state#59; verify ADC
     CLI->>GCP: Read cloud metadata
     alt Read-only check
-        Script-->>Operator: Service state / explicit prerequisite failures; no cloud mutation
+        Script-->>Operator: Service state / explicit prerequisite failures#59; no cloud mutation
     else Deploy with approval
         Script->>CLI: Ensure private versioned state bucket
-        Script->>TF: Initialize matching backend; inspect state ownership
+        Script->>TF: Initialize matching backend#59; inspect state ownership
         Script->>TF: Plan foundation, preserving existing managed services
-        TF-->>Script: Plan; refuse all deletion/replacement
+        TF-->>Script: Plan#59; refuse all deletion/replacement
         Script->>TF: Apply approved plan
         Script-->>Operator: NAT IP and generated Auth0 URLs
         Operator->>Operator: Configure Atlas allowlist and Auth0 URLs, preserving existing entries
         Operator->>Script: Confirm external setup or use external-ready flag
-        Script->>Secrets: Missing-only bootstrap; reuse suitable local inputs / prompt securely
-        Secrets-->>Script: Enabled numeric secret pins; no rotation
+        Script->>Secrets: Missing-only bootstrap#59; reuse suitable local inputs / prompt securely
+        Secrets-->>Script: Enabled numeric secret pins#59; no rotation
         Script->>CLI: Build/push missing immutable backend/frontend release tags
         CLI->>GCP: Publish images to Artifact Registry
         Script->>Local: Persist nonsecret settings, image tags and secret pins
@@ -915,7 +915,7 @@ sequenceDiagram
         Benchmark->>API: POST /traffic-log-uploads
         API-->>Benchmark: Durable raw acknowledgement
         Benchmark->>Benchmark: Record acknowledgement latency
-        API-->>Pipeline: Object event; asynchronous processing
+        API-->>Pipeline: Object event#59; asynchronous processing
         loop Poll each acknowledged upload while other uploads continue
             Benchmark->>API: GET upload receipt
             API-->>Benchmark: Current state
@@ -923,7 +923,7 @@ sequenceDiagram
         end
         Benchmark->>Benchmark: Record observed stored latency or fail explicitly
     end
-    Benchmark-->>Operator: ACK/storage percentiles; rate through final acknowledgement
+    Benchmark-->>Operator: ACK/storage percentiles#59; rate through final acknowledgement
 ```
 
 Observed storage includes status polling delay, not an exact Mongo completion
@@ -952,9 +952,9 @@ sequenceDiagram
     Make->>Init: Provision topics/subscriptions and raw notification bucket
     Init-->>Make: Completed or explicit error
     alt Full container mode
-        Make->>Compose: Stop native proxy variants; select full application services
-        Compose->>Apps: Recreate only application containers; refresh credential mounts
-        Note over Compose,Apps: Dedicated container proxy uses Docker DNS; no host gateway
+        Make->>Compose: Stop native proxy variants#59; select full application services
+        Compose->>Apps: Recreate only application containers#59; refresh credential mounts
+        Note over Compose,Apps: Dedicated container proxy uses Docker DNS#59; no host gateway
     else Native collector mode
         Operator->>Make: local-collector-run after infra setup
         Make->>Apps: Foreground host Python collector only
@@ -962,10 +962,10 @@ sequenceDiagram
     end
     opt Explicit cleanup retry
         Operator->>Make: local-cleanup UPLOAD_ID=stored receipt ID
-        Make->>Compose: Run one-shot cleaner; never enable with full
-        Compose->>Apps: Existing receipt-based cleanup; reject non-stored receipt
+        Make->>Compose: Run one-shot cleaner#59; never enable with full
+        Compose->>Apps: Existing receipt-based cleanup#59; reject non-stored receipt
     end
-    Note over Make,Bao: local-apps-stop preserves running dependencies/keys; full down loses ephemeral keys
+    Note over Make,Bao: local-apps-stop preserves running dependencies/keys#59; full down loses ephemeral keys
 ```
 
 These operations do not invoke Terraform or alter Cloud Run services. Old Make
