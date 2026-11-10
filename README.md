@@ -1,6 +1,6 @@
 <!-- Purpose: Introduce Amazing HTTP Logger, summarize its capabilities and ingestion flow, and direct readers to setup and detailed documentation. -->
 
-# Amazing HTTP Logger
+# HTTP Logger Collector
 
 A proof-of-concept platform for collecting HTTP traffic from device agents,
 storing it securely, and investigating it through an authenticated management
